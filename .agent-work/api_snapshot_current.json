@@ -1,0 +1,10 @@
+{
+  "generated_at": "2026-06-10T07:36:31+08:00",
+  "source": "code",
+  "endpoints": [],
+  "dto_fields": {},
+  "error_codes": [],
+  "warnings": [
+    "code/ does not exist."
+  ]
+}

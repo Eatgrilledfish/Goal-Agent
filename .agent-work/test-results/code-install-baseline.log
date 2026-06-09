@@ -1,0 +1,1 @@
+SKIPPED by --no-tests: mvn -f code/pom.xml install

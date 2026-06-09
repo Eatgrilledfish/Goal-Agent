@@ -1,0 +1,28 @@
+{
+  "phase": "DONE",
+  "round": 0,
+  "max_rounds": 20,
+  "fixed_count": 0,
+  "reverted_count": 0,
+  "high_priority_open": 0,
+  "medium_priority_open": 0,
+  "low_priority_open": 0,
+  "consecutive_no_progress": 0,
+  "consecutive_regressions": 0,
+  "api_contract_safe": true,
+  "last_focused_test": "not_run",
+  "last_full_test": "skipped",
+  "last_score": null,
+  "should_continue": false,
+  "stop_reason": "missing_competition_inputs",
+  "missing_required_paths": [
+    "code",
+    "design-docs",
+    "test-cases",
+    "API基线文档.md",
+    "黑盒用例说明.md",
+    "比赛说明.md"
+  ],
+  "updated_at": "2026-06-10T07:36:31+08:00",
+  "git_status_at_init": "?? .agent-work/\n?? .gitignore\n?? .opencode/\n?? AGENTS.md\n?? README.md\n?? design-document.md\n?? prompts/\n?? scripts/\n?? \"\\344\\277\\256\\345\\244\\215\\346\\212\\245\\345\\221\\212.md\""
+}
