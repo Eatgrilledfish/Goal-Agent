@@ -1,0 +1,43 @@
+{
+  "name": "shophub-goal-runner",
+  "version": "0.3.0+codex.20260610000810",
+  "description": "Run the ShopHub design-implementation consistency competition workflow from the current repository.",
+  "author": {
+    "name": "Eatgrilledfish",
+    "email": "fjq121706148@gmail.com",
+    "url": "https://github.com/Eatgrilledfish"
+  },
+  "homepage": "https://github.com/Eatgrilledfish/Goal-Agent",
+  "repository": "https://github.com/Eatgrilledfish/Goal-Agent",
+  "license": "MIT",
+  "keywords": [
+    "shophub",
+    "goal-runner",
+    "competition",
+    "java",
+    "spring-boot",
+    "agent",
+    "opencode",
+    "slash-command"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "ShopHub Goal Runner",
+    "shortDescription": "Finish the ShopHub consistency competition from the current repo",
+    "longDescription": "A deterministic Goal Runner for the ShopHub design-implementation consistency competition. Use /shophub in the CLI from a repo containing code/, design-docs/, test-cases/, API\u57fa\u7ebf\u6587\u6863.md, \u9ed1\u76d2\u7528\u4f8b\u8bf4\u660e.md, and \u6bd4\u8d5b\u8bf4\u660e.md. The command builds design/API/code indexes, runs Maven tests, audits inconsistencies, fixes code in small evidence-backed rounds, guards the frozen REST API contract, and writes \u4fee\u590d\u62a5\u544a.md.",
+    "developerName": "Eatgrilledfish",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Read",
+      "Write",
+      "Execute"
+    ],
+    "websiteURL": "https://github.com/Eatgrilledfish/Goal-Agent",
+    "defaultPrompt": [
+      "/shophub",
+      "/shophub dry-run",
+      "Use ShopHub Goal Runner on this repo"
+    ],
+    "brandColor": "#2563EB"
+  }
+}

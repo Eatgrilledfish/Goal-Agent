@@ -1,6 +1,6 @@
 # ShopHub Goal Runner
 
-This repository contains a local Goal Runner for the ShopHub design/implementation consistency competition.
+This repository contains a local Goal Runner and Codex/OpenCode-compatible plugin for the ShopHub design/implementation consistency competition.
 
 The runner follows `design-document.md` and coordinates these steps:
 
@@ -15,6 +15,57 @@ The runner follows `design-document.md` and coordinates these steps:
 9. Generate `修复报告.md`.
 
 The runner is intentionally conservative. It never edits `design-docs/`, `API基线文档.md`, `比赛说明.md`, `黑盒用例说明.md`, or `test-cases/`. In `auto-run` mode, code repair is delegated one issue at a time to the external command passed with `--patch-command`.
+
+## Plugin Usage
+
+This repository is also a plugin root:
+
+```text
+.codex-plugin/plugin.json
+commands/shophub.md
+skills/shophub-goal-runner/SKILL.md
+agents/*.md
+```
+
+Install it locally:
+
+```bash
+scripts/install_plugin.sh
+```
+
+The installer:
+
+- symlinks this repository to `~/plugins/shophub-goal-runner`;
+- adds/updates `~/.agents/plugins/marketplace.json`;
+- exposes a CLI helper at `~/.local/bin/shophub-goal-runner`;
+- links the skill into `~/.config/opencode/skills/shophub-goal-runner`;
+- links the skill into `~/.codex/skills/shophub-goal-runner`.
+- runs `codex plugin add shophub-goal-runner@personal` when the Codex CLI is available.
+
+After installing, restart the CLI/app if needed.
+
+From a ShopHub competition repository, run the slash command:
+
+```text
+/shophub
+```
+
+Useful variants:
+
+```text
+/shophub dry-run
+/shophub no-tests
+/shophub max-rounds=10
+/shophub report-only
+```
+
+For OpenCode, use the installed `shophub-goal-runner` skill by asking it to run the ShopHub Goal Runner in the current repo. The skill is installed at:
+
+```text
+~/.config/opencode/skills/shophub-goal-runner
+```
+
+The slash command and the skill both expect the current working directory to contain the competition inputs.
 
 ## Expected Competition Layout
 
