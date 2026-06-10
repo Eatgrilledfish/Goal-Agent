@@ -35,12 +35,13 @@ The installer:
 
 - symlinks this repository to `~/plugins/shophub-goal-runner`;
 - adds/updates `~/.agents/plugins/marketplace.json`;
-- runs `codex plugin add shophub-goal-runner@personal` when the Codex CLI is available.
+- runs `codex plugin add shophub-goal-runner@personal` when the Codex CLI is available;
+- links the same slash command into OpenCode at `~/.config/opencode/commands/shophub.md`;
 - removes legacy direct helper links if they exist.
 
 After installing, restart the CLI/app if needed.
 
-From a ShopHub competition repository, run the slash command:
+From a ShopHub competition repository, run the slash command in Codex or OpenCode:
 
 ```text
 /shophub

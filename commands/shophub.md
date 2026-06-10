@@ -27,13 +27,25 @@ Run the ShopHub design-implementation consistency workflow in the current workin
 4. Check `git status --short`. Never revert user changes. Record dirty state in `.agent-work/state.json` or the final summary.
 5. Check that Maven is available if tests are not skipped:
    - `mvn -version`
-6. If helper scripts are present in the current repo, use them for bookkeeping:
+6. Resolve the internal runner implementation. Prefer the installed plugin path:
+
+   ```bash
+   test -f "$HOME/plugins/shophub-goal-runner/scripts/shophub_goal_runner.py"
+   ```
+
+   If that file exists, use:
+
+   ```bash
+   python3 "$HOME/plugins/shophub-goal-runner/scripts/shophub_goal_runner.py" --root .
+   ```
+
+   If the plugin path is unavailable but helper scripts are present in the current repo, use them for bookkeeping:
    - `scripts/shophub_goal_runner.py`
    - `scripts/api_snapshot.py`
    - `scripts/summarize_test_logs.py`
    - `scripts/issue_queue.py`
    - `scripts/round_recorder.py`
-7. If helper scripts are not present, execute the same workflow manually and create the `.agent-work/` files yourself. Do not ask the user to invoke another entry point.
+7. If neither installed plugin runner nor local helper scripts are present, execute the same workflow manually and create the `.agent-work/` files yourself. Do not ask the user to invoke another entry point.
 
 ## Plan
 
@@ -70,7 +82,13 @@ Safety rules:
 
 ### 1. Initialize Evidence
 
-If helper scripts exist:
+If the installed plugin runner exists:
+
+```bash
+python3 "$HOME/plugins/shophub-goal-runner/scripts/shophub_goal_runner.py" --root . init
+```
+
+If only local helper scripts exist:
 
 ```bash
 python3 scripts/shophub_goal_runner.py init
@@ -88,7 +106,15 @@ Otherwise create:
 
 ### 2. Build Indexes
 
-If helper scripts exist:
+If the installed plugin runner exists:
+
+```bash
+python3 "$HOME/plugins/shophub-goal-runner/scripts/shophub_goal_runner.py" --root . read-specs
+python3 "$HOME/plugins/shophub-goal-runner/scripts/shophub_goal_runner.py" --root . read-api
+python3 "$HOME/plugins/shophub-goal-runner/scripts/shophub_goal_runner.py" --root . map-code
+```
+
+If only local helper scripts exist:
 
 ```bash
 python3 scripts/shophub_goal_runner.py read-specs
@@ -119,7 +145,13 @@ mvn -f code/pom.xml install
 mvn -f test-cases/pom.xml test
 ```
 
-Save logs under `.agent-work/test-results/` and summarize failures in `.agent-work/baseline_tests.md`. If helper scripts exist:
+Save logs under `.agent-work/test-results/` and summarize failures in `.agent-work/baseline_tests.md`. If the installed plugin runner exists:
+
+```bash
+python3 "$HOME/plugins/shophub-goal-runner/scripts/shophub_goal_runner.py" --root . baseline-tests
+```
+
+If only local helper scripts exist:
 
 ```bash
 python3 scripts/shophub_goal_runner.py baseline-tests
@@ -146,7 +178,14 @@ Find design-code inconsistencies. Each issue must include:
 
 Write `.agent-work/issues.jsonl` and `.agent-work/fix_plan.md`.
 
-If helper scripts exist:
+If the installed plugin runner exists:
+
+```bash
+python3 "$HOME/plugins/shophub-goal-runner/scripts/shophub_goal_runner.py" --root . audit
+python3 "$HOME/plugins/shophub-goal-runner/scripts/shophub_goal_runner.py" --root . prioritize
+```
+
+If only local helper scripts exist:
 
 ```bash
 python3 scripts/shophub_goal_runner.py audit
@@ -164,6 +203,14 @@ Repeat until DONE:
 1. Select the highest priority open issue with design evidence.
 2. Create a round record:
 
+   If the installed plugin runner exists:
+
+   ```bash
+   python3 "$HOME/plugins/shophub-goal-runner/scripts/shophub_goal_runner.py" --root . next-round
+   ```
+
+   If only local helper scripts exist:
+
    ```bash
    python3 scripts/shophub_goal_runner.py next-round
    ```
@@ -172,6 +219,14 @@ Repeat until DONE:
 3. Edit the smallest necessary set of files, preferably Service/Domain logic before Controller/DTO.
 4. Add or update focused tests under `code/**/src/test/**` when useful.
 5. Rebuild the API snapshot and compare against baseline:
+
+   If the installed plugin runner exists:
+
+   ```bash
+   python3 "$HOME/plugins/shophub-goal-runner/scripts/shophub_goal_runner.py" --root . read-api
+   ```
+
+   If only local helper scripts exist:
 
    ```bash
    python3 scripts/api_snapshot.py --root .
@@ -192,6 +247,14 @@ Repeat until DONE:
    - no public-test hardcoding;
    - hidden-test risk.
 8. If the round is accepted, mark it PASS:
+
+   If the installed plugin runner exists:
+
+   ```bash
+   python3 "$HOME/plugins/shophub-goal-runner/scripts/shophub_goal_runner.py" --root . finish-round --round <N> --result PASS --tests "<commands run>"
+   ```
+
+   If only local helper scripts exist:
 
    ```bash
    python3 scripts/round_recorder.py --root . finish --round <N> --result PASS --tests "<commands run>"
@@ -230,6 +293,14 @@ mvn -f test-cases/pom.xml test
 ```
 
 Regenerate the report:
+
+If the installed plugin runner exists:
+
+```bash
+python3 "$HOME/plugins/shophub-goal-runner/scripts/shophub_goal_runner.py" --root . report
+```
+
+If only local helper scripts exist:
 
 ```bash
 python3 scripts/shophub_goal_runner.py report

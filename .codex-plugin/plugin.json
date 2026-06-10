@@ -1,6 +1,6 @@
 {
   "name": "shophub-goal-runner",
-  "version": "0.3.0+codex.20260610001152",
+  "version": "0.3.0+codex.20260610001625",
   "description": "Run the ShopHub design-implementation consistency competition workflow from the current repository.",
   "author": {
     "name": "Eatgrilledfish",

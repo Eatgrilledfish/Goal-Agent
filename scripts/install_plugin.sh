@@ -7,10 +7,13 @@ PERSONAL_PLUGINS_DIR="${HOME}/plugins"
 PLUGIN_LINK="${PERSONAL_PLUGINS_DIR}/${PLUGIN_NAME}"
 MARKETPLACE_DIR="${HOME}/.agents/plugins"
 MARKETPLACE_JSON="${MARKETPLACE_DIR}/marketplace.json"
+OPENCODE_COMMANDS_DIR="${HOME}/.config/opencode/commands"
+OPENCODE_COMMAND_LINK="${OPENCODE_COMMANDS_DIR}/shophub.md"
 
-mkdir -p "$PERSONAL_PLUGINS_DIR" "$MARKETPLACE_DIR"
+mkdir -p "$PERSONAL_PLUGINS_DIR" "$MARKETPLACE_DIR" "$OPENCODE_COMMANDS_DIR"
 
 ln -sfn "$PLUGIN_ROOT" "$PLUGIN_LINK"
+ln -sfn "$PLUGIN_ROOT/commands/shophub.md" "$OPENCODE_COMMAND_LINK"
 
 rm -f "${HOME}/.local/bin/shophub-goal-runner"
 rm -f "${HOME}/.config/opencode/skills/${PLUGIN_NAME}"
@@ -73,6 +76,9 @@ Installed ${PLUGIN_NAME}.
 Codex plugin symlink:
   ${PLUGIN_LINK}
 
+OpenCode global command:
+  ${OPENCODE_COMMAND_LINK}
+
 Marketplace:
   ${MARKETPLACE_JSON}
 
@@ -80,5 +86,5 @@ Codex plugin add:
   ${CODEX_INSTALL_STATUS}
 
 Restart your CLI/app if slash commands are not immediately visible.
-Use the single entry /shophub from a ShopHub competition repository.
+Use the single entry /shophub from Codex or OpenCode in a ShopHub competition repository.
 MSG
