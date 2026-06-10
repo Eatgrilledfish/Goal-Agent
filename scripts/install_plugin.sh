@@ -7,19 +7,14 @@ PERSONAL_PLUGINS_DIR="${HOME}/plugins"
 PLUGIN_LINK="${PERSONAL_PLUGINS_DIR}/${PLUGIN_NAME}"
 MARKETPLACE_DIR="${HOME}/.agents/plugins"
 MARKETPLACE_JSON="${MARKETPLACE_DIR}/marketplace.json"
-LOCAL_BIN="${HOME}/.local/bin"
-CLI_LINK="${LOCAL_BIN}/shophub-goal-runner"
-OPENCODE_SKILLS_DIR="${HOME}/.config/opencode/skills"
-OPENCODE_SKILL_LINK="${OPENCODE_SKILLS_DIR}/${PLUGIN_NAME}"
-CODEX_SKILLS_DIR="${HOME}/.codex/skills"
-CODEX_SKILL_LINK="${CODEX_SKILLS_DIR}/${PLUGIN_NAME}"
 
-mkdir -p "$PERSONAL_PLUGINS_DIR" "$MARKETPLACE_DIR" "$LOCAL_BIN" "$OPENCODE_SKILLS_DIR" "$CODEX_SKILLS_DIR"
+mkdir -p "$PERSONAL_PLUGINS_DIR" "$MARKETPLACE_DIR"
 
 ln -sfn "$PLUGIN_ROOT" "$PLUGIN_LINK"
-ln -sfn "$PLUGIN_ROOT/scripts/shophub_goal_runner.py" "$CLI_LINK"
-ln -sfn "$PLUGIN_ROOT/skills/${PLUGIN_NAME}" "$OPENCODE_SKILL_LINK"
-ln -sfn "$PLUGIN_ROOT/skills/${PLUGIN_NAME}" "$CODEX_SKILL_LINK"
+
+rm -f "${HOME}/.local/bin/shophub-goal-runner"
+rm -f "${HOME}/.config/opencode/skills/${PLUGIN_NAME}"
+rm -f "${HOME}/.codex/skills/${PLUGIN_NAME}"
 
 python3 - "$MARKETPLACE_JSON" "$PLUGIN_NAME" <<'PY'
 import json
@@ -81,18 +76,9 @@ Codex plugin symlink:
 Marketplace:
   ${MARKETPLACE_JSON}
 
-CLI helper:
-  ${CLI_LINK}
-
-OpenCode skill:
-  ${OPENCODE_SKILL_LINK}
-
-Codex skill:
-  ${CODEX_SKILL_LINK}
-
 Codex plugin add:
   ${CODEX_INSTALL_STATUS}
 
 Restart your CLI/app if slash commands are not immediately visible.
-Use /shophub from a ShopHub competition repository.
+Use the single entry /shophub from a ShopHub competition repository.
 MSG

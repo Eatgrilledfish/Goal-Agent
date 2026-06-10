@@ -33,14 +33,7 @@ Run the ShopHub design-implementation consistency workflow in the current workin
    - `scripts/summarize_test_logs.py`
    - `scripts/issue_queue.py`
    - `scripts/round_recorder.py`
-7. If helper scripts are not present, check whether the installed plugin CLI is available:
-
-   ```bash
-   command -v shophub-goal-runner
-   ```
-
-8. If either local helper scripts or the installed plugin CLI are available, use them for deterministic bookkeeping.
-9. If neither is available, execute the same workflow manually and create the `.agent-work/` files yourself.
+7. If helper scripts are not present, execute the same workflow manually and create the `.agent-work/` files yourself. Do not ask the user to invoke another entry point.
 
 ## Plan
 
@@ -83,12 +76,6 @@ If helper scripts exist:
 python3 scripts/shophub_goal_runner.py init
 ```
 
-If only the installed plugin CLI exists:
-
-```bash
-shophub-goal-runner --root . init
-```
-
 Otherwise create:
 
 ```text
@@ -107,14 +94,6 @@ If helper scripts exist:
 python3 scripts/shophub_goal_runner.py read-specs
 python3 scripts/shophub_goal_runner.py read-api
 python3 scripts/shophub_goal_runner.py map-code
-```
-
-If only the installed plugin CLI exists:
-
-```bash
-shophub-goal-runner --root . read-specs
-shophub-goal-runner --root . read-api
-shophub-goal-runner --root . map-code
 ```
 
 Otherwise manually produce:
@@ -146,12 +125,6 @@ Save logs under `.agent-work/test-results/` and summarize failures in `.agent-wo
 python3 scripts/shophub_goal_runner.py baseline-tests
 ```
 
-If only the installed plugin CLI exists:
-
-```bash
-shophub-goal-runner --root . baseline-tests
-```
-
 ### 4. Audit and Prioritize
 
 Find design-code inconsistencies. Each issue must include:
@@ -180,13 +153,6 @@ python3 scripts/shophub_goal_runner.py audit
 python3 scripts/shophub_goal_runner.py prioritize
 ```
 
-If only the installed plugin CLI exists:
-
-```bash
-shophub-goal-runner --root . audit
-shophub-goal-runner --root . prioritize
-```
-
 Then refine weak heuristic issues manually by reading the cited design and code before fixing anything.
 
 ### 5. Fix Loop
@@ -202,12 +168,6 @@ Repeat until DONE:
    python3 scripts/shophub_goal_runner.py next-round
    ```
 
-   If only the installed plugin CLI exists:
-
-   ```bash
-   shophub-goal-runner --root . next-round
-   ```
-
    If helper tooling is unavailable, create `.agent-work/rounds/round-XXX.md` manually.
 3. Edit the smallest necessary set of files, preferably Service/Domain logic before Controller/DTO.
 4. Add or update focused tests under `code/**/src/test/**` when useful.
@@ -215,12 +175,6 @@ Repeat until DONE:
 
    ```bash
    python3 scripts/api_snapshot.py --root .
-   ```
-
-   If only the installed plugin CLI exists:
-
-   ```bash
-   shophub-goal-runner --root . read-api
    ```
 
 6. Run focused tests first, then full tests when the change is broad or every third round:
@@ -241,12 +195,6 @@ Repeat until DONE:
 
    ```bash
    python3 scripts/round_recorder.py --root . finish --round <N> --result PASS --tests "<commands run>"
-   ```
-
-   If only the installed plugin CLI exists:
-
-   ```bash
-   shophub-goal-runner --root . finish-round --round <N> --result PASS --tests "<commands run>"
    ```
 
 9. If tests fail or API safety is not preserved, stop new issue work and repair or revert the current round before continuing.
@@ -285,12 +233,6 @@ Regenerate the report:
 
 ```bash
 python3 scripts/shophub_goal_runner.py report
-```
-
-If only the installed plugin CLI exists:
-
-```bash
-shophub-goal-runner --root . report
 ```
 
 If helper tooling is unavailable, write `修复报告.md` manually with the required sections.
