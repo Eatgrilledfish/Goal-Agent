@@ -18,11 +18,12 @@ The runner is intentionally conservative. It never edits `design-docs/`, `API基
 
 ## Plugin Usage
 
-This repository is a plugin root with one user-facing entry:
+This repository is a plugin root with one user-facing slash command and internal hidden subagents:
 
 ```text
 .codex-plugin/plugin.json
 commands/shophub.md
+agents/shophub-*.md
 ```
 
 Install it locally:
@@ -37,6 +38,7 @@ The installer:
 - adds/updates `~/.agents/plugins/marketplace.json`;
 - runs `codex plugin add shophub-goal-runner@personal` when the Codex CLI is available;
 - links the same slash command into OpenCode at `~/.config/opencode/commands/shophub.md`;
+- registers hidden OpenCode subagents at `~/.config/opencode/agents/shophub-*.md`;
 - removes legacy direct helper links if they exist.
 
 After installing, restart the CLI/app if needed.
@@ -57,6 +59,19 @@ Optional slash arguments:
 ```
 
 Do not call internal scripts directly during normal use. They are implementation details used by `/shophub`.
+
+In OpenCode, `/shophub` is bound to the hidden `shophub-orchestrator` subagent. The orchestrator calls these hidden specialist subagents through the Task tool:
+
+- `shophub-spec-librarian`
+- `shophub-api-guardian`
+- `shophub-code-mapper`
+- `shophub-test-diagnoser`
+- `shophub-module-auditor`
+- `shophub-patch-agent`
+- `shophub-review-agent`
+- `shophub-report-writer`
+
+These agent files are internal implementation details, not additional slash-command entry points.
 
 ## Expected Competition Layout
 

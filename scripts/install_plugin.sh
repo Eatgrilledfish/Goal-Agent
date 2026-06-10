@@ -9,11 +9,26 @@ MARKETPLACE_DIR="${HOME}/.agents/plugins"
 MARKETPLACE_JSON="${MARKETPLACE_DIR}/marketplace.json"
 OPENCODE_COMMANDS_DIR="${HOME}/.config/opencode/commands"
 OPENCODE_COMMAND_LINK="${OPENCODE_COMMANDS_DIR}/shophub.md"
+OPENCODE_AGENTS_DIR="${HOME}/.config/opencode/agents"
+OPENCODE_AGENT_NAMES=(
+  shophub-orchestrator
+  shophub-spec-librarian
+  shophub-api-guardian
+  shophub-code-mapper
+  shophub-test-diagnoser
+  shophub-module-auditor
+  shophub-patch-agent
+  shophub-review-agent
+  shophub-report-writer
+)
 
-mkdir -p "$PERSONAL_PLUGINS_DIR" "$MARKETPLACE_DIR" "$OPENCODE_COMMANDS_DIR"
+mkdir -p "$PERSONAL_PLUGINS_DIR" "$MARKETPLACE_DIR" "$OPENCODE_COMMANDS_DIR" "$OPENCODE_AGENTS_DIR"
 
 ln -sfn "$PLUGIN_ROOT" "$PLUGIN_LINK"
 ln -sfn "$PLUGIN_ROOT/commands/shophub.md" "$OPENCODE_COMMAND_LINK"
+for agent_name in "${OPENCODE_AGENT_NAMES[@]}"; do
+  ln -sfn "$PLUGIN_ROOT/agents/${agent_name}.md" "$OPENCODE_AGENTS_DIR/${agent_name}.md"
+done
 
 rm -f "${HOME}/.local/bin/shophub-goal-runner"
 rm -f "${HOME}/.config/opencode/skills/${PLUGIN_NAME}"
@@ -79,6 +94,9 @@ Codex plugin symlink:
 OpenCode global command:
   ${OPENCODE_COMMAND_LINK}
 
+OpenCode hidden subagents:
+  ${OPENCODE_AGENTS_DIR}/shophub-*.md
+
 Marketplace:
   ${MARKETPLACE_JSON}
 
@@ -86,5 +104,5 @@ Codex plugin add:
   ${CODEX_INSTALL_STATUS}
 
 Restart your CLI/app if slash commands are not immediately visible.
-Use the single entry /shophub from Codex or OpenCode in a ShopHub competition repository.
+Use the single visible entry /shophub from Codex or OpenCode in a ShopHub competition repository.
 MSG

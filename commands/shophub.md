@@ -1,10 +1,14 @@
 ---
 description: Run the ShopHub competition Goal Runner in the current repository until DONE or a safety stop condition.
+agent: shophub-orchestrator
+subtask: true
 ---
 
 # ShopHub Goal Runner
 
 Run the ShopHub design-implementation consistency workflow in the current working directory. This command is intended to be invoked as `/shophub` from the repository that already contains the competition inputs.
+
+In OpenCode, this command must run through the registered `shophub-orchestrator` subagent. The orchestrator must use the Task tool to call the hidden ShopHub specialist subagents. Do not collapse the workflow into a single-agent pass unless the runtime does not expose subagent invocation.
 
 `$ARGUMENTS` may contain:
 
@@ -50,6 +54,28 @@ Run the ShopHub design-implementation consistency workflow in the current workin
 ## Plan
 
 Act as the ShopHub Goal Runner Orchestrator. Continue until DONE or a safety stop condition is reached.
+
+Registered ShopHub subagents:
+
+- `shophub-spec-librarian`: extract design rules from `design-docs/`.
+- `shophub-api-guardian`: extract and protect the frozen REST API contract.
+- `shophub-code-mapper`: map Java/Spring modules, APIs, services, repositories, DTOs, and tests.
+- `shophub-test-diagnoser`: run and diagnose Maven/public black-box test symptoms.
+- `shophub-module-auditor`: audit modules for design-code inconsistencies with evidence.
+- `shophub-patch-agent`: apply exactly one minimal, API-safe repair round.
+- `shophub-review-agent`: review each round for design match, API safety, minimality, and hidden-test risk.
+- `shophub-report-writer`: write the final `修复报告.md`.
+
+Delegation is mandatory when the Task tool is available:
+
+- Call `shophub-spec-librarian` during `READ_SPECS`.
+- Call `shophub-api-guardian` during `READ_API_BASELINE` and after every accepted or attempted patch.
+- Call `shophub-code-mapper` during `MAP_CODE`.
+- Call `shophub-test-diagnoser` during `RUN_BASELINE_TESTS`, focused verification, and final verification.
+- Call `shophub-module-auditor` during `AUDIT_INCONSISTENCIES`, once per core module or module group.
+- Call `shophub-patch-agent` during each `FIX_LOOP` repair round.
+- Call `shophub-review-agent` before accepting or reverting each repair round.
+- Call `shophub-report-writer` during `WRITE_REPORT`.
 
 Follow this state machine:
 
