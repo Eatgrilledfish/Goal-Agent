@@ -11,9 +11,10 @@ The runner follows `design-document.md` and coordinates these steps:
 5. Run baseline Maven tests and summarize symptoms.
 6. Maintain an issue queue and fix plan.
 7. Record repair rounds.
-8. Generate `修复报告.md`.
+8. Optionally call an external patch agent in a continuous loop.
+9. Generate `修复报告.md`.
 
-The runner is intentionally conservative. It never edits `design-docs/`, `API基线文档.md`, `比赛说明.md`, `黑盒用例说明.md`, or `test-cases/`. Code repair is performed one issue at a time by the patch agent or by Codex following the generated round file.
+The runner is intentionally conservative. It never edits `design-docs/`, `API基线文档.md`, `比赛说明.md`, `黑盒用例说明.md`, or `test-cases/`. In `auto-run` mode, code repair is delegated one issue at a time to the external command passed with `--patch-command`.
 
 ## Expected Competition Layout
 
@@ -38,6 +39,7 @@ This scaffold can be initialized before the competition files exist. Missing com
 python3 scripts/shophub_goal_runner.py init
 python3 scripts/shophub_goal_runner.py run --no-tests
 python3 scripts/shophub_goal_runner.py run
+python3 scripts/shophub_goal_runner.py auto-run
 python3 scripts/shophub_goal_runner.py status
 ```
 
@@ -63,6 +65,53 @@ python3 scripts/issue_queue.py --root . next
 python3 scripts/round_recorder.py --root . start
 python3 scripts/round_recorder.py --root . finish --round 1 --result PASS
 ```
+
+## Continuous Goal Mode
+
+Use `auto-run` when you want the runner to keep working until the competition goals are complete or a safety stop condition is reached.
+
+The runner handles orchestration, indexing, tests, API checks, round records, scoring, and reporting. The actual code repair must be supplied through `--patch-command` or the `SHOPHUB_PATCH_COMMAND` environment variable.
+
+The patch command is called once per round and receives these placeholders:
+
+- `{root}`: shell-quoted project root.
+- `{round}`: current round number.
+- `{round_file}`: shell-quoted `.agent-work/rounds/round-XXX.md`.
+- `{issue_id}`: shell-quoted issue id.
+- `{issue_json}`: shell-quoted JSON file for the selected issue.
+
+Example template:
+
+```bash
+export SHOPHUB_PATCH_COMMAND='codex exec --full-auto "$(cat {round_file})"'
+python3 scripts/shophub_goal_runner.py auto-run --max-rounds 20
+```
+
+If your patch agent expects a file path instead of inline prompt text:
+
+```bash
+python3 scripts/shophub_goal_runner.py auto-run \
+  --patch-command 'opencode run --agent patch-agent --prompt-file {round_file}' \
+  --max-rounds 20
+```
+
+For a dry run that verifies the loop without Maven execution:
+
+```bash
+python3 scripts/shophub_goal_runner.py auto-run --no-tests --max-rounds 2
+```
+
+Do not use `--no-tests` for an actual competition run.
+
+`auto-run` stops and writes `修复报告.md` when any design-document stop condition is met, including:
+
+- required competition inputs are missing;
+- high and medium issues are handled and full tests pass;
+- there are no open issues but tests still fail;
+- API contract drift is detected;
+- the patch command fails;
+- consecutive no-progress or regression limits are reached;
+- `--max-rounds` is reached.
 
 ## Verification
 

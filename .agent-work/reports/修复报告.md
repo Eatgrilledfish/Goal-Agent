@@ -1,6 +1,6 @@
 # ShopHub 设计实现一致性检查与修复报告
 
-生成时间：2026-06-10T07:36:31+08:00
+生成时间：2026-06-10T08:00:16+08:00
 
 ## 发现的不一致点
 
@@ -37,7 +37,7 @@
 
 # Baseline Test Summary
 
-Generated: 2026-06-10T07:36:31+08:00
+Generated: 2026-06-10T08:00:16+08:00
 
 ## .agent-work/test-results/blackbox-baseline.log
 

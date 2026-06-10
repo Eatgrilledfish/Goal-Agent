@@ -3,10 +3,11 @@
 
 The runner implements the deterministic parts of the workflow described in
 design-document.md: workspace initialization, spec/API/code indexing, Maven
-test execution, issue queue maintenance, round recording, and final reporting.
+test execution, issue queue maintenance, round recording, continuous orchestration,
+and final reporting.
 
-It deliberately avoids automatic business-code edits. Repairs are made by the
-patch agent or by Codex using the generated issue and round files.
+It does not hard-code business fixes. In auto-run mode, repairs are delegated to
+an external patch command such as Codex CLI, opencode, or another local agent.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import textwrap
@@ -194,6 +196,10 @@ def default_state() -> dict[str, Any]:
         "last_score": None,
         "should_continue": True,
         "stop_reason": None,
+        "auto_run_started_at": None,
+        "auto_run_finished_at": None,
+        "last_patch_command": None,
+        "last_patch_exit_code": None,
         "missing_required_paths": [],
         "updated_at": now_iso(),
     }
@@ -994,6 +1000,58 @@ def run_baseline_tests(root: Path, timeout: int = 900, no_tests: bool = False) -
     return {"results": results, "summary": summary}
 
 
+def run_verification_tests(root: Path, label: str, timeout: int = 900, no_tests: bool = False) -> dict[str, Any]:
+    paths = RunnerPaths(root)
+    ensure_work_layout(paths)
+    commands = [
+        (f"{label}-code-test.log", ["mvn", "-f", "code/pom.xml", "test"]),
+        (f"{label}-code-install.log", ["mvn", "-f", "code/pom.xml", "install"]),
+        (f"{label}-blackbox.log", ["mvn", "-f", "test-cases/pom.xml", "test"]),
+    ]
+    results: list[dict[str, Any]] = []
+    for log_name, command in commands:
+        log_path = paths.test_results / log_name
+        pom_path = root / command[2]
+        if no_tests:
+            write_text(log_path, f"SKIPPED by --no-tests: {' '.join(command)}\n")
+            results.append({"command": command, "log": rel(root, log_path), "returncode": None, "skipped": True})
+            continue
+        if not pom_path.exists():
+            write_text(log_path, f"SKIPPED missing {command[2]}: {' '.join(command)}\n")
+            results.append({"command": command, "log": rel(root, log_path), "returncode": None, "skipped": True})
+            continue
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=root,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                check=False,
+                timeout=timeout,
+            )
+            write_text(log_path, completed.stdout)
+            results.append({"command": command, "log": rel(root, log_path), "returncode": completed.returncode, "skipped": False})
+        except subprocess.TimeoutExpired as exc:
+            output = exc.stdout if isinstance(exc.stdout, str) else ""
+            write_text(log_path, output + f"\nTIMEOUT after {timeout}s\n")
+            results.append({"command": command, "log": rel(root, log_path), "returncode": 124, "skipped": False, "timeout": True})
+
+    skipped_count = sum(1 for item in results if item.get("skipped"))
+    executed = [item for item in results if not item.get("skipped")]
+    if skipped_count == len(results):
+        status = "skipped"
+    elif any(item.get("returncode") not in (0, None) for item in executed):
+        status = "failed"
+    elif skipped_count:
+        status = "partial_skipped"
+    else:
+        status = "passed"
+    summarize_test_logs(root)
+    save_state(paths, phase="RUN_FULL_TESTS", last_full_test=status)
+    return {"status": status, "results": results}
+
+
 def summarize_test_logs(root: Path) -> dict[str, Any]:
     paths = RunnerPaths(root)
     summaries: list[dict[str, Any]] = []
@@ -1578,6 +1636,221 @@ def run_full_workflow(root: Path, no_tests: bool, timeout: int) -> None:
     generate_report(root)
 
 
+def append_auto_log(paths: RunnerPaths, message: str) -> None:
+    path = paths.work / "auto-run.log"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(f"[{now_iso()}] {message}\n")
+
+
+def open_issues_by_severity(root: Path) -> dict[str, list[dict[str, Any]]]:
+    issues = read_jsonl(RunnerPaths(root).issues)
+    open_issues = [issue for issue in issues if issue.get("status", "open") == "open"]
+    return {
+        "high": [issue for issue in open_issues if issue.get("severity") == "high"],
+        "medium": [issue for issue in open_issues if issue.get("severity") == "medium"],
+        "low": [issue for issue in open_issues if issue.get("severity") == "low"],
+        "all": open_issues,
+    }
+
+
+def done_decision(root: Path, no_tests: bool = False) -> tuple[bool, str | None]:
+    paths = RunnerPaths(root)
+    state = load_state(paths)
+    missing = check_competition_layout(root)
+    buckets = open_issues_by_severity(root)
+    high_medium_open = len(buckets["high"]) + len(buckets["medium"])
+    last_full_test = state.get("last_full_test")
+
+    if missing:
+        return True, "missing_competition_inputs"
+    if not state.get("api_contract_safe", True):
+        return True, "api_contract_violation"
+    if int(state.get("round", 0)) >= int(state.get("max_rounds", 20)):
+        return True, "max_rounds_reached"
+    if int(state.get("consecutive_no_progress", 0)) >= 3:
+        return True, "consecutive_no_progress"
+    if int(state.get("consecutive_regressions", 0)) >= 2:
+        return True, "consecutive_regressions"
+    if high_medium_open == 0 and last_full_test == "passed":
+        return True, "completed_high_medium_and_tests_passed"
+    if no_tests and not buckets["all"] and last_full_test in {"skipped", "partial_skipped", "passed"}:
+        return True, "no_open_issues_tests_not_required"
+    if not buckets["all"] and last_full_test == "failed":
+        return True, "tests_failed_without_open_issue"
+    return False, None
+
+
+def format_patch_command(command_template: str, root: Path, round_no: int, round_path: Path, issue: dict[str, Any]) -> str:
+    paths = RunnerPaths(root)
+    issue_path = paths.rounds / f"round-{round_no:03d}-issue.json"
+    write_json(issue_path, issue)
+    values = {
+        "root": shlex.quote(root.as_posix()),
+        "round": str(round_no),
+        "round_file": shlex.quote(round_path.as_posix()),
+        "issue_id": shlex.quote(str(issue.get("issue_id", ""))),
+        "issue_json": shlex.quote(issue_path.as_posix()),
+    }
+    return command_template.format(**values)
+
+
+def run_patch_command(
+    root: Path,
+    command_template: str,
+    round_no: int,
+    round_path: Path,
+    issue: dict[str, Any],
+    timeout: int,
+) -> dict[str, Any]:
+    paths = RunnerPaths(root)
+    command = format_patch_command(command_template, root, round_no, round_path, issue)
+    log_path = paths.rounds / f"round-{round_no:03d}-patch-command.log"
+    env = os.environ.copy()
+    env.update(
+        {
+            "SHOPHUB_ROOT": root.as_posix(),
+            "SHOPHUB_ROUND": str(round_no),
+            "SHOPHUB_ROUND_FILE": round_path.as_posix(),
+            "SHOPHUB_ISSUE_ID": str(issue.get("issue_id", "")),
+        }
+    )
+    append_auto_log(paths, f"round {round_no:03d}: running patch command for {issue.get('issue_id')}")
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=root,
+            shell=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+            timeout=timeout,
+            env=env,
+        )
+        write_text(log_path, completed.stdout)
+        save_state(paths, last_patch_command=command, last_patch_exit_code=completed.returncode)
+        return {"returncode": completed.returncode, "log": rel(root, log_path), "timeout": False}
+    except subprocess.TimeoutExpired as exc:
+        output = exc.stdout if isinstance(exc.stdout, str) else ""
+        write_text(log_path, output + f"\nTIMEOUT after {timeout}s\n")
+        save_state(paths, last_patch_command=command, last_patch_exit_code=124)
+        return {"returncode": 124, "log": rel(root, log_path), "timeout": True}
+
+
+def verification_command_summary(verification: dict[str, Any]) -> str:
+    parts = []
+    for item in verification.get("results", []):
+        command = " ".join(item.get("command", []))
+        status = "SKIPPED" if item.get("skipped") else str(item.get("returncode"))
+        parts.append(f"{command} => {status} ({item.get('log')})")
+    return "; ".join(parts)
+
+
+def run_until_done(
+    root: Path,
+    no_tests: bool,
+    timeout: int,
+    max_rounds: int,
+    patch_command: str | None,
+    patch_timeout: int,
+) -> None:
+    paths = RunnerPaths(root)
+    init_workspace(root)
+    save_state(
+        paths,
+        phase="INIT",
+        max_rounds=max_rounds,
+        should_continue=True,
+        stop_reason=None,
+        auto_run_started_at=now_iso(),
+        auto_run_finished_at=None,
+    )
+    append_auto_log(paths, "auto-run started")
+
+    extract_specs(root)
+    parse_api_baseline(root)
+    map_code(root)
+    run_baseline_tests(root, timeout=timeout, no_tests=no_tests)
+    audit_inconsistencies(root)
+    prioritize_issues(root)
+
+    while True:
+        done, reason = done_decision(root, no_tests=no_tests)
+        if done:
+            append_auto_log(paths, f"stopping: {reason}")
+            save_state(paths, phase="WRITE_REPORT", should_continue=False, stop_reason=reason, auto_run_finished_at=now_iso())
+            break
+
+        issue = select_next_issue(root)
+        if not issue:
+            reason = "no_open_issue_available"
+            append_auto_log(paths, f"stopping: {reason}")
+            save_state(paths, phase="WRITE_REPORT", should_continue=False, stop_reason=reason, auto_run_finished_at=now_iso())
+            break
+
+        round_path = start_next_round(root)
+        if not round_path:
+            reason = "unable_to_start_round"
+            append_auto_log(paths, f"stopping: {reason}")
+            save_state(paths, phase="WRITE_REPORT", should_continue=False, stop_reason=reason, auto_run_finished_at=now_iso())
+            break
+
+        state = load_state(paths)
+        round_no = int(state.get("round", 0))
+        if not patch_command:
+            reason = "patch_command_required"
+            append_auto_log(paths, f"stopping: {reason}")
+            save_state(paths, should_continue=False, stop_reason=reason, auto_run_finished_at=now_iso())
+            break
+
+        patch_result = run_patch_command(root, patch_command, round_no, round_path, issue, patch_timeout)
+        if patch_result["returncode"] != 0:
+            finish_round(
+                root,
+                round_no,
+                "FAILED",
+                tests=f"patch command failed: {patch_result['log']}",
+                risk="Patch command did not complete successfully.",
+            )
+            reason = "patch_command_failed"
+            append_auto_log(paths, f"stopping: {reason}")
+            save_state(paths, should_continue=False, stop_reason=reason, auto_run_finished_at=now_iso())
+            break
+
+        parse_api_baseline(root)
+        state = load_state(paths)
+        if not state.get("api_contract_safe", True):
+            save_state(paths, consecutive_regressions=int(state.get("consecutive_regressions", 0)) + 1)
+            finish_round(
+                root,
+                round_no,
+                "REJECT_AND_REVERT",
+                tests="API snapshot comparison failed.",
+                risk="Patch changed frozen API contract. Manual rollback or repair is required.",
+            )
+            reason = "api_contract_violation_after_round"
+            append_auto_log(paths, f"stopping: {reason}")
+            save_state(paths, should_continue=False, stop_reason=reason, auto_run_finished_at=now_iso())
+            break
+
+        verification = run_verification_tests(root, f"round-{round_no:03d}", timeout=timeout, no_tests=no_tests)
+        tests_summary = verification_command_summary(verification)
+        if verification["status"] in {"passed", "skipped"}:
+            finish_round(root, round_no, "PASS", tests=tests_summary, risk="Full tests skipped." if no_tests else "None recorded.")
+        else:
+            state = load_state(paths)
+            save_state(paths, consecutive_regressions=int(state.get("consecutive_regressions", 0)) + 1)
+            finish_round(root, round_no, "REWORK_REQUIRED", tests=tests_summary, risk="Verification did not pass after patch.")
+
+        map_code(root)
+        audit_inconsistencies(root)
+        prioritize_issues(root)
+
+    generate_report(root)
+    append_auto_log(paths, "auto-run finished")
+
+
 def command_status(root: Path) -> None:
     paths = RunnerPaths(root)
     state = load_state(paths)
@@ -1608,6 +1881,19 @@ def build_parser() -> argparse.ArgumentParser:
     run = sub.add_parser("run", help="Run deterministic workflow through report generation.")
     run.add_argument("--timeout", type=int, default=900)
     run.add_argument("--no-tests", action="store_true", help="Skip Maven execution and write skipped logs.")
+    auto_run = sub.add_parser("auto-run", help="Continuously run the Goal Runner until DONE or a safety stop condition.")
+    auto_run.add_argument("--timeout", type=int, default=900, help="Timeout in seconds for each Maven verification command.")
+    auto_run.add_argument("--patch-timeout", type=int, default=1800, help="Timeout in seconds for each external patch command.")
+    auto_run.add_argument("--max-rounds", type=int, default=20, help="Maximum repair rounds before stopping.")
+    auto_run.add_argument("--no-tests", action="store_true", help="Skip Maven execution. Use only for dry runs.")
+    auto_run.add_argument(
+        "--patch-command",
+        default=os.environ.get("SHOPHUB_PATCH_COMMAND"),
+        help=(
+            "External command that repairs one round. Placeholders: {root}, {round}, "
+            "{round_file}, {issue_id}, {issue_json}. Can also be set with SHOPHUB_PATCH_COMMAND."
+        ),
+    )
     sub.add_parser("report", help="Generate 修复报告.md.")
     sub.add_parser("status", help="Print state.json.")
     return parser
@@ -1642,6 +1928,15 @@ def main(argv: list[str] | None = None) -> int:
         print(round_path)
     elif args.command == "run":
         run_full_workflow(root, no_tests=args.no_tests, timeout=args.timeout)
+    elif args.command == "auto-run":
+        run_until_done(
+            root,
+            no_tests=args.no_tests,
+            timeout=args.timeout,
+            max_rounds=args.max_rounds,
+            patch_command=args.patch_command,
+            patch_timeout=args.patch_timeout,
+        )
     elif args.command == "report":
         print(generate_report(root))
     elif args.command == "status":

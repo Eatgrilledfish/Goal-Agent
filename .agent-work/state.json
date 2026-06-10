@@ -15,6 +15,10 @@
   "last_score": null,
   "should_continue": false,
   "stop_reason": "missing_competition_inputs",
+  "auto_run_started_at": "2026-06-10T08:00:16+08:00",
+  "auto_run_finished_at": "2026-06-10T08:00:16+08:00",
+  "last_patch_command": null,
+  "last_patch_exit_code": null,
   "missing_required_paths": [
     "code",
     "design-docs",
@@ -23,6 +27,6 @@
     "黑盒用例说明.md",
     "比赛说明.md"
   ],
-  "updated_at": "2026-06-10T07:36:31+08:00",
-  "git_status_at_init": "?? .agent-work/\n?? .gitignore\n?? .opencode/\n?? AGENTS.md\n?? README.md\n?? design-document.md\n?? prompts/\n?? scripts/\n?? \"\\344\\277\\256\\345\\244\\215\\346\\212\\245\\345\\221\\212.md\""
+  "updated_at": "2026-06-10T08:00:16+08:00",
+  "git_status_at_init": "M .agent-work/01_spec_index.md\n M .agent-work/02_api_contract_index.md\n M .agent-work/api_compare.json\n M .agent-work/api_contract.json\n M .agent-work/api_snapshot_baseline.json\n M .agent-work/api_snapshot_current.json\n M .agent-work/baseline_tests.md\n M .agent-work/code_map.md\n M .agent-work/final_report_source.md\n M .agent-work/fix_plan.md\n M .agent-work/goal.md\n M \".agent-work/reports/\\344\\277\\256\\345\\244\\215\\346\\212\\245\\345\\221\\212.md\"\n M .agent-work/state.json\n M README.md\n M scripts/shophub_goal_runner.py\n M \"\\344\\277\\256\\345\\244\\215\\346\\212\\245\\345\\221\\212.md\"\n?? .agent-work/auto-run.log\n?? scripts/run_until_done.sh"
 }
