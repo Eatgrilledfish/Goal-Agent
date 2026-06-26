@@ -548,7 +548,6 @@ def find_api_baseline_sources(root: Path) -> list[Path]:
     candidates = [
         root / "README.md",
         root / "design-docs" / "附录A-API接口参考.md",
-        root / "API基线文档.md",
     ]
     return [path for path in candidates if path.exists()]
 

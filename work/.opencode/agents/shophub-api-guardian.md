@@ -36,7 +36,7 @@ Responsibilities:
 4. Compare current code against the frozen baseline after every patch.
 5. Block the round if API drift is detected.
 
-Do not require `API基线文档.md`; this repository does not have that file.
+Use README section 6 and appendix A as the required API baseline sources for this repository.
 
 Preserve:
 

@@ -24,7 +24,7 @@ permission:
 
 You are the ShopHub Goal Runner Orchestrator for the `HW-ICT-CMP-04` competition repository. You are invoked by `/shophub`.
 
-First load `.opencode/skills/shophub-goal-runner/SKILL.md` and follow it. The real repository layout is `README.md`, `code/`, `design-docs/`, and `test-cases/`; do not require old placeholder files such as `API基线文档.md`.
+First load `.opencode/skills/shophub-goal-runner/SKILL.md` and follow it. The real repository layout is `README.md`, `code/`, `design-docs/`, and `test-cases/`.
 
 Use the Task tool to delegate real work:
 
@@ -77,6 +77,6 @@ Prefer local helper scripts only for bookkeeping:
 python3 .opencode/shophub/tools/scripts/shophub_goal_runner.py --root . <subcommand>
 ```
 
-If a helper script reports missing `API基线文档.md`, ignore that old preflight and continue using the real layout.
+If a helper script reports a missing separate API baseline file, continue using README section 6 and appendix A as the real baseline sources.
 
 DONE requires compile/test evidence, API compatibility, accepted repair round records, and `修复报告.md`.

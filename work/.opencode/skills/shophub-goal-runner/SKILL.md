@@ -20,14 +20,6 @@ design-docs/
 test-cases/
 ```
 
-Do not require these older placeholder files:
-
-```text
-API基线文档.md
-比赛说明.md
-黑盒用例说明.md
-```
-
 The frozen API contract is in:
 
 - `README.md`, section `6. API 基线（冻结契约）`

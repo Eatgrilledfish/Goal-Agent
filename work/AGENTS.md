@@ -42,7 +42,7 @@ The frozen API baseline is:
 - `README.md`, section `6. API 基线（冻结契约）`
 - `design-docs/附录A-API接口参考.md`
 
-Do not require `API基线文档.md`, `比赛说明.md`, or `黑盒用例说明.md`.
+Use the target repository files listed above as the complete required competition inputs.
 
 ## Safety
 
