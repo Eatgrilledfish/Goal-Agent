@@ -37,6 +37,12 @@ Never modify:
 - `README.md`
 - `test-cases/**` unless explicitly diagnosing only and not submitting those edits.
 
-Do not change `/api/v1/` URL, HTTP method, request/response fields, success status codes, or error-code semantics.
+Do not change `/api/v1/` URL, HTTP method, request fields, documented response fields, success status codes, or error-code semantics.
+
+Only add response aliases when all of these are true:
+
+- They expose existing domain state without changing persistence semantics.
+- They do not remove, rename, or change the type of documented fields.
+- They are needed for API compatibility observed in README, appendix A, or public black-box fixtures.
 
 Reject public-test hardcoding. Fix the underlying design behavior.

@@ -38,6 +38,16 @@ Responsibilities:
 4. Deduplicate against existing issues.
 5. Prioritize hidden-test-relevant design behavior, not just public assertions.
 
+Always audit these public-baseline design areas when the relevant module is in scope:
+
+- User: registration status must be `PENDING_ACTIVATION`; activation token must be created; login must require `ACTIVE`; inactive or frozen users should be rejected with an authorization-style status.
+- Order: create order success status must be 201; payable amount must include shipping and packaging fees before discount/points deductions; order detail should expose paid state through `payStatus` or `paymentStatus` without removing `status`.
+- Promotion: `DISCOUNT` coupon formula must treat `discountValue=0.8` as 8折, producing a 20% discount; calculation order must be full reduction, then coupon, then member discount.
+- Payment: callback signature may come from `X-Payment-Signature`; missing callback body `status` should default to success when otherwise valid; payment and order paid state must persist before post-payment logistics/loyalty/notification/event actions; those post-actions must not roll back payment success.
+- Statistics: sales statistics should count orders that were marked paid by successful callbacks and use persisted payable amounts.
+
+When a public test points at a symptom, still create the issue from design behavior and code location. Do not cite the test alone as the source of truth.
+
 Issue JSONL shape:
 
 ```json

@@ -46,6 +46,26 @@ api endpoints extracted: 81
 generic module-missing issues: 0
 ```
 
+## 真实公开用例验证记录
+
+已在真实题库克隆 `/tmp/HW-ICT-CMP-04` 中按设计文档修复公开用例暴露的问题，并通过以下验证：
+
+```text
+docker run --rm -v /tmp/HW-ICT-CMP-04:/workspace -v /tmp/m2-shophub:/root/.m2 -w /workspace maven:3.9-eclipse-temurin-17 mvn -f code/pom.xml test
+docker run --rm -v /tmp/HW-ICT-CMP-04:/workspace -v /tmp/m2-shophub:/root/.m2 -w /workspace maven:3.9-eclipse-temurin-17 mvn -f code/pom.xml install -DskipTests
+docker run --rm -v /tmp/HW-ICT-CMP-04:/workspace -v /tmp/m2-shophub:/root/.m2 -w /workspace maven:3.9-eclipse-temurin-17 mvn -f test-cases/pom.xml test
+```
+
+结果：
+
+```text
+code/pom.xml test: BUILD SUCCESS
+code/pom.xml install -DskipTests: BUILD SUCCESS
+test-cases/pom.xml test: 24 tests, 0 failures, 0 errors, BUILD SUCCESS
+```
+
+本次实测暴露出的设计不一致已同步进 `/work` 的 skill 与 hidden agents 的公开基线诊断清单，后续 `/shophub` 运行会优先审计这些高风险点。
+
 说明：当前交付不再依赖 Codex plugin 或 `~/plugins`；黑箱环境只需将 `/work` 安装到目标比赛仓库 `.opencode/`。
 
 ## 提交结构自检

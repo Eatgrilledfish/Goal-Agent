@@ -49,5 +49,6 @@ Do not require `API基线文档.md`, `比赛说明.md`, or `黑盒用例说明.m
 - Do not modify target `design-docs/**`.
 - Do not modify target `README.md` API baseline or competition instructions.
 - Avoid modifying target `test-cases/**`.
-- Do not change `/api/v1/` URLs, HTTP methods, request headers, request fields, response fields, success status codes, or public error-code semantics.
+- Do not change `/api/v1/` URLs, HTTP methods, request headers, request fields, documented response fields, success status codes, or public error-code semantics.
+- Additive response aliases are allowed only when they expose existing domain state, do not remove or rename documented fields, and are needed for API compatibility observed in README, appendix A, or public black-box fixtures.
 - Do not hardcode public test fixture values.

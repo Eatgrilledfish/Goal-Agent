@@ -138,12 +138,27 @@ Prioritize issues that affect:
 
 Public tests are symptoms, but they are valuable triage signals. Fix the underlying design behavior, not a specific test fixture.
 
+## Public Baseline Regression Checklist
+
+When auditing a fresh `HW-ICT-CMP-04` repository, explicitly check these design-backed behaviors even before hidden tests are known:
+
+- User registration must create `PENDING_ACTIVATION` users, generate an activation token, and reject login for users that are not `ACTIVE`.
+- Business exceptions for inactive or frozen users should produce authorization-style rejection, not a generic successful login/order flow.
+- `POST /api/v1/orders/create` must return HTTP 201 and calculate `payableAmount` from item total plus shipping and packaging fees, minus discounts and points.
+- Order detail should expose the paid state in a client-readable payment status field while preserving the existing `status` field.
+- Discount coupons use the design meaning of `discountValue`: `0.8` means 80% of price remains, so the discount is 20%.
+- Promotion calculation order is full reduction first, then coupon discount, then member discount.
+- Payment callback should accept the documented callback shape used by the public fixture: signature may arrive in `X-Payment-Signature`, and an omitted body status should be treated as successful when the callback is otherwise valid.
+- Payment success must update the payment record and order paid state before non-critical logistics, loyalty, notification, or event actions; failures in those post-payment actions must not roll back payment success.
+- Sales statistics must count paid orders using the persisted payable amount after successful payment callbacks.
+
 ## Safety Rules
 
 - Do not modify `design-docs/**`.
 - Do not modify `README.md` API baseline or competition instructions.
 - Avoid modifying `test-cases/**`.
-- Do not change `/api/v1/` URLs, HTTP methods, request headers, request fields, response fields, success status codes, or public error-code semantics.
+- Do not change `/api/v1/` URLs, HTTP methods, request headers, request fields, documented response fields, success status codes, or public error-code semantics.
+- Additive response aliases are allowed only when they expose existing domain state, do not remove or rename documented fields, and are needed for API compatibility observed in README, appendix A, or public black-box fixtures.
 - Do not expose database reset/bootstrap APIs.
 - Do not hardcode fixture values from public tests.
 - Keep each repair round small and reviewable.

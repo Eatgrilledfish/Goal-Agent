@@ -48,6 +48,8 @@ Preserve:
 - Public error-code semantics.
 - Black-box support management APIs.
 
+API-safe response compatibility means documented response fields cannot be removed, renamed, or type-changed. Additive response aliases may be accepted only when they expose existing domain state and are required by README, appendix A, or public black-box fixture compatibility.
+
 If helper scripts produce an empty baseline endpoint set, discard that result and extract the baseline manually from README and appendix A.
 
 Constraints:
