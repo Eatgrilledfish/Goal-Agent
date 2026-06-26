@@ -23,9 +23,9 @@
 
 工作流会持续执行设计抽取、API 基线保护、代码地图、测试诊断、不一致审计、小步修复、复核和报告生成，直到 DONE 或触发安全停止条件。
 
-## 真实比赛仓库结构
+## 目标比赛仓库结构
 
-目标比赛仓库是：
+本作品运行时需要作用到 ShopHub 题目仓库。公开题库仓库结构为：
 
 ```text
 README.md
@@ -34,22 +34,16 @@ design-docs/
 test-cases/
 ```
 
-不要要求旧版占位文件：
-
-```text
-API基线文档.md
-比赛说明.md
-黑盒用例说明.md
-```
-
-冻结 API 基线来自：
+冻结 API 基线以题库内已提供的材料为准：
 
 - `README.md` 第 6 节 `API 基线（冻结契约）`
 - `design-docs/附录A-API接口参考.md`
 
-## 安装作品
+## 安装 `/shophub` 入口
 
-在提交包根目录执行，并传入比赛仓库路径：
+如果评测平台已经把 `work/.opencode/` 资产放入目标比赛仓库的 `.opencode/` 目录，则无需重复安装，直接进入目标比赛仓库运行 OpenCode 并输入 `/shophub`。
+
+如果评测平台只加载本提交包，则需要先执行一次安装脚本，把 `work/` 内的 OpenCode command、skill、agents 和 helper scripts 复制到目标比赛仓库。在提交包根目录执行，并传入比赛仓库路径：
 
 ```bash
 bash work/install_opencode.sh /path/to/HW-ICT-CMP-04
