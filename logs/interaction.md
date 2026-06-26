@@ -13,5 +13,7 @@
    - `/result/output.md`
    - `/logs/interaction.md`
    - `/logs/trace`
+7. 用户提供真实比赛题库 `https://gitcode.com/oyealex/HW-ICT-CMP-04` 后，发现旧实现错误依赖 `API基线文档.md`、`比赛说明.md`、`黑盒用例说明.md`。
+8. 用户明确要求不用做成插件，改为黑箱 OpenCode 环境可运行的 skill + agent 交付。
 
-交互过程中未要求人工参与具体修复比赛代码；当前仓库是可安装运行的 Goal Runner 提交包。
+当前仓库是可安装运行的 OpenCode skill + hidden-agent Goal Runner 提交包。

@@ -4,49 +4,51 @@
 
 - 入口文件：`/INSTRUCTION.md`
 - 可运行交付件目录：`/work`
+- Skill：`/work/skill/SKILL.md`
+- OpenCode 项目本地 Skill：`/work/.opencode/skills/shophub-goal-runner/SKILL.md`
 - OpenCode 用户入口：`/shophub`
-- OpenCode hidden subagents：`shophub-*.md`
+- OpenCode hidden subagents：`/work/.opencode/agents/shophub-*.md`
+- Helper scripts：`/work/tools/scripts/*.py`
 
 ## 已完成的本地验证记录
 
-本次结构化保存后已执行以下验证，均通过：
+当前 skill + agent 形态已执行以下验证，均通过：
 
 ```text
-Plugin validation passed: /Users/fangjianqiao/Documents/Goal-Agent
 python3 -m py_compile scripts/*.py
+python3 -m py_compile work/tools/scripts/*.py
 bash -n work/install_opencode.sh
-bash -n scripts/install_plugin.sh
-required submission structure ok
+YAML frontmatter ok for work/.opencode agents, command, and skill files
+Skill is valid!
 ```
 
-已执行 `/work` 安装入口：
+已在真实题库克隆 `/tmp/HW-ICT-CMP-04` 上执行 `/work` 安装入口：
 
 ```text
-Installed shophub-goal-runner.
-OpenCode global command:
-  /Users/fangjianqiao/.config/opencode/commands/shophub.md
-OpenCode hidden subagents:
-  /Users/fangjianqiao/.config/opencode/agents/shophub-*.md
+Installed ShopHub Goal Runner into:
+  /tmp/HW-ICT-CMP-04/.opencode
+
+OpenCode assets:
+  .opencode/commands/shophub.md
+  .opencode/agents/shophub-*.md
+  .opencode/skills/shophub-goal-runner/SKILL.md
+  .opencode/shophub/tools/scripts/
 ```
 
-OpenCode 链接验证：
+真实题库结构验证：
 
 ```text
-/Users/fangjianqiao/.config/opencode/commands/shophub.md
-  -> /Users/fangjianqiao/Documents/Goal-Agent/commands/shophub.md
-
-/Users/fangjianqiao/.config/opencode/agents/shophub-orchestrator.md
-  -> /Users/fangjianqiao/Documents/Goal-Agent/agents/shophub-orchestrator.md
-
-/Users/fangjianqiao/.config/opencode/agents/shophub-patch-agent.md
-  -> /Users/fangjianqiao/Documents/Goal-Agent/agents/shophub-patch-agent.md
+missing_required_paths: []
+api baseline sources: README.md, design-docs/附录A-API接口参考.md
+api endpoints extracted: 81
+generic module-missing issues: 0
 ```
 
-说明：当前本机 Codex CLI 的 `codex plugin add` 子命令不可用，因此 Codex personal plugin 安装状态显示为非阻断失败；OpenCode command/subagent 注册已成功。
+说明：当前交付不再依赖 Codex plugin 或 `~/plugins`；黑箱环境只需将 `/work` 安装到目标比赛仓库 `.opencode/`。
 
 ## 提交结构自检
 
-本次结构化保存新增了比赛要求的必选路径：
+必选路径：
 
 ```text
 /INSTRUCTION.md
@@ -56,10 +58,15 @@ OpenCode 链接验证：
 /logs/trace
 ```
 
-可选目录未使用时未创建：
+已使用可选 Skill 路径：
 
 ```text
 /work/skill/SKILL.md
+```
+
+未使用可选目录：
+
+```text
 /result/screenshot
 /problem_statement
 ```

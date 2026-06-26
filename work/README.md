@@ -2,18 +2,18 @@
 
 本目录是比赛提交结构中的可运行交付件目录。
 
-当前作品不是单独 Skill，也不是 MCP server；它是 OpenCode slash command + hidden subagents 的 Goal Runner。因此本目录保留安装入口：
+当前作品是 OpenCode `skill + hidden agents + slash command` 的 Goal Runner，不再是插件。
 
 ```bash
-bash work/install_opencode.sh
+bash work/install_opencode.sh /path/to/HW-ICT-CMP-04
 ```
 
-安装脚本会从提交包根目录注册实际运行资产：
+安装脚本会把实际运行资产复制到目标比赛仓库：
 
-- `commands/shophub.md`
-- `agents/shophub-*.md`
-- `scripts/*.py`
-- `.codex-plugin/plugin.json`
+- `.opencode/commands/shophub.md`
+- `.opencode/agents/shophub-*.md`
+- `.opencode/skills/shophub-goal-runner/SKILL.md`
+- `.opencode/shophub/tools/scripts/*.py`
 
 用户可见入口只有：
 
@@ -21,4 +21,4 @@ bash work/install_opencode.sh
 /shophub
 ```
 
-OpenCode 内部会通过 `shophub-orchestrator` 调用多个 hidden subagent 完成比赛任务。
+OpenCode 内部会加载 `shophub-goal-runner` skill，并通过 `shophub-orchestrator` 调用多个 hidden subagent 完成比赛任务。

@@ -1,105 +1,99 @@
 # ShopHub Goal Runner
 
-This repository contains a local Goal Runner plugin for the ShopHub design/implementation consistency competition.
+This repository contains an OpenCode skill + hidden-agent Goal Runner for the `HW-ICT-CMP-04` ShopHub design/implementation consistency competition.
 
-The runner follows `design-document.md` and coordinates these steps:
-
-1. Create the agent work area.
-2. Extract business rules from `design-docs/`.
-3. Extract the frozen REST API contract from `API基线文档.md`.
-4. Build a Java/Spring code map from `code/`.
-5. Run baseline Maven tests and summarize symptoms.
-6. Maintain an issue queue and fix plan.
-7. Record repair rounds.
-8. Optionally call an external patch agent in a continuous loop.
-9. Generate `修复报告.md`.
-
-The runner is intentionally conservative. It never edits `design-docs/`, `API基线文档.md`, `比赛说明.md`, `黑盒用例说明.md`, or `test-cases/`. In `auto-run` mode, code repair is delegated one issue at a time to the external command passed with `--patch-command`.
-
-## Plugin Usage
-
-This repository is a plugin root with one user-facing slash command and internal hidden subagents:
+The zip submission entry is:
 
 ```text
-.codex-plugin/plugin.json
-commands/shophub.md
-agents/shophub-*.md
+INSTRUCTION.md
+work/
 ```
 
-Install it locally:
+The runtime assets under `work/` are:
+
+```text
+work/skill/SKILL.md
+work/.opencode/commands/shophub.md
+work/.opencode/agents/shophub-*.md
+work/.opencode/skills/shophub-goal-runner/SKILL.md
+work/tools/scripts/*.py
+```
+
+## Install Into OpenCode
+
+Install from this submission package into the target competition repository:
 
 ```bash
-scripts/install_plugin.sh
+bash work/install_opencode.sh /path/to/HW-ICT-CMP-04
 ```
 
-The installer:
+The installer copies assets into the target repository:
 
-- symlinks this repository to `~/plugins/shophub-goal-runner`;
-- adds/updates `~/.agents/plugins/marketplace.json`;
-- runs `codex plugin add shophub-goal-runner@personal` when the Codex CLI is available;
-- links the same slash command into OpenCode at `~/.config/opencode/commands/shophub.md`;
-- registers hidden OpenCode subagents at `~/.config/opencode/agents/shophub-*.md`;
-- removes legacy direct helper links if they exist.
+```text
+.opencode/commands/shophub.md
+.opencode/agents/shophub-*.md
+.opencode/skills/shophub-goal-runner/SKILL.md
+.opencode/shophub/tools/scripts/
+```
 
-After installing, restart the CLI/app if needed.
+No Codex plugin or `~/plugins` installation is required.
 
-From a ShopHub competition repository, run the slash command in Codex or OpenCode:
+## Run
+
+From the target `HW-ICT-CMP-04` repository:
+
+```bash
+opencode
+```
+
+Then enter:
 
 ```text
 /shophub
 ```
 
-Optional slash arguments:
+Optional arguments:
 
 ```text
+/shophub max-rounds=20
 /shophub dry-run
-/shophub no-tests
-/shophub max-rounds=10
 /shophub report-only
 ```
 
-Do not call internal scripts directly during normal use. They are implementation details used by `/shophub`.
+Do not skip tests during a real competition run.
 
-In OpenCode, `/shophub` is bound to the hidden `shophub-orchestrator` subagent. The orchestrator calls these hidden specialist subagents through the Task tool:
+## Real Competition Layout
 
-- `shophub-spec-librarian`
-- `shophub-api-guardian`
-- `shophub-code-mapper`
-- `shophub-test-diagnoser`
-- `shophub-module-auditor`
-- `shophub-patch-agent`
-- `shophub-review-agent`
-- `shophub-report-writer`
-
-These agent files are internal implementation details, not additional slash-command entry points.
-
-## Expected Competition Layout
+The real repository layout is:
 
 ```text
-.
-├── code/
-├── design-docs/
-├── test-cases/
-├── API基线文档.md
-├── 黑盒用例说明.md
-├── 比赛说明.md
-├── AGENTS.md
-└── .agent-work/
+README.md
+code/
+design-docs/
+test-cases/
 ```
 
-This scaffold can be initialized before the competition files exist. Missing competition inputs are reported in `.agent-work/goal.md` and `state.json`.
+The frozen API baseline is in:
+
+- `README.md`, section `6. API 基线（冻结契约）`
+- `design-docs/附录A-API接口参考.md`
+
+Do not require older placeholder files such as `API基线文档.md`, `比赛说明.md`, or `黑盒用例说明.md`.
 
 ## Verification
 
+Local package validation:
+
 ```bash
-python3 -m py_compile scripts/*.py
-PYTHONPATH=/tmp/codex-plugin-validator-deps python3 /Users/fangjianqiao/.codex/skills/.system/plugin-creator/scripts/validate_plugin.py .
+python3 -m py_compile scripts/*.py work/tools/scripts/*.py
+bash -n work/install_opencode.sh
+PYTHONPATH=/tmp/codex-plugin-validator-deps python3 /Users/fangjianqiao/.codex/skills/.system/skill-creator/scripts/quick_validate.py work/skill
 ```
 
-When the real ShopHub competition files are present, final verification is:
+Competition verification:
 
 ```bash
 mvn -f code/pom.xml test
-mvn -f code/pom.xml install
+mvn -f code/pom.xml install -DskipTests
 mvn -f test-cases/pom.xml test
 ```
