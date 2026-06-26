@@ -1,1 +1,0 @@
-SKIPPED by --no-tests: mvn -f test-cases/pom.xml test

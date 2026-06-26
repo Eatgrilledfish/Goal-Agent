@@ -1,6 +1,6 @@
 # ShopHub Goal Runner 运行入口
 
-本作品用于 `HW-ICT-CMP-04` ShopHub 设计实现一致性检查与修复比赛。平台加载本文件后，应把本仓库视为提交包，把 `work/` 视为 OpenCode 可运行交付件入口目录。
+本作品用于 `HW-ICT-CMP-04` ShopHub 设计实现一致性检查与修复比赛。平台加载本文件后，应把本仓库视为提交包，把 `work/` 视为作品运行根目录。所有可运行交付件都在 `work/` 内。
 
 ## 作品目标
 
@@ -55,10 +55,10 @@ API基线文档.md
 bash work/install_opencode.sh /path/to/HW-ICT-CMP-04
 ```
 
-如果当前目录就是比赛仓库，也可以执行：
+如果执行环境已经把 `work/` 当作当前目录，则执行：
 
 ```bash
-bash /path/to/submission/work/install_opencode.sh
+bash install_opencode.sh /path/to/HW-ICT-CMP-04
 ```
 
 该脚本会把 skill、agents、command 和 helper scripts 安装到目标比赛仓库：
@@ -71,6 +71,10 @@ bash /path/to/submission/work/install_opencode.sh
 ```
 
 不需要安装 Codex plugin，也不依赖 `~/plugins`。
+
+## Agent 根目录约定
+
+对于 OpenCode agent，本作品的根目录是 `work/`，不是提交包根目录。`work/AGENTS.md` 是运行约束入口；agent 不应依赖 `work/` 外部的文件。
 
 ## 运行作品
 

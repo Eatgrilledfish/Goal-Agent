@@ -9,6 +9,7 @@
 - OpenCode 用户入口：`/shophub`
 - OpenCode hidden subagents：`/work/.opencode/agents/shophub-*.md`
 - Helper scripts：`/work/tools/scripts/*.py`
+- Agent 根目录：`/work`
 
 ## 已完成的本地验证记录
 
@@ -20,6 +21,7 @@ python3 -m py_compile work/tools/scripts/*.py
 bash -n work/install_opencode.sh
 YAML frontmatter ok for work/.opencode agents, command, and skill files
 Skill is valid!
+strict submission structure ok
 ```
 
 已在真实题库克隆 `/tmp/HW-ICT-CMP-04` 上执行 `/work` 安装入口：
@@ -58,10 +60,18 @@ generic module-missing issues: 0
 /logs/trace
 ```
 
+根目录已移除旧插件、旧脚本、旧报告和旧运行产物；运行交付件只保留在 `/work` 内。
+
 已使用可选 Skill 路径：
 
 ```text
 /work/skill/SKILL.md
+```
+
+运行约束文件：
+
+```text
+/work/AGENTS.md
 ```
 
 未使用可选目录：
