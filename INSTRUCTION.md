@@ -4,7 +4,7 @@
 
 ## 运行目标
 
-在 `HW-ICT-CMP-04` ShopHub 题目仓库中，使用 `work/` 内的 skill、subagent 定义和 helper scripts，持续比较设计文档、冻结 API 基线与 Java Spring Boot 实现，修复代码中的设计实现不一致，直到公开验证通过或触发明确安全停止条件。
+在ShopHub 题目仓库中，使用 `work/` 内的 skill、subagent 定义和 helper scripts，持续比较设计文档、冻结 API 基线与 Java Spring Boot 实现，修复代码中的设计实现不一致，直到公开验证通过或触发明确安全停止条件。
 
 ## 目录定位
 
