@@ -4,27 +4,19 @@ Treat this `work/` directory as the delivery root.
 
 ## Runtime Assets
 
-All runnable OpenCode assets are under this directory:
+All runnable assets are under this directory:
 
 ```text
-.opencode/commands/shophub.md
-.opencode/agents/shophub-*.md
-.opencode/skills/shophub-goal-runner/SKILL.md
+skill/SKILL.md
+skills/shophub-*.md
 tools/scripts/*.py
-install_opencode.sh
 ```
 
 Do not depend on files outside `work/` at runtime.
 
-## Installation
+## Execution
 
-Install into the target `HW-ICT-CMP-04` repository:
-
-```bash
-bash install_opencode.sh /path/to/HW-ICT-CMP-04
-```
-
-The installer copies this work package into the target repository's `.opencode/` directory.
+Do not install a plugin or copy files into the target repository. The platform loads `/INSTRUCTION.md`; the running agent should read `work/skill/SKILL.md`, then load subagent definitions from `work/skills/*.md`, and execute against the target `HW-ICT-CMP-04` repository in place.
 
 ## Target Repository Truth
 

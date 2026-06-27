@@ -360,7 +360,7 @@ Compare ShopHub design documents, frozen REST API contract, and Spring Boot impl
 
 ```bash
 mvn -f code/pom.xml test
-mvn -f code/pom.xml install
+mvn -f code/pom.xml install -DskipTests
 mvn -f test-cases/pom.xml test
 ```
 """
@@ -992,7 +992,7 @@ def run_baseline_tests(root: Path, timeout: int = 900, no_tests: bool = False) -
     ensure_work_layout(paths)
     commands = [
         ("code-test-baseline.log", ["mvn", "-f", "code/pom.xml", "test"]),
-        ("code-install-baseline.log", ["mvn", "-f", "code/pom.xml", "install"]),
+        ("code-install-baseline.log", ["mvn", "-f", "code/pom.xml", "install", "-DskipTests"]),
         ("blackbox-baseline.log", ["mvn", "-f", "test-cases/pom.xml", "test"]),
     ]
     results: list[dict[str, Any]] = []
@@ -1045,7 +1045,7 @@ def run_verification_tests(root: Path, label: str, timeout: int = 900, no_tests:
     ensure_work_layout(paths)
     commands = [
         (f"{label}-code-test.log", ["mvn", "-f", "code/pom.xml", "test"]),
-        (f"{label}-code-install.log", ["mvn", "-f", "code/pom.xml", "install"]),
+        (f"{label}-code-install.log", ["mvn", "-f", "code/pom.xml", "install", "-DskipTests"]),
         (f"{label}-blackbox.log", ["mvn", "-f", "test-cases/pom.xml", "test"]),
     ]
     results: list[dict[str, Any]] = []
@@ -1634,7 +1634,7 @@ def render_report(
             f"- API 契约是否保持不变：{api_safe}",
             "- 最终验证命令：",
             "  - `mvn -f code/pom.xml test`",
-            "  - `mvn -f code/pom.xml install`",
+            "  - `mvn -f code/pom.xml install -DskipTests`",
             "  - `mvn -f test-cases/pom.xml test`",
             f"- 最终验证结果：{final_test_result}",
             "",

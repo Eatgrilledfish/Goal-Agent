@@ -1,16 +1,45 @@
 # ShopHub Goal Runner 运行入口
 
-本作品用于 `HW-ICT-CMP-04` ShopHub 设计实现一致性检查与修复比赛。平台加载本文件后，应把本仓库视为提交包，把 `work/` 视为作品运行根目录。所有可运行交付件都在 `work/` 内。
+本文件是作品运行入口。平台加载本 Markdown 后，请按本文直接运行作品，不需要安装插件，也不需要安装额外命令入口。
 
-## 作品目标
+## 运行目标
 
-在 OpenCode 中通过 skill + hidden agents 完成比赛目标。安装后可通过一个命令启动：
+在 `HW-ICT-CMP-04` ShopHub 题目仓库中，使用 `work/` 内的 skill、subagent 定义和 helper scripts，持续比较设计文档、冻结 API 基线与 Java Spring Boot 实现，修复代码中的设计实现不一致，直到公开验证通过或触发明确安全停止条件。
+
+## 目录定位
+
+先确定两个根目录：
+
+- `SUBMISSION_ROOT`：本提交包根目录，包含本文件和 `work/`。
+- `PROJECT_ROOT`：待修复的 ShopHub 题目仓库根目录，必须包含：
 
 ```text
-/shophub
+README.md
+code/pom.xml
+design-docs/
+test-cases/pom.xml
 ```
 
-该命令会加载 `shophub-goal-runner` skill，启动隐藏的 `shophub-orchestrator` subagent，并由它调用以下专项 subagent 协同工作：
+如果当前工作目录已经包含这些题目仓库文件，则它就是 `PROJECT_ROOT`。否则在当前目录、父目录、兄弟目录中查找满足上述结构的目录。
+
+`WORK_ROOT` 固定为：
+
+```text
+${SUBMISSION_ROOT}/work
+```
+
+## 加载作品
+
+按以下顺序读取并遵守运行资产：
+
+1. `${WORK_ROOT}/AGENTS.md`
+2. `${WORK_ROOT}/skill/SKILL.md`
+3. `${WORK_ROOT}/skills/*.md`
+4. `${WORK_ROOT}/tools/scripts/*.py`
+
+`work/skills/` 中的每个 Markdown 是一个 subagent 定义。若当前 agent 框架支持 subagent/Task 调用，请按文件名中的 agent 名称调用；若不支持，则由主 agent 读取这些文件并按其职责顺序执行。
+
+必须使用的 subagent 定义：
 
 - `shophub-spec-librarian`
 - `shophub-api-guardian`
@@ -21,102 +50,92 @@
 - `shophub-review-agent`
 - `shophub-report-writer`
 
-工作流会持续执行设计抽取、API 基线保护、代码地图、测试诊断、不一致审计、小步修复、复核和报告生成，直到 DONE 或触发安全停止条件。
+## 题目依据
 
-## 目标比赛仓库结构
-
-本作品运行时需要作用到 ShopHub 题目仓库。公开题库仓库结构为：
+业务真相来源：
 
 ```text
-README.md
-code/
-design-docs/
-test-cases/
+${PROJECT_ROOT}/design-docs/
 ```
 
-冻结 API 基线以题库内已提供的材料为准：
+冻结 API 基线来源：
 
-- `README.md` 第 6 节 `API 基线（冻结契约）`
-- `design-docs/附录A-API接口参考.md`
+```text
+${PROJECT_ROOT}/README.md
+${PROJECT_ROOT}/design-docs/附录A-API接口参考.md
+```
 
-## 安装 `/shophub` 入口
+公开黑盒测试只作为诊断信号，不能作为唯一需求依据。
 
-如果评测平台已经把 `work/.opencode/` 资产放入目标比赛仓库的 `.opencode/` 目录，则无需重复安装，直接进入目标比赛仓库运行 OpenCode 并输入 `/shophub`。
+## 必须执行的工作流
 
-如果评测平台只加载本提交包，则需要先执行一次安装脚本，把 `work/` 内的 OpenCode command、skill、agents 和 helper scripts 复制到目标比赛仓库。在提交包根目录执行，并传入比赛仓库路径：
+1. 预检 `PROJECT_ROOT` 结构与 `git status --short`。
+2. 读取 `design-docs/**`，提取可追踪业务规则。
+3. 读取冻结 API 基线，记录并保护 `/api/v1/` REST 契约。
+4. 建立代码地图：controller、service、repository、DTO、entity、event、test。
+5. 运行基线验证，记录失败症状。
+6. 将失败症状和高风险模块转换为带设计依据、代码位置和 API 影响的 issue。
+7. 每轮只修一个 issue 或一个紧耦合 issue 组。
+8. 每轮修复后运行聚焦测试、API 契约检查和 review。
+9. 循环直到公开用例通过，或剩余问题被设计依据证明为风险接受/安全停止。
+10. 生成 `${PROJECT_ROOT}/修复报告.md`。
+
+## 验证命令
+
+在 `PROJECT_ROOT` 中按顺序执行：
 
 ```bash
-bash work/install_opencode.sh /path/to/HW-ICT-CMP-04
+mvn -f code/pom.xml test
+mvn -f code/pom.xml install -DskipTests
+mvn -f test-cases/pom.xml test
 ```
 
-如果执行环境已经把 `work/` 当作当前目录，则执行：
+如果环境没有本机 Maven/JDK，但允许 Docker，可使用 Maven JDK 17 镜像执行等价命令；最终报告必须写清实际执行方式。
 
-```bash
-bash install_opencode.sh /path/to/HW-ICT-CMP-04
-```
+## 修复约束
 
-该脚本会把 skill、agents、command 和 helper scripts 安装到目标比赛仓库：
+禁止修改：
 
 ```text
-.opencode/commands/shophub.md
-.opencode/agents/shophub-*.md
-.opencode/skills/shophub-goal-runner/SKILL.md
-.opencode/shophub/tools/scripts/
+design-docs/**
+README.md 中的比赛说明和 API 基线
+test-cases/**（除非仅为本地诊断，提交修复不得依赖测试改动）
 ```
 
-不需要安装 Codex plugin，也不依赖 `~/plugins`。
+不得改变：
 
-## Agent 根目录约定
+- `/api/v1/` REST URL
+- HTTP Method
+- 请求头语义
+- 请求体字段名或类型
+- 已文档化响应字段名或类型
+- 成功状态码
+- 公开错误码语义
 
-对于 OpenCode agent，本作品的根目录是 `work/`，不是提交包根目录。`work/AGENTS.md` 是运行约束入口；agent 不应依赖 `work/` 外部的文件。
+允许修改：
 
-## 运行作品
+- `code/**` 下 Java 源码和 JUnit 测试
+- `code/**/application.yml` 或 `application.yaml`
+- `code/**/pom.xml`
 
-安装完成后，进入比赛仓库并启动 OpenCode：
+可添加响应兼容别名，但仅当它暴露已有领域状态、不删除或改名已文档化字段，且用于保持 README、附录A或公开 fixture 观察到的 API 兼容性。
 
-```bash
-opencode
-```
+## 完成标准
 
-在 OpenCode CLI 中输入：
+完成时必须满足：
 
-```text
-/shophub
-```
-
-可选参数：
-
-```text
-/shophub max-rounds=20
-/shophub dry-run
-/shophub report-only
-```
-
-真实比赛运行不要跳过测试。
-
-## 输出要求
-
-作品运行后会在比赛仓库中生成或更新：
-
-```text
-.agent-work/
-修复报告.md
-```
+- 记录设计依据。
+- 记录修复前代码行为或测试症状。
+- 列出修改文件。
+- API 契约保持兼容。
+- 执行并记录验证命令结果。
+- `${PROJECT_ROOT}/修复报告.md` 已生成。
 
 最终回答必须包含：
 
-- 状态：DONE、BLOCKED 或 STOPPED_BY_SAFETY；
-- 发现、修复、未修复 issue 数量；
-- API 契约状态；
-- 实际执行的验证命令与结果；
-- `修复报告.md` 路径；
-- 剩余风险。
-
-## 安全约束
-
-- 不修改 `design-docs/**`。
-- 不修改 `README.md` 中的比赛说明和 API 基线。
-- 避免修改 `test-cases/**`。
-- 不改变 `/api/v1/` REST URL、HTTP Method、请求头、请求体字段、响应体字段、成功状态码或公开错误码语义。
-- 每个 issue 和 fix 必须能回溯到设计文档或 API 基线。
-- 公开黑盒测试只能作为症状，不能作为唯一需求依据。
+- 状态：`DONE`、`BLOCKED` 或 `STOPPED_BY_SAFETY`
+- issue 发现/修复/剩余数量
+- API 契约状态
+- 验证命令和结果
+- `修复报告.md` 路径
+- 剩余风险

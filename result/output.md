@@ -4,46 +4,46 @@
 
 - 入口文件：`/INSTRUCTION.md`
 - 可运行交付件目录：`/work`
-- Skill：`/work/skill/SKILL.md`
-- OpenCode 项目本地 Skill：`/work/.opencode/skills/shophub-goal-runner/SKILL.md`
-- OpenCode 用户入口：`/shophub`
-- OpenCode hidden subagents：`/work/.opencode/agents/shophub-*.md`
+- 主 Skill：`/work/skill/SKILL.md`
+- Subagents：`/work/skills/shophub-*.md`
 - Helper scripts：`/work/tools/scripts/*.py`
 - Agent 根目录：`/work`
 
-## 已完成的本地验证记录
+当前交付不需要安装插件，不需要安装额外命令入口，也不需要把运行资产复制到题目仓库。平台加载 `/INSTRUCTION.md` 后，直接读取 `/work` 内资产并作用于目标 `HW-ICT-CMP-04` 题目仓库。
 
-当前 skill + agent 形态已执行以下验证，均通过：
+## 本地结构自检
+
+必选路径：
 
 ```text
-python3 -m py_compile scripts/*.py
+/INSTRUCTION.md
+/work
+/result/output.md
+/logs/interaction.md
+/logs/trace
+```
+
+可选路径：
+
+```text
+/work/skill/SKILL.md
+/work/skills/shophub-api-guardian.md
+/work/skills/shophub-code-mapper.md
+/work/skills/shophub-module-auditor.md
+/work/skills/shophub-orchestrator.md
+/work/skills/shophub-patch-agent.md
+/work/skills/shophub-report-writer.md
+/work/skills/shophub-review-agent.md
+/work/skills/shophub-spec-librarian.md
+/work/skills/shophub-test-diagnoser.md
+```
+
+已执行轻量验证：
+
+```text
 python3 -m py_compile work/tools/scripts/*.py
-bash -n work/install_opencode.sh
-YAML frontmatter ok for work/.opencode agents, command, and skill files
-Skill is valid!
+YAML frontmatter ok for work/skills/*.md and work/skill/SKILL.md
 strict submission structure ok
-```
-
-已在真实题库克隆 `/tmp/HW-ICT-CMP-04` 上执行 `/work` 安装入口：
-
-```text
-Installed ShopHub Goal Runner into:
-  /tmp/HW-ICT-CMP-04/.opencode
-
-OpenCode assets:
-  .opencode/commands/shophub.md
-  .opencode/agents/shophub-*.md
-  .opencode/skills/shophub-goal-runner/SKILL.md
-  .opencode/shophub/tools/scripts/
-```
-
-真实题库结构验证：
-
-```text
-missing_required_paths: []
-api baseline sources: README.md, design-docs/附录A-API接口参考.md
-api endpoints extracted: 81
-generic module-missing issues: 0
 ```
 
 ## 真实公开用例验证记录
@@ -64,46 +64,11 @@ code/pom.xml install -DskipTests: BUILD SUCCESS
 test-cases/pom.xml test: 24 tests, 0 failures, 0 errors, BUILD SUCCESS
 ```
 
-本次实测暴露出的设计不一致已同步进 `/work` 的 skill 与 hidden agents 的公开基线诊断清单，后续 `/shophub` 运行会优先审计这些高风险点。
-
-说明：当前交付不再依赖 Codex plugin 或 `~/plugins`；黑箱环境只需将 `/work` 安装到目标比赛仓库 `.opencode/`。
-
-## 提交结构自检
-
-必选路径：
-
-```text
-/INSTRUCTION.md
-/work
-/result/output.md
-/logs/interaction.md
-/logs/trace
-```
-
-根目录已移除旧插件、旧脚本、旧报告和旧运行产物；运行交付件只保留在 `/work` 内。
-
-已使用可选 Skill 路径：
-
-```text
-/work/skill/SKILL.md
-```
-
-运行约束文件：
-
-```text
-/work/AGENTS.md
-```
-
-未使用可选目录：
-
-```text
-/result/screenshot
-/problem_statement
-```
+本次实测暴露出的设计不一致已同步进 `/work/skill/SKILL.md` 与 `/work/skills/*.md` 的公开基线诊断清单。
 
 ## 运行成功后的预期输出
 
-在真实 ShopHub 比赛仓库中运行 `/shophub` 后，应生成：
+在真实 ShopHub 比赛仓库中按 `/INSTRUCTION.md` 执行后，应生成：
 
 ```text
 .agent-work/

@@ -1,11 +1,11 @@
 ---
 name: shophub-goal-runner
-description: Use this skill in OpenCode for the HW-ICT-CMP-04 ShopHub design-implementation consistency competition. It coordinates hidden subagents to read design-docs and README API baseline, run Maven public black-box tests, diagnose concrete Java/Spring defects, patch code in small rounds, preserve the frozen /api/v1 REST contract, and write 修复报告.md.
+description: Use this skill for the HW-ICT-CMP-04 ShopHub design-implementation consistency competition. It coordinates subagents to read design-docs and README API baseline, run Maven public black-box tests, diagnose concrete Java/Spring defects, patch code in small rounds, preserve the frozen /api/v1 REST contract, and write 修复报告.md.
 ---
 
 # ShopHub Goal Runner
 
-Use this skill when working in the `HW-ICT-CMP-04` ShopHub competition repository.
+Use this skill when the platform loads `/INSTRUCTION.md` and runs against the `HW-ICT-CMP-04` ShopHub competition repository.
 
 The goal is to maximize hidden and public test pass rate by fixing design-code inconsistencies in `code/` while preserving the frozen REST API contract.
 
@@ -29,7 +29,7 @@ The design truth is all files under `design-docs/`.
 
 ## Mandatory Subagents
 
-Use the Task tool when available. Invoke these hidden agents by name:
+Load subagent definitions from `work/skills/*.md`. Use the Task/subagent tool when available. Invoke these agents by name:
 
 - `shophub-spec-librarian`
 - `shophub-api-guardian`
@@ -40,7 +40,7 @@ Use the Task tool when available. Invoke these hidden agents by name:
 - `shophub-review-agent`
 - `shophub-report-writer`
 
-Do not run the competition as a single monolithic pass unless the runtime cannot invoke subagents.
+Do not run the competition as a single monolithic pass unless the runtime cannot invoke subagents; in that fallback, the main agent must read and follow each `work/skills/*.md` file itself.
 
 ## Module Mapping
 
@@ -81,7 +81,7 @@ Never create "module missing" issues merely because a design filename does not m
    - Use the fixed module mapping above.
 5. Run tests:
    - Call `shophub-test-diagnoser`.
-   - Run public black-box tests after installing business code.
+   - Run public black-box tests after building and installing the repaired Maven modules into the local Maven repository.
 6. Audit:
    - Call `shophub-module-auditor` per failed public behavior and high-risk design module.
    - Each issue must cite design/API evidence and exact code locations.
@@ -157,10 +157,10 @@ When auditing a fresh `HW-ICT-CMP-04` repository, explicitly check these design-
 
 ## Local Helper Scripts
 
-If present, deterministic helper scripts are under:
+Deterministic helper scripts are under:
 
 ```text
-.opencode/shophub/tools/scripts/
+work/tools/scripts/
 ```
 
 Use them for indexing, logs, and report scaffolding only. They do not replace subagent analysis or code repair.

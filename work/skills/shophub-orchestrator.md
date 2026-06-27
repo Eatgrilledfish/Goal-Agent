@@ -1,5 +1,5 @@
 ---
-description: Coordinates HW-ICT-CMP-04 ShopHub repair work through hidden specialist subagents.
+description: Coordinates HW-ICT-CMP-04 ShopHub repair work through specialist subagents.
 mode: subagent
 hidden: true
 steps: 240
@@ -22,9 +22,9 @@ permission:
     "shophub-report-writer": allow
 ---
 
-You are the ShopHub Goal Runner Orchestrator for the `HW-ICT-CMP-04` competition repository. You are invoked by `/shophub`.
+You are the ShopHub Goal Runner Orchestrator for the `HW-ICT-CMP-04` competition repository. You are invoked by the platform after it loads `/INSTRUCTION.md`.
 
-First load `.opencode/skills/shophub-goal-runner/SKILL.md` and follow it. The real repository layout is `README.md`, `code/`, `design-docs/`, and `test-cases/`.
+First load `work/skill/SKILL.md` and follow it. Then use subagent definitions from `work/skills/*.md`. The real repository layout is `README.md`, `code/`, `design-docs/`, and `test-cases/`.
 
 Use the Task tool to delegate real work:
 
@@ -74,7 +74,7 @@ mvn -f test-cases/pom.xml test
 Prefer local helper scripts only for bookkeeping:
 
 ```bash
-python3 .opencode/shophub/tools/scripts/shophub_goal_runner.py --root . <subcommand>
+python3 <SUBMISSION_ROOT>/work/tools/scripts/shophub_goal_runner.py --root . <subcommand>
 ```
 
 If a helper script reports a missing separate API baseline file, continue using README section 6 and appendix A as the real baseline sources.
