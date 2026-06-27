@@ -66,10 +66,12 @@ Safety rules:
 Verification commands:
 
 ```bash
-mvn -f code/pom.xml test
-mvn -f code/pom.xml install -DskipTests
-mvn -f test-cases/pom.xml test
+mvn -s maven-settings.xml -f code/pom.xml test
+mvn -s maven-settings.xml -f code/pom.xml install -DskipTests
+mvn -s maven-settings.xml -f test-cases/pom.xml test
 ```
+
+Use local Maven only. `maven-settings.xml` is the required internal mirror configuration.
 
 Prefer local helper scripts only for bookkeeping:
 

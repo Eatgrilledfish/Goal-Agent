@@ -48,12 +48,14 @@ strict submission structure ok
 
 ## 真实公开用例验证记录
 
-已在真实题库克隆 `/tmp/HW-ICT-CMP-04` 中按设计文档修复公开用例暴露的问题，并通过以下验证：
+已在真实题库克隆 `/tmp/HW-ICT-CMP-04` 中按设计文档修复公开用例暴露的问题，并通过公开用例验证。
+
+比赛黑箱环境应使用本机 Maven。若题库根目录存在 `maven-settings.xml`，必须使用内网镜像配置：
 
 ```text
-docker run --rm -v /tmp/HW-ICT-CMP-04:/workspace -v /tmp/m2-shophub:/root/.m2 -w /workspace maven:3.9-eclipse-temurin-17 mvn -f code/pom.xml test
-docker run --rm -v /tmp/HW-ICT-CMP-04:/workspace -v /tmp/m2-shophub:/root/.m2 -w /workspace maven:3.9-eclipse-temurin-17 mvn -f code/pom.xml install -DskipTests
-docker run --rm -v /tmp/HW-ICT-CMP-04:/workspace -v /tmp/m2-shophub:/root/.m2 -w /workspace maven:3.9-eclipse-temurin-17 mvn -f test-cases/pom.xml test
+mvn -s maven-settings.xml -f code/pom.xml test
+mvn -s maven-settings.xml -f code/pom.xml install -DskipTests
+mvn -s maven-settings.xml -f test-cases/pom.xml test
 ```
 
 结果：

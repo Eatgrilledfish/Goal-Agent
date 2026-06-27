@@ -20,19 +20,19 @@ Outputs:
 - `.agent-work/test_symptoms.jsonl`
 - `.agent-work/test-results/*.log`
 
-Run full verification in this order:
+Use local Maven and pass the project-root `maven-settings.xml` to every Maven command:
 
 ```bash
-mvn -f code/pom.xml test
-mvn -f code/pom.xml install -DskipTests
-mvn -f test-cases/pom.xml test
+mvn -s maven-settings.xml -f code/pom.xml test
+mvn -s maven-settings.xml -f code/pom.xml install -DskipTests
+mvn -s maven-settings.xml -f test-cases/pom.xml test
 ```
 
 Focused public tests:
 
 ```bash
-mvn -f test-cases/pom.xml -Dtest=PubBasicFlowTest test
-mvn -f test-cases/pom.xml -Dtest=PubAdditionalBehaviorTest test
+mvn -s maven-settings.xml -f test-cases/pom.xml -Dtest=PubBasicFlowTest test
+mvn -s maven-settings.xml -f test-cases/pom.xml -Dtest=PubAdditionalBehaviorTest test
 ```
 
 Responsibilities:
@@ -42,4 +42,4 @@ Responsibilities:
 3. Map failed tests to REST endpoints, fixtures, modules, and design docs.
 4. Mark public tests as symptoms, then cite design docs before patching.
 
-If Maven is unavailable, return BLOCKED with the exact environment failure. Do not fabricate issue findings from missing test output.
+If Maven is unavailable, return BLOCKED with the exact environment failure. Do not switch to another runtime path or fabricate issue findings from missing test output.

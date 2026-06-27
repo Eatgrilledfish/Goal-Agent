@@ -82,15 +82,13 @@ ${PROJECT_ROOT}/design-docs/附录A-API接口参考.md
 
 ## 验证命令
 
-在 `PROJECT_ROOT` 中按顺序执行：
+在 `PROJECT_ROOT` 中按顺序执行。本机必须使用 Maven；`PROJECT_ROOT/maven-settings.xml` 是内网镜像配置，所有 Maven 命令必须使用该文件。
 
 ```bash
-mvn -f code/pom.xml test
-mvn -f code/pom.xml install -DskipTests
-mvn -f test-cases/pom.xml test
+mvn -s maven-settings.xml -f code/pom.xml test
+mvn -s maven-settings.xml -f code/pom.xml install -DskipTests
+mvn -s maven-settings.xml -f test-cases/pom.xml test
 ```
-
-如果环境没有本机 Maven/JDK，但允许 Docker，可使用 Maven JDK 17 镜像执行等价命令；最终报告必须写清实际执行方式。
 
 ## 修复约束
 

@@ -207,6 +207,34 @@ class RunnerPaths:
         return self.work / "spec_rules.jsonl"
 
 
+def find_maven_settings(root: Path) -> Path | None:
+    env_value = os.environ.get("SHOPHUB_MAVEN_SETTINGS") or os.environ.get("MAVEN_SETTINGS")
+    if env_value:
+        env_path = Path(env_value).expanduser()
+        if not env_path.is_absolute():
+            env_path = root / env_path
+        if env_path.exists():
+            return env_path
+
+    for candidate in (root / "maven-settings.xml", root / "settings.xml"):
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def maven_command(root: Path, args: list[str]) -> list[str]:
+    command = ["mvn"]
+    settings_path = find_maven_settings(root)
+    if settings_path is not None:
+        command.extend(["-s", rel(root, settings_path)])
+    command.extend(args)
+    return command
+
+
+def command_text(command: list[str]) -> str:
+    return shlex.join(command)
+
+
 def default_state() -> dict[str, Any]:
     return {
         "phase": "INIT",
@@ -358,10 +386,12 @@ Compare ShopHub design documents, frozen REST API contract, and Spring Boot impl
 
 ## Verification Commands
 
+If `maven-settings.xml` exists in the project root, use it for every Maven command:
+
 ```bash
-mvn -f code/pom.xml test
-mvn -f code/pom.xml install -DskipTests
-mvn -f test-cases/pom.xml test
+mvn -s maven-settings.xml -f code/pom.xml test
+mvn -s maven-settings.xml -f code/pom.xml install -DskipTests
+mvn -s maven-settings.xml -f test-cases/pom.xml test
 ```
 """
     write_text(paths.work / "goal.md", text)
@@ -991,21 +1021,21 @@ def run_baseline_tests(root: Path, timeout: int = 900, no_tests: bool = False) -
     paths = RunnerPaths(root)
     ensure_work_layout(paths)
     commands = [
-        ("code-test-baseline.log", ["mvn", "-f", "code/pom.xml", "test"]),
-        ("code-install-baseline.log", ["mvn", "-f", "code/pom.xml", "install", "-DskipTests"]),
-        ("blackbox-baseline.log", ["mvn", "-f", "test-cases/pom.xml", "test"]),
+        ("code-test-baseline.log", "code/pom.xml", maven_command(root, ["-f", "code/pom.xml", "test"])),
+        ("code-install-baseline.log", "code/pom.xml", maven_command(root, ["-f", "code/pom.xml", "install", "-DskipTests"])),
+        ("blackbox-baseline.log", "test-cases/pom.xml", maven_command(root, ["-f", "test-cases/pom.xml", "test"])),
     ]
     results: list[dict[str, Any]] = []
-    for log_name, command in commands:
+    for log_name, pom_rel, command in commands:
         log_path = paths.test_results / log_name
-        pom_path = root / command[2]
+        pom_path = root / pom_rel
         if no_tests:
-            content = f"SKIPPED by --no-tests: {' '.join(command)}\n"
+            content = f"SKIPPED by --no-tests: {command_text(command)}\n"
             write_text(log_path, content)
             results.append({"command": command, "log": rel(root, log_path), "returncode": None, "skipped": True})
             continue
         if not pom_path.exists():
-            content = f"SKIPPED missing {command[2]}: {' '.join(command)}\n"
+            content = f"SKIPPED missing {pom_rel}: {command_text(command)}\n"
             write_text(log_path, content)
             results.append({"command": command, "log": rel(root, log_path), "returncode": None, "skipped": True})
             continue
@@ -1044,20 +1074,20 @@ def run_verification_tests(root: Path, label: str, timeout: int = 900, no_tests:
     paths = RunnerPaths(root)
     ensure_work_layout(paths)
     commands = [
-        (f"{label}-code-test.log", ["mvn", "-f", "code/pom.xml", "test"]),
-        (f"{label}-code-install.log", ["mvn", "-f", "code/pom.xml", "install", "-DskipTests"]),
-        (f"{label}-blackbox.log", ["mvn", "-f", "test-cases/pom.xml", "test"]),
+        (f"{label}-code-test.log", "code/pom.xml", maven_command(root, ["-f", "code/pom.xml", "test"])),
+        (f"{label}-code-install.log", "code/pom.xml", maven_command(root, ["-f", "code/pom.xml", "install", "-DskipTests"])),
+        (f"{label}-blackbox.log", "test-cases/pom.xml", maven_command(root, ["-f", "test-cases/pom.xml", "test"])),
     ]
     results: list[dict[str, Any]] = []
-    for log_name, command in commands:
+    for log_name, pom_rel, command in commands:
         log_path = paths.test_results / log_name
-        pom_path = root / command[2]
+        pom_path = root / pom_rel
         if no_tests:
-            write_text(log_path, f"SKIPPED by --no-tests: {' '.join(command)}\n")
+            write_text(log_path, f"SKIPPED by --no-tests: {command_text(command)}\n")
             results.append({"command": command, "log": rel(root, log_path), "returncode": None, "skipped": True})
             continue
         if not pom_path.exists():
-            write_text(log_path, f"SKIPPED missing {command[2]}: {' '.join(command)}\n")
+            write_text(log_path, f"SKIPPED missing {pom_rel}: {command_text(command)}\n")
             results.append({"command": command, "log": rel(root, log_path), "returncode": None, "skipped": True})
             continue
         try:
@@ -1622,6 +1652,11 @@ def render_report(
             lines.append("未记录开放风险。")
     api_safe = "是" if api_compare.get("safe", state.get("api_contract_safe", True)) else "否"
     final_test_result = state.get("last_full_test", "not_run")
+    verification_commands = [
+        command_text(maven_command(root, ["-f", "code/pom.xml", "test"])),
+        command_text(maven_command(root, ["-f", "code/pom.xml", "install", "-DskipTests"])),
+        command_text(maven_command(root, ["-f", "test-cases/pom.xml", "test"])),
+    ]
     lines.extend(
         [
             "",
@@ -1633,9 +1668,7 @@ def render_report(
             f"- 仍有风险：{'是' if open_issues or state.get('missing_required_paths') else '否'}",
             f"- API 契约是否保持不变：{api_safe}",
             "- 最终验证命令：",
-            "  - `mvn -f code/pom.xml test`",
-            "  - `mvn -f code/pom.xml install -DskipTests`",
-            "  - `mvn -f test-cases/pom.xml test`",
+            *[f"  - `{command}`" for command in verification_commands],
             f"- 最终验证结果：{final_test_result}",
             "",
             "## 测试摘要",

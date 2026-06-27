@@ -96,19 +96,19 @@ Never create "module missing" issues merely because a design filename does not m
 
 ## Verification Commands
 
-Use these commands in order:
+Use local Maven and pass the project-root `maven-settings.xml` to every Maven command so the internal mirror is used:
 
 ```bash
-mvn -f code/pom.xml test
-mvn -f code/pom.xml install -DskipTests
-mvn -f test-cases/pom.xml test
+mvn -s maven-settings.xml -f code/pom.xml test
+mvn -s maven-settings.xml -f code/pom.xml install -DskipTests
+mvn -s maven-settings.xml -f test-cases/pom.xml test
 ```
 
 Focused public tests:
 
 ```bash
-mvn -f test-cases/pom.xml -Dtest=PubBasicFlowTest test
-mvn -f test-cases/pom.xml -Dtest=PubAdditionalBehaviorTest test
+mvn -s maven-settings.xml -f test-cases/pom.xml -Dtest=PubBasicFlowTest test
+mvn -s maven-settings.xml -f test-cases/pom.xml -Dtest=PubAdditionalBehaviorTest test
 ```
 
 Do not use `no-tests` in a real competition run.
@@ -169,8 +169,8 @@ Use them for indexing, logs, and report scaffolding only. They do not replace su
 
 DONE requires:
 
-- `mvn -f code/pom.xml test` succeeds.
-- `mvn -f code/pom.xml install -DskipTests` succeeds.
-- `mvn -f test-cases/pom.xml test` succeeds, or remaining failures are explicitly documented with design-backed risk.
+- `mvn -s maven-settings.xml -f code/pom.xml test` succeeds.
+- `mvn -s maven-settings.xml -f code/pom.xml install -DskipTests` succeeds.
+- `mvn -s maven-settings.xml -f test-cases/pom.xml test` succeeds, or remaining failures are explicitly documented with design-backed risk.
 - API baseline remains compatible.
 - `修复报告.md` exists.
