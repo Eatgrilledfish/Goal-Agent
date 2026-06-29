@@ -1,5 +1,5 @@
 ---
-description: Applies one minimal HW-ICT-CMP-04 code fix at a time while preserving the frozen API.
+description: Applies one minimal code fix at a time while preserving the frozen API.
 mode: subagent
 hidden: true
 steps: 180

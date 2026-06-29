@@ -1,5 +1,5 @@
 ---
-description: Writes the final ShopHub repair report from evidence, rounds, tests, and remaining risks.
+description: Writes the final repair report from evidence, rounds, tests, and remaining risks.
 mode: subagent
 hidden: true
 steps: 100
@@ -41,7 +41,7 @@ Responsibilities:
 Required report structure:
 
 ```md
-# ShopHub 设计实现一致性检查与修复报告
+# 设计实现一致性检查与修复报告
 
 ## 发现的不一致点
 

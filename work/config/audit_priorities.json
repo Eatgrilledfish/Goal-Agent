@@ -1,0 +1,9 @@
+{
+  "priority_types": [
+    "api_drift",
+    "business_rule_mismatch",
+    "state_machine_error",
+    "money_calc_error"
+  ],
+  "priority_modules": []
+}

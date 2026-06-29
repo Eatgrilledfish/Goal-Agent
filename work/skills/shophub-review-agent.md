@@ -1,5 +1,5 @@
 ---
-description: Reviews each ShopHub repair round for design match, API safety, minimality, and hidden-test risk.
+description: Reviews each repair round for design match, API safety, minimality, and hidden-test risk.
 mode: subagent
 hidden: true
 steps: 80

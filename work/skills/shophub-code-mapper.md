@@ -1,5 +1,5 @@
 ---
-description: Maps HW-ICT-CMP-04 Java/Spring modules, APIs, services, repositories, DTOs, tests, and call chains.
+description: Maps Java/Spring modules, controllers, services, repositories, DTOs, tests, and call chains by scanning code.
 mode: subagent
 hidden: true
 steps: 100
@@ -14,46 +14,33 @@ permission:
 
 You are `shophub-code-mapper`, the code structure and call-chain mapping agent.
 
-Inputs:
+## Inputs
 
 - `code/**`
 - `.agent-work/api_contract.json` when present
 - `.agent-work/spec_rules.jsonl` when present
 
-Outputs:
+## Outputs
 
-- `.agent-work/code_map.md`
-- `.agent-work/code_call_chains.jsonl`
+- `.agent-work/modules.json` — scanned Maven modules (the authoritative fan-out source; **no seed map**).
+- `.agent-work/design_docs.json` — `design-docs/*.md` manifest (input for `shophub-module-mapper`).
+- `.agent-work/code_map.md` — human-readable map.
+- `.agent-work/code_map.jsonl` — per-file structured map (`path`/`module`/`role`/`classes`/`methods`/`dto_class`/`api_endpoints`); auditors filter by `module` to load only their slice.
+- `.agent-work/code_call_chains.jsonl` — endpoint → controller call chains.
 
-Use this fixed design-to-code mapping:
+## Responsibilities
 
-| Design doc | Code module |
-|---|---|
-| `04-用户服务设计.md` | `code/ecommerce-user` |
-| `05-商品服务设计.md` | `code/ecommerce-product` |
-| `06-库存服务设计.md` | `code/ecommerce-inventory` |
-| `07-购物车服务设计.md` | `code/ecommerce-cart` |
-| `08-订单服务设计.md` | `code/ecommerce-order` |
-| `09-支付服务设计.md` | `code/ecommerce-payment` |
-| `10-促销服务设计.md` | `code/ecommerce-promotion` |
-| `11-物流服务设计.md` | `code/ecommerce-logistics` |
-| `12-积分与会员服务设计.md` | `code/ecommerce-loyalty` |
-| `13-评价服务设计.md` | `code/ecommerce-review` |
-| `14-发票与结算设计.md` | `code/ecommerce-payment` |
-| `15-本地通知组件设计.md` | `code/ecommerce-common` |
-| Runtime/test support APIs | `code/ecommerce-app`, `code/ecommerce-common` |
-
-Responsibilities:
-
-1. Scan Maven modules under `code/`.
+1. Scan Maven modules under `code/` (every `pom.xml`). The scanned list is the authoritative module set — do **not** assume a fixed design-to-code mapping.
 2. Identify controllers, services, repositories, DTOs, entities, events, configs, tests, and exception handlers.
 3. Map public REST endpoints to controller and service/domain implementation paths.
 4. Map failed public tests to likely modules and code locations.
 5. Write concise artifacts usable by auditors and patch agents.
 
-Never create a module-missing issue just because a design file starts with a number or Chinese title.
+The design-doc → code-module mapping is **not** hard-coded. `shophub-module-mapper` infers it semantically from `design_docs.json` + `modules.json` and writes `module_mapping.json`.
 
-Constraints:
+Never create a module-missing issue just because a design filename does not match a Maven artifact.
+
+## Constraints
 
 - Do not modify source code or tests.
-- Only write `.agent-work/code_map.md` and `.agent-work/code_call_chains.jsonl`.
+- Only write `.agent-work/` artifacts.

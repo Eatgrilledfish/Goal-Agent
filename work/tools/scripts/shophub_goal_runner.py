@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Local Goal Runner for the ShopHub consistency competition.
+"""Local Goal Runner for design-implementation consistency repair.
 
 The runner implements the deterministic parts of the workflow described in
 design-document.md: workspace initialization, spec/API/code indexing, Maven
@@ -60,51 +60,11 @@ PHASES = [
 ]
 SEVERITY_WEIGHT = {"high": 3.0, "medium": 2.0, "low": 1.0}
 COMPLEXITY_WEIGHT = {"small": 1.0, "medium": 2.0, "large": 4.0}
-MODULE_ORDER = [
-    "order",
-    "inventory",
-    "stock",
-    "payment",
-    "pay",
-    "amount",
-    "price",
-    "status",
-    "error",
-    "validation",
-    "idempotent",
-    "query",
-]
-DESIGN_MODULE_MAP = {
-    "04-用户服务设计": "user",
-    "05-商品服务设计": "product",
-    "06-库存服务设计": "inventory",
-    "07-购物车服务设计": "cart",
-    "08-订单服务设计": "order",
-    "09-支付服务设计": "payment",
-    "10-促销服务设计": "promotion",
-    "11-物流服务设计": "logistics",
-    "12-积分与会员服务设计": "loyalty",
-    "13-评价服务设计": "review",
-    "14-发票与结算设计": "payment",
-    "15-本地通知组件设计": "common",
-    "附录A-API接口参考": "api",
-    "附录B-配置参考": "config",
-    "附录C-数据模型": "data-model",
-    "附录D-本地事件契约": "event",
-}
-AUDITABLE_MODULES = {
-    "user",
-    "product",
-    "inventory",
-    "cart",
-    "order",
-    "payment",
-    "promotion",
-    "logistics",
-    "loyalty",
-    "review",
-    "common",
-}
+# Submission-internal config location (work/config/), independent of PROJECT_ROOT.
+WORK_ROOT = Path(__file__).resolve().parent.parent.parent
+AUDIT_PRIORITIES_PATH = WORK_ROOT / "config" / "audit_priorities.json"
+# Generic engineering priority (non-business): issue types more likely to affect hidden tests.
+DEFAULT_PRIORITY_TYPES = ("api_drift", "business_rule_mismatch", "state_machine_error", "money_calc_error")
 
 
 def now_iso() -> str:
@@ -135,10 +95,18 @@ def write_json(path: Path, payload: Any) -> None:
 
 
 def append_jsonl(path: Path, records: Iterable[dict[str, Any]]) -> None:
+    """Write all records, overwriting the file (full-rewrite semantics)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
         for record in records:
             handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def append_jsonl_record(path: Path, record: dict[str, Any]) -> None:
+    """Append a single record (true append) — for fan-out writers that must not overwrite each other."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -371,7 +339,7 @@ Generated: {now_iso()}
 
 ## Objective
 
-Compare ShopHub design documents, frozen REST API contract, and Spring Boot implementation. Find and repair design-code inconsistencies in small, evidence-backed rounds while preserving the API contract.
+Compare design documents, frozen REST API contract, and Spring Boot implementation. Find and repair design-code inconsistencies in small, evidence-backed rounds while preserving the API contract.
 
 ## Required Inputs Missing
 
@@ -398,6 +366,13 @@ mvn -s maven-settings.xml -f test-cases/pom.xml test
 
 
 def extract_specs(root: Path) -> list[dict[str, Any]]:
+    """Split design documents into paragraph-level spec records.
+
+    The runner does NOT interpret rules — it only segments design docs into
+    records tagged with source_doc/section/source_line. The spec-librarian
+    subagent fills expected_behavior/rule_kind/severity_hint, and module is
+    assigned via module_mapping.json (no hard-coded design-to-module map).
+    """
     design_dir = root / "design-docs"
     paths = RunnerPaths(root)
     records: list[dict[str, Any]] = []
@@ -409,45 +384,39 @@ def extract_specs(root: Path) -> list[dict[str, Any]]:
         save_state(paths, phase="READ_SPECS", stop_reason="missing_design_docs")
         return records
 
-    rule_markers = re.compile(
-        r"(应当|应该|应|必须|不得|禁止|需要|要求|当|如果|若|则|校验|释放|扣减|恢复|支付|取消|退款|库存|订单|金额|状态|错误码|边界|幂等)"
-    )
-    boundary_markers = re.compile(r"(不得|禁止|不能|边界|异常|失败|为空|不存在|重复|超限|已支付|已发货|已取消)")
-    api_pattern = re.compile(r"(/api/[A-Za-z0-9_./{}?=&:-]+)")
-
     for doc_path in sorted(design_dir.rglob("*.md")):
-        module = infer_design_module(doc_path.stem)
-        module_slug = slug(module)
         section = "概要"
         doc_records: list[dict[str, Any]] = []
         paragraph: list[str] = []
+        paragraph_start_line = 0
 
         def flush_paragraph() -> None:
-            nonlocal paragraph
+            nonlocal paragraph, paragraph_start_line
             if not paragraph:
                 return
             text = clean_markdown_text(" ".join(paragraph))
+            start = paragraph_start_line
             paragraph = []
-            if len(text) < 8 or not rule_markers.search(text):
+            paragraph_start_line = 0
+            if len(text) < 8:
                 return
-            count = len([r for r in records if r["module"] == module]) + 1
-            spec_id = f"{module_slug}-{count:03d}"
-            boundaries = split_boundary_conditions(text, boundary_markers)
+            count = len(records) + 1
+            spec_id = f"SPEC-{count:04d}"
             record = {
                 "spec_id": spec_id,
-                "module": module,
+                "module": "",
                 "source_doc": rel(root, doc_path),
                 "section": section,
+                "source_line": start,
                 "design_rule": text,
-                "expected_behavior": infer_expected_behavior(text),
-                "boundary_conditions": boundaries,
-                "related_api_if_any": sorted(set(api_pattern.findall(text))),
-                "severity_hint": infer_severity(text),
+                "expected_behavior": "",
+                "rule_kind": "",
+                "severity_hint": "",
             }
             records.append(record)
             doc_records.append(record)
 
-        for raw_line in read_text(doc_path).splitlines():
+        for line_no, raw_line in enumerate(read_text(doc_path).splitlines(), start=1):
             line = raw_line.strip()
             if not line:
                 flush_paragraph()
@@ -457,36 +426,23 @@ def extract_specs(root: Path) -> list[dict[str, Any]]:
                 flush_paragraph()
                 section = clean_markdown_text(heading.group(2))
                 continue
-            if line.startswith("|") and line.endswith("|"):
-                cells = [clean_markdown_text(cell) for cell in line.strip("|").split("|")]
-                if len(cells) > 1 and any(rule_markers.search(cell) for cell in cells):
-                    paragraph.append("；".join(cell for cell in cells if cell and not set(cell) <= {"-", ":"}))
-                    flush_paragraph()
-                continue
-            if re.match(r"^[-*+]\s+", line) or re.match(r"^\d+[.)、]\s+", line):
-                flush_paragraph()
-                paragraph.append(re.sub(r"^([-*+]|\d+[.)、])\s+", "", line))
-                flush_paragraph()
-                continue
+            if not paragraph:
+                paragraph_start_line = line_no
             paragraph.append(line)
         flush_paragraph()
 
         index_lines.append(f"## {rel(root, doc_path)}")
         if doc_records:
             for record in doc_records:
-                index_lines.append(f"- `{record['spec_id']}` {record['section']}: {record['design_rule']}")
+                index_lines.append(f"- `{record['spec_id']}` {record['section']} (line {record['source_line']}): {record['design_rule']}")
         else:
-            index_lines.append("- No explicit rule-like statements found by heuristic extraction.")
+            index_lines.append("- No paragraph-level records extracted.")
         index_lines.append("")
 
     append_jsonl(paths.specs, records)
     write_text(paths.work / "01_spec_index.md", "\n".join(index_lines).rstrip() + "\n")
     save_state(paths, phase="READ_SPECS", stop_reason=None if records else "no_spec_rules_extracted")
     return records
-
-
-def infer_design_module(stem: str) -> str:
-    return DESIGN_MODULE_MAP.get(stem, stem.lower())
 
 
 def clean_markdown_text(value: str) -> str:
@@ -497,29 +453,6 @@ def clean_markdown_text(value: str) -> str:
     return value.strip(" -*\t\r\n")
 
 
-def split_boundary_conditions(text: str, pattern: re.Pattern[str]) -> list[str]:
-    parts = re.split(r"[；;。.!?？]", text)
-    return [part.strip() for part in parts if part.strip() and pattern.search(part)]
-
-
-def infer_expected_behavior(text: str) -> str:
-    if "应" in text or "必须" in text or "需要" in text:
-        return text
-    if "不得" in text or "禁止" in text:
-        return f"系统应拒绝或阻止该场景：{text}"
-    return text
-
-
-def infer_severity(text: str) -> str:
-    high_terms = ("订单", "库存", "支付", "金额", "状态", "错误码", "扣减", "释放", "退款")
-    medium_terms = ("校验", "查询", "边界", "幂等", "重复", "分页")
-    if any(term in text for term in high_terms):
-        return "high"
-    if any(term in text for term in medium_terms):
-        return "medium"
-    return "low"
-
-
 def parse_api_baseline(root: Path) -> dict[str, Any]:
     paths = RunnerPaths(root)
     baseline_sources = find_api_baseline_sources(root)
@@ -528,13 +461,14 @@ def parse_api_baseline(root: Path) -> dict[str, Any]:
         "source": [rel(root, path) for path in baseline_sources],
         "endpoints": [],
         "error_codes": [],
+        "dto_fields": {},
         "frozen": True,
         "warnings": [],
     }
     index_lines = ["# API Contract Index", "", f"Generated: {now_iso()}", ""]
     if not baseline_sources:
         contract["source"] = []
-        contract["warnings"].append("No API baseline source found. Expected README.md and/or design-docs/附录A-API接口参考.md.")
+        contract["warnings"].append("No API baseline source found. Expected README.md and/or design-docs/*.md.")
         write_json(paths.work / "api_contract.json", contract)
         write_json(paths.work / "api_snapshot_baseline.json", contract)
         write_text(paths.work / "02_api_contract_index.md", "\n".join(index_lines + ["API baseline source is missing."]) + "\n")
@@ -547,7 +481,7 @@ def parse_api_baseline(root: Path) -> dict[str, Any]:
 
     text = "\n\n".join(read_text(path) for path in baseline_sources)
     endpoints = extract_endpoints_from_markdown(text)
-    error_codes = sorted(set(re.findall(r"\b[A-Z][A-Z0-9_]{2,}\b", text)))
+    error_codes = sorted(set(re.findall(r"\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+){1,}\b", text)))
     contract["endpoints"] = endpoints
     contract["error_codes"] = error_codes
     if not endpoints:
@@ -575,11 +509,21 @@ def parse_api_baseline(root: Path) -> dict[str, Any]:
 
 
 def find_api_baseline_sources(root: Path) -> list[Path]:
-    candidates = [
-        root / "README.md",
-        root / "design-docs" / "附录A-API接口参考.md",
-    ]
-    return [path for path in candidates if path.exists()]
+    """Return README plus every design-docs markdown.
+
+    The API baseline is not tied to a hard-coded appendix filename — which
+    would not generalize to other competition domains. The api-guardian
+    subagent semantically identifies which documents carry the frozen REST
+    contract and fills endpoint DTO fields into ``api_snapshot_baseline.json``.
+    """
+    sources: list[Path] = []
+    readme = root / "README.md"
+    if readme.exists():
+        sources.append(readme)
+    design_dir = root / "design-docs"
+    if design_dir.exists():
+        sources.extend(sorted(design_dir.rglob("*.md")))
+    return sources
 
 
 def extract_endpoints_from_markdown(text: str) -> list[dict[str, Any]]:
@@ -852,6 +796,29 @@ def unwrap_response_type(value: str) -> str:
     return value.split(".")[-1].strip()
 
 
+def diff_endpoint_fields(baseline_ep: dict[str, Any], current_ep: dict[str, Any]) -> list[dict[str, Any]]:
+    """Compare request/response body fields between a baseline and current endpoint.
+
+    Both sides carry ``request_body``/``response_body`` as ``{field: type}`` dicts.
+    The baseline DTO fields are filled by the api-guardian subagent; until then
+    both dicts may be empty and no drift is reported.
+    """
+    drifts: list[dict[str, Any]] = []
+    for direction in ("request_body", "response_body"):
+        baseline_fields = baseline_ep.get(direction) or {}
+        current_fields = current_ep.get(direction) or {}
+        if not baseline_fields and not current_fields:
+            continue
+        for field in sorted(set(baseline_fields) - set(current_fields)):
+            drifts.append({"direction": direction, "field": field, "baseline_type": baseline_fields.get(field), "current_type": None, "drift": "missing"})
+        for field in sorted(set(baseline_fields) & set(current_fields)):
+            if baseline_fields.get(field) != current_fields.get(field):
+                drifts.append({"direction": direction, "field": field, "baseline_type": baseline_fields.get(field), "current_type": current_fields.get(field), "drift": "type_change"})
+        for field in sorted(set(current_fields) - set(baseline_fields)):
+            drifts.append({"direction": direction, "field": field, "baseline_type": None, "current_type": current_fields.get(field), "drift": "added"})
+    return drifts
+
+
 def compare_api_snapshots(baseline: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
     baseline_endpoints = {(item.get("method"), item.get("url")): item for item in baseline.get("endpoints", [])}
     current_endpoints = {(item.get("method"), item.get("url")): item for item in current.get("endpoints", [])}
@@ -861,20 +828,103 @@ def compare_api_snapshots(baseline: dict[str, Any], current: dict[str, Any]) -> 
     current_error_codes = set(current.get("error_codes", []))
     missing_error_codes = sorted(code for code in baseline_error_codes if code not in current_error_codes)
 
+    field_drifts: list[dict[str, Any]] = []
+    for (method, url), baseline_ep in baseline_endpoints.items():
+        current_ep = current_endpoints.get((method, url))
+        if not current_ep:
+            continue
+        for drift in diff_endpoint_fields(baseline_ep, current_ep):
+            drift.update({"endpoint_id": baseline_ep.get("endpoint_id"), "method": method, "url": url})
+            field_drifts.append(drift)
+    breaking_field_drifts = [drift for drift in field_drifts if drift["drift"] in ("missing", "type_change")]
+    field_drifts = sorted(field_drifts, key=lambda x: (x["url"], x["method"], x["direction"], x["field"]))
+
     warnings: list[str] = []
     if not baseline_endpoints:
-        warnings.append("Baseline endpoint set is empty; API compatibility cannot be fully verified.")
+        warnings.append("Baseline endpoint set is empty; api-guardian must extract the frozen API baseline before compatibility can be verified.")
     if not current_endpoints:
         warnings.append("Current code endpoint set is empty; code/ may be missing or parser found no controllers.")
-    safe = not missing and (not baseline_error_codes or not missing_error_codes)
+    baseline_has_fields = any(
+        (ep.get("request_body") or ep.get("response_body"))
+        for ep in baseline_endpoints.values()
+    )
+    if baseline_endpoints and not baseline_has_fields:
+        warnings.append("Baseline endpoints have no request/response body fields; api-guardian must fill DTO fields before field-level drift can be detected.")
+
+    safe = (
+        bool(baseline_endpoints)
+        and not missing
+        and (not baseline_error_codes or not missing_error_codes)
+        and not breaking_field_drifts
+    )
     return {
         "generated_at": now_iso(),
         "safe": safe,
         "missing_endpoints": missing,
         "additional_current_endpoints": additional,
         "missing_error_codes": missing_error_codes,
+        "field_drifts": field_drifts,
         "warnings": warnings,
     }
+
+
+def write_modules_manifest(paths: RunnerPaths, modules: list[dict[str, Any]]) -> None:
+    """Write the scanned code module list — the authoritative fan-out source (no seed)."""
+    manifest = {
+        "generated_at": now_iso(),
+        "modules": [
+            {
+                "code_module": module.get("artifact_id") or module.get("path"),
+                "path": module.get("path"),
+                "artifact_id": module.get("artifact_id"),
+                "packaging": module.get("packaging"),
+            }
+            for module in modules
+        ],
+    }
+    write_json(paths.work / "modules.json", manifest)
+
+
+def write_design_docs_manifest(root: Path, paths: RunnerPaths) -> None:
+    """Write the design-docs manifest for the module-mapper subagent."""
+    design_dir = root / "design-docs"
+    docs: list[dict[str, Any]] = []
+    if design_dir.exists():
+        for doc_path in sorted(design_dir.rglob("*.md")):
+            docs.append({"path": rel(root, doc_path), "stem": doc_path.stem})
+    write_json(paths.work / "design_docs.json", {"generated_at": now_iso(), "docs": docs})
+
+
+def load_scanned_module_names(root: Path) -> list[str]:
+    """Return scanned code module names for low-confidence symptom triage."""
+    paths = RunnerPaths(root)
+    manifest = read_json(paths.work / "modules.json", {})
+    names = [module.get("code_module") for module in manifest.get("modules", []) if module.get("code_module")]
+    if names:
+        return names
+    code_dir = root / "code"
+    if code_dir.exists():
+        for pom in sorted(code_dir.rglob("pom.xml")):
+            names.append(pom.parent.name)
+    return names
+
+
+def extract_file_structure(text: str) -> tuple[list[str], list[dict[str, Any]]]:
+    """Extract top-level class names and public/protected methods with line numbers."""
+    clean = strip_java_comments(text)
+    class_re = re.compile(r"\b(?:class|enum|interface)\s+([A-Za-z_][A-Za-z0-9_]*)\b")
+    method_re = re.compile(r"(?:public|protected)\s+(?:static\s+)?(?:[A-Za-z0-9_<>, ?.\[\]]+)\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+    classes = [match.group(1) for match in class_re.finditer(clean)]
+    methods: list[dict[str, Any]] = []
+    current_class: str | None = None
+    for line_no, line in enumerate(clean.splitlines(), start=1):
+        class_match = class_re.search(line)
+        if class_match:
+            current_class = class_match.group(1)
+        method_match = method_re.search(line)
+        if method_match and method_match.group(1) not in ("class", "interface", "enum"):
+            methods.append({"class": current_class, "method": method_match.group(1), "line": line_no})
+    return classes, methods
 
 
 def map_code(root: Path) -> dict[str, Any]:
@@ -901,28 +951,63 @@ def map_code(root: Path) -> dict[str, Any]:
         return code_map
 
     code_map["modules"] = find_maven_modules(root, code_dir)
+    write_modules_manifest(paths, code_map["modules"])
+    write_design_docs_manifest(root, paths)
     java_files = sorted(code_dir.rglob("*.java"))
     call_chains: list[dict[str, Any]] = []
     snapshot = snapshot_code_api(root)
+    endpoints_by_path: dict[str, list[dict[str, Any]]] = {}
+    for endpoint in snapshot.get("endpoints", []):
+        source = endpoint.get("source", "")
+        file_part = source.split("#")[0]
+        endpoints_by_path.setdefault(file_part, []).append({"method": endpoint["method"], "url": endpoint["url"], "source": source})
+    role_to_bucket = {
+        "test": "tests",
+        "controller": "controllers",
+        "service": "services",
+        "repository": "repositories",
+        "dto": "dtos",
+        "exception": "exceptions",
+        "config": "configs",
+        "domain": "domain_models",
+    }
+    file_records: list[dict[str, Any]] = []
     for path in java_files:
         text = read_text(path)
-        item = {"path": rel(root, path), "class": path.stem, "module": infer_module_for_path(root, path)}
+        rel_path = rel(root, path)
+        module = infer_module_for_path(root, path)
+        classes, methods = extract_file_structure(text)
         if is_test_path(path):
-            code_map["tests"].append(item)
+            role = "test"
         elif "@RestController" in text or "@Controller" in text:
-            code_map["controllers"].append(item)
+            role = "controller"
         elif "@Service" in text or path.name.endswith("Service.java") or path.name.endswith("ServiceImpl.java"):
-            code_map["services"].append(item)
+            role = "service"
         elif "@Repository" in text or path.name.endswith("Repository.java") or path.name.endswith("Mapper.java") or path.name.endswith("Dao.java"):
-            code_map["repositories"].append(item)
+            role = "repository"
         elif looks_like_dto(path, path.stem, text):
-            code_map["dtos"].append(item)
+            role = "dto"
         elif "Exception" in path.name:
-            code_map["exceptions"].append(item)
+            role = "exception"
         elif "@Configuration" in text or path.name.endswith("Config.java") or path.name.endswith("Configuration.java"):
-            code_map["configs"].append(item)
+            role = "config"
         elif "/domain/" in path.as_posix().lower() or "/model/" in path.as_posix().lower() or "/entity/" in path.as_posix().lower():
-            code_map["domain_models"].append(item)
+            role = "domain"
+        else:
+            role = "other"
+        record = {
+            "path": rel_path,
+            "module": module,
+            "role": role,
+            "classes": classes,
+            "methods": methods,
+            "dto_class": path.stem if role == "dto" else None,
+            "api_endpoints": endpoints_by_path.get(rel_path, []) if role == "controller" else [],
+        }
+        file_records.append(record)
+        bucket = role_to_bucket.get(role)
+        if bucket:
+            code_map[bucket].append({"path": rel_path, "class": path.stem, "module": module})
 
     for endpoint in snapshot.get("endpoints", []):
         call_chains.append(
@@ -936,6 +1021,7 @@ def map_code(root: Path) -> dict[str, Any]:
             }
         )
     write_text(paths.work / "code_map.md", render_code_map(root, code_map, call_chains))
+    append_jsonl(paths.work / "code_map.jsonl", file_records)
     append_jsonl(paths.work / "code_call_chains.jsonl", call_chains)
     save_state(paths, phase="MAP_CODE", stop_reason=None)
     return code_map
@@ -1017,13 +1103,17 @@ def render_code_map(root: Path, code_map: dict[str, Any], call_chains: list[dict
     return "\n".join(lines).rstrip() + "\n"
 
 
-def run_baseline_tests(root: Path, timeout: int = 900, no_tests: bool = False) -> dict[str, Any]:
+def run_baseline_tests(root: Path, timeout: int = 900, no_tests: bool = False, test_filter: str | None = None) -> dict[str, Any]:
     paths = RunnerPaths(root)
     ensure_work_layout(paths)
+    blackbox_args = ["-f", "test-cases/pom.xml"]
+    if test_filter:
+        blackbox_args.append(f"-Dtest={test_filter}")
+    blackbox_args.append("test")
     commands = [
         ("code-test-baseline.log", "code/pom.xml", maven_command(root, ["-f", "code/pom.xml", "test"])),
         ("code-install-baseline.log", "code/pom.xml", maven_command(root, ["-f", "code/pom.xml", "install", "-DskipTests"])),
-        ("blackbox-baseline.log", "test-cases/pom.xml", maven_command(root, ["-f", "test-cases/pom.xml", "test"])),
+        ("blackbox-baseline.log", "test-cases/pom.xml", maven_command(root, blackbox_args)),
     ]
     results: list[dict[str, Any]] = []
     for log_name, pom_rel, command in commands:
@@ -1070,13 +1160,17 @@ def run_baseline_tests(root: Path, timeout: int = 900, no_tests: bool = False) -
     return {"results": results, "summary": summary}
 
 
-def run_verification_tests(root: Path, label: str, timeout: int = 900, no_tests: bool = False) -> dict[str, Any]:
+def run_verification_tests(root: Path, label: str, timeout: int = 900, no_tests: bool = False, test_filter: str | None = None) -> dict[str, Any]:
     paths = RunnerPaths(root)
     ensure_work_layout(paths)
+    blackbox_args = ["-f", "test-cases/pom.xml"]
+    if test_filter:
+        blackbox_args.append(f"-Dtest={test_filter}")
+    blackbox_args.append("test")
     commands = [
         (f"{label}-code-test.log", "code/pom.xml", maven_command(root, ["-f", "code/pom.xml", "test"])),
         (f"{label}-code-install.log", "code/pom.xml", maven_command(root, ["-f", "code/pom.xml", "install", "-DskipTests"])),
-        (f"{label}-blackbox.log", "test-cases/pom.xml", maven_command(root, ["-f", "test-cases/pom.xml", "test"])),
+        (f"{label}-blackbox.log", "test-cases/pom.xml", maven_command(root, blackbox_args)),
     ]
     results: list[dict[str, Any]] = []
     for log_name, pom_rel, command in commands:
@@ -1124,13 +1218,14 @@ def run_verification_tests(root: Path, label: str, timeout: int = 900, no_tests:
 
 def summarize_test_logs(root: Path) -> dict[str, Any]:
     paths = RunnerPaths(root)
+    module_names = load_scanned_module_names(root)
     summaries: list[dict[str, Any]] = []
     symptoms: list[dict[str, Any]] = []
     for log_path in sorted(paths.test_results.glob("*.log")):
         text = read_text(log_path)
         summary = summarize_single_log(root, log_path, text)
         summaries.append(summary)
-        symptoms.extend(symptoms_from_log(summary, text))
+        symptoms.extend(symptoms_from_log(summary, text, module_names))
     write_text(paths.work / "baseline_tests.md", render_test_summary(summaries))
     append_jsonl(paths.work / "test_symptoms.jsonl", symptoms)
     return {"logs": summaries, "symptoms": symptoms}
@@ -1162,7 +1257,7 @@ def summarize_single_log(root: Path, log_path: Path, text: str) -> dict[str, Any
     }
 
 
-def symptoms_from_log(summary: dict[str, Any], text: str) -> list[dict[str, Any]]:
+def symptoms_from_log(summary: dict[str, Any], text: str, modules: list[str] | None = None) -> list[dict[str, Any]]:
     if summary["skipped"]:
         return []
     symptoms: list[dict[str, Any]] = []
@@ -1172,7 +1267,7 @@ def symptoms_from_log(summary: dict[str, Any], text: str) -> list[dict[str, Any]
                 "test_name": Path(summary["log"]).name,
                 "failure_type": "compilation_error",
                 "symptom": "Maven compilation failed.",
-                "likely_modules": infer_modules_from_text(text),
+                "likely_modules": infer_modules_from_text(text, modules),
                 "related_spec_ids": [],
                 "is_design_evidence": False,
             }
@@ -1183,7 +1278,7 @@ def symptoms_from_log(summary: dict[str, Any], text: str) -> list[dict[str, Any]
                 "test_name": failed_test,
                 "failure_type": "test_failure",
                 "symptom": failed_test,
-                "likely_modules": infer_modules_from_text(failed_test + "\n" + text[:4000]),
+                "likely_modules": infer_modules_from_text(failed_test + "\n" + text[:4000], modules),
                 "related_spec_ids": [],
                 "is_design_evidence": False,
             }
@@ -1194,7 +1289,7 @@ def symptoms_from_log(summary: dict[str, Any], text: str) -> list[dict[str, Any]
                 "test_name": Path(summary["log"]).name,
                 "failure_type": "timeout",
                 "symptom": "Maven command timed out.",
-                "likely_modules": infer_modules_from_text(text),
+                "likely_modules": infer_modules_from_text(text, modules),
                 "related_spec_ids": [],
                 "is_design_evidence": False,
             }
@@ -1202,10 +1297,16 @@ def symptoms_from_log(summary: dict[str, Any], text: str) -> list[dict[str, Any]
     return symptoms
 
 
-def infer_modules_from_text(text: str) -> list[str]:
+def infer_modules_from_text(text: str, modules: list[str] | None = None) -> list[str]:
+    """Return scanned module names that appear in text (low-confidence triage hint).
+
+    Uses real scanned module names instead of a hard-coded business keyword list.
+    """
+    if not modules:
+        return []
     lowered = text.lower()
-    modules = [module for module in MODULE_ORDER if module in lowered]
-    return sorted(set(modules), key=modules.index)
+    found = [module for module in modules if module and module.lower() in lowered]
+    return sorted(set(found), key=modules.index)
 
 
 def render_test_summary(summaries: list[dict[str, Any]]) -> str:
@@ -1240,80 +1341,63 @@ def render_test_summary(summaries: list[dict[str, Any]]) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
-def audit_inconsistencies(root: Path) -> list[dict[str, Any]]:
-    """Create conservative issue candidates from missing implementation signals.
+def validate_issue(issue: dict[str, Any]) -> list[str]:
+    """Return contract violations for an issue; empty list means acceptable.
 
-    The runner does not fabricate semantic inconsistencies. It only creates
-    low-risk audit issues when a design module has no corresponding code map, or
-    when test symptoms point to a module that has design rules and code files.
-    A human/Codex auditor should refine these into concrete code-location issues.
+    The runner does not fabricate issues — module-auditor subagents do. This
+    only enforces the contract so downstream patch/review/report get actionable,
+    code-location-specific data instead of placeholders.
     """
+    errors: list[str] = []
+    if not issue.get("issue_id"):
+        errors.append("missing issue_id")
+    if not issue.get("design_basis"):
+        errors.append("missing design_basis")
+    code_location = str(issue.get("code_location", ""))
+    if not code_location.startswith("code/") or "#" not in code_location:
+        errors.append("code_location must point to a method, e.g. code/.../XxxService.java#method")
+    actual = str(issue.get("actual_behavior", ""))
+    actual_lower = actual.lower()
+    placeholder_markers = ("not found", "see code_map", "test symptom observed", "was found by code-mapper", "no corresponding implementation")
+    if not actual or any(marker in actual_lower for marker in placeholder_markers):
+        errors.append("actual_behavior must be read from code, not a placeholder")
+    if not issue.get("design_behavior"):
+        errors.append("missing design_behavior")
+    if str(issue.get("severity", "")).lower() not in ("high", "medium", "low"):
+        errors.append("severity must be one of high/medium/low")
+    return errors
 
+
+def audit_inconsistencies(root: Path) -> list[dict[str, Any]]:
+    """Validate and deduplicate issues written by module-auditor subagents.
+
+    The runner does not fabricate semantic inconsistencies — that is the
+    module-auditor subagents' job. This enforces the issue contract (precise
+    code_location, real actual_behavior), deduplicates by issue_id, records
+    rejections to ``issue_rejections.jsonl``, and updates counts.
+    """
     paths = RunnerPaths(root)
-    specs = read_jsonl(paths.specs)
-    existing = read_jsonl(paths.issues)
-    by_id = {item.get("issue_id"): item for item in existing if item.get("issue_id")}
-    code_map_text = read_text(paths.work / "code_map.md") if (paths.work / "code_map.md").exists() else ""
-    symptoms = read_jsonl(paths.work / "test_symptoms.jsonl")
-    issues: list[dict[str, Any]] = list(existing)
-
-    modules_with_specs = sorted(set(str(spec["module"]) for spec in specs if str(spec["module"]) in AUDITABLE_MODULES))
-    for module in modules_with_specs:
-        module_specs = [spec for spec in specs if spec["module"] == module]
-        module_present = module.lower() in code_map_text.lower()
-        if not module_present and module_specs:
-            spec = module_specs[0]
-            issue_id = f"{slug(module)}-MAP-{stable_hash(spec['spec_id'], 4).upper()}"
-            if issue_id not in by_id:
-                issues.append(
-                    {
-                        "issue_id": issue_id,
-                        "severity": "medium" if spec.get("severity_hint") == "high" else "low",
-                        "module": module,
-                        "design_basis": f"{spec['source_doc']}#{spec['section']}",
-                        "code_location": "code/ (module not found in code map)",
-                        "design_behavior": spec["expected_behavior"],
-                        "actual_behavior": "No corresponding implementation module was found by code-mapper.",
-                        "type": "implementation_mapping_gap",
-                        "api_impact": "unknown",
-                        "fix_suggestion": "Run module-auditor to confirm whether implementation exists under a different module name before patching.",
-                        "test_suggestion": "Run full baseline tests after confirming module mapping.",
-                        "confidence": 0.55,
-                        "estimated_fix_effort": "medium",
-                        "status": "open",
-                    }
-                )
-    for symptom in symptoms:
-        for module in symptom.get("likely_modules", []):
-            module_specs = [spec for spec in specs if module in str(spec["module"]).lower()]
-            if not module_specs:
-                continue
-            spec = module_specs[0]
-            issue_id = f"{slug(module)}-TEST-{stable_hash(symptom['test_name'] + spec['spec_id'], 4).upper()}"
-            if issue_id in by_id:
-                continue
-            issues.append(
-                {
-                    "issue_id": issue_id,
-                    "severity": spec.get("severity_hint", "medium"),
-                    "module": module,
-                    "design_basis": f"{spec['source_doc']}#{spec['section']}",
-                    "code_location": "See code_map.md for likely module files.",
-                    "design_behavior": spec["expected_behavior"],
-                    "actual_behavior": f"Test symptom observed: {symptom['symptom']}",
-                    "type": "test_symptom_requires_design_audit",
-                    "api_impact": "unknown",
-                    "fix_suggestion": "Use module-auditor to compare the failing behavior with the cited design rule before editing code.",
-                    "test_suggestion": "Re-run the failing test plus related module tests after a confirmed fix.",
-                    "confidence": 0.6,
-                    "estimated_fix_effort": "medium",
-                    "status": "open",
-                }
-            )
-    append_jsonl(paths.issues, issues)
-    update_issue_counts(paths, issues)
+    issues = read_jsonl(paths.issues)
+    seen: set[str] = set()
+    accepted: list[dict[str, Any]] = []
+    rejections: list[dict[str, Any]] = []
+    for issue in issues:
+        issue_id = issue.get("issue_id")
+        if not issue_id or issue_id in seen:
+            rejections.append({"issue_id": issue_id, "reason": "duplicate or missing issue_id", "issue": issue})
+            continue
+        errors = validate_issue(issue)
+        if errors:
+            rejections.append({"issue_id": issue_id, "reason": "; ".join(errors), "issue": issue})
+            continue
+        seen.add(issue_id)
+        accepted.append(issue)
+    append_jsonl(paths.issues, accepted)
+    if rejections:
+        write_json(paths.work / "issue_rejections.jsonl", rejections)
+    update_issue_counts(paths, accepted)
     save_state(paths, phase="AUDIT_INCONSISTENCIES")
-    return issues
+    return accepted
 
 
 def update_issue_counts(paths: RunnerPaths, issues: list[dict[str, Any]] | None = None) -> None:
@@ -1372,14 +1456,21 @@ def mark_issue_status(root: Path, issue_id: str, status: str) -> bool:
     return found
 
 
+def load_audit_priorities() -> dict[str, Any]:
+    """Load submission-internal audit priorities (work/config/audit_priorities.json)."""
+    return read_json(AUDIT_PRIORITIES_PATH, {}) or {}
+
+
 def priority_score(issue: dict[str, Any]) -> float:
     severity = SEVERITY_WEIGHT.get(str(issue.get("severity", "low")).lower(), 1.0)
     confidence = float(issue.get("confidence", 0.5) or 0.5)
     complexity = COMPLEXITY_WEIGHT.get(str(issue.get("estimated_fix_effort", "medium")).lower(), 2.0)
-    module = str(issue.get("module", "")).lower()
-    module_rank = next((index for index, key in enumerate(MODULE_ORDER) if key in module), len(MODULE_ORDER))
-    hidden_likelihood = max(0.5, 1.2 - module_rank * 0.05)
-    return severity * confidence * hidden_likelihood / complexity
+    priorities = load_audit_priorities()
+    priority_types = tuple(priorities.get("priority_types") or DEFAULT_PRIORITY_TYPES)
+    type_boost = 1.2 if issue.get("type") in priority_types else 1.0
+    priority_modules = [str(module).lower() for module in (priorities.get("priority_modules") or [])]
+    module_boost = 1.15 if priority_modules and str(issue.get("module", "")).lower() in priority_modules else 1.0
+    return severity * confidence * type_boost * module_boost / complexity
 
 
 def render_fix_plan(issues: list[dict[str, Any]]) -> str:
@@ -1528,6 +1619,8 @@ def finish_round(root: Path, round_no: int, result: str, tests: str | None, risk
 def run_git_diff(root: Path) -> str:
     try:
         completed = subprocess.run(
+            # `code` pathspec already covers nested files under code/, including
+            # **/application.yml and **/application.yaml allowed by INSTRUCTION.
             ["git", "diff", "--", "code", "pom.xml"],
             cwd=root,
             text=True,
@@ -1561,9 +1654,11 @@ def score_round(result: str, api_safe: bool, diff: str, tests: str | None) -> in
     evidence_quality = 80
     task_completion = 100 if result.upper() == "PASS" else 50
     api_safety = 100 if api_safe else 0
-    test_effectiveness = 85 if tests else 40
+    # test_effectiveness from the round result, not from whether a tests string was recorded
+    test_effectiveness = 90 if result.upper() == "PASS" else (60 if tests else 30)
     changed_files = len(set(re.findall(r"^\+\+\+ b/(.+)$", diff, flags=re.M)))
-    token_efficiency = min(100, int(3 / max(1, changed_files) * 100))
+    # token_efficiency: do not punish a normal multi-file fix; only lightly flag very large diffs
+    token_efficiency = 100 if changed_files <= 8 else max(40, 100 - (changed_files - 8) * 5)
     score = (
         evidence_quality * 0.30
         + task_completion * 0.25
@@ -1603,7 +1698,7 @@ def render_report(
     fixed = [issue for issue in issues if issue.get("status") in {"fixed", "done", "closed"}]
     open_issues = [issue for issue in issues if issue.get("status", "open") == "open"]
     lines = [
-        "# ShopHub 设计实现一致性检查与修复报告",
+        "# 设计实现一致性检查与修复报告",
         "",
         f"生成时间：{now_iso()}",
         "",
@@ -1728,12 +1823,22 @@ def open_issues_by_severity(root: Path) -> dict[str, list[dict[str, Any]]]:
 
 
 def done_decision(root: Path, no_tests: bool = False) -> tuple[bool, str | None]:
+    """Decide whether the runner is DONE.
+
+    ``no_tests`` is accepted for backward compatibility but no longer grants a
+    done path — a real run requires ``last_full_test == passed`` (per SKILL.md:
+    "Do not use no-tests in a real competition run"). Tests failing with no
+    open issue also does not auto-stop: it returns to the orchestrator so
+    auditors can be fanned out again (the queue may be empty because auditors
+    have not yet covered the failing behavior).
+    """
     paths = RunnerPaths(root)
     state = load_state(paths)
     missing = check_competition_layout(root)
     buckets = open_issues_by_severity(root)
     high_medium_open = len(buckets["high"]) + len(buckets["medium"])
     last_full_test = state.get("last_full_test")
+    _ = no_tests  # accepted for compatibility; no-tests is not a done path
 
     if missing:
         return True, "missing_competition_inputs"
@@ -1747,10 +1852,6 @@ def done_decision(root: Path, no_tests: bool = False) -> tuple[bool, str | None]
         return True, "consecutive_regressions"
     if high_medium_open == 0 and last_full_test == "passed":
         return True, "completed_high_medium_and_tests_passed"
-    if no_tests and not buckets["all"] and last_full_test in {"skipped", "partial_skipped", "passed"}:
-        return True, "no_open_issues_tests_not_required"
-    if not buckets["all"] and last_full_test == "failed":
-        return True, "tests_failed_without_open_issue"
     return False, None
 
 
@@ -1828,6 +1929,14 @@ def run_until_done(
     patch_command: str | None,
     patch_timeout: int,
 ) -> None:
+    """Fallback-only continuous runner for runtimes WITHOUT subagent/Task support.
+
+    The preferred path is the orchestrator's subagent fan-out (see
+    shophub-orchestrator.md). This loop cannot produce semantic issues on its
+    own — ``audit_inconsistencies`` only validates/dedups issues written by
+    subagents — so without an external ``--patch-command`` it stops at
+    ``patch_command_required``. Use only when the runtime has no Task tool.
+    """
     paths = RunnerPaths(root)
     init_workspace(root)
     save_state(
@@ -1942,6 +2051,7 @@ def build_parser() -> argparse.ArgumentParser:
     baseline = sub.add_parser("baseline-tests", help="Run Maven baseline tests and summarize logs.")
     baseline.add_argument("--timeout", type=int, default=900)
     baseline.add_argument("--no-tests", action="store_true", help="Create skipped logs without running Maven.")
+    baseline.add_argument("--test-filter", default=None, help="Focus black-box tests via -Dtest=<name>; test class is discovered dynamically, not hard-coded.")
     sub.add_parser("summarize-tests", help="Summarize logs under .agent-work/test-results/.")
     sub.add_parser("audit", help="Create conservative issue candidates.")
     sub.add_parser("prioritize", help="Prioritize issues into fix_plan.md.")
@@ -1967,6 +2077,8 @@ def build_parser() -> argparse.ArgumentParser:
             "{round_file}, {issue_id}, {issue_json}. Can also be set with SHOPHUB_PATCH_COMMAND."
         ),
     )
+    add_issue = sub.add_parser("add-issue", help="Append one validated issue to issues.jsonl (for fan-out auditors).")
+    add_issue.add_argument("--issue-json", required=True, help="JSON string of the issue.")
     sub.add_parser("report", help="Generate 修复报告.md.")
     sub.add_parser("status", help="Print state.json.")
     return parser
@@ -1985,7 +2097,7 @@ def main(argv: list[str] | None = None) -> int:
     elif args.command == "map-code":
         map_code(root)
     elif args.command == "baseline-tests":
-        run_baseline_tests(root, timeout=args.timeout, no_tests=args.no_tests)
+        run_baseline_tests(root, timeout=args.timeout, no_tests=args.no_tests, test_filter=args.test_filter)
     elif args.command == "summarize-tests":
         summarize_test_logs(root)
     elif args.command == "audit":
@@ -2010,6 +2122,12 @@ def main(argv: list[str] | None = None) -> int:
             patch_command=args.patch_command,
             patch_timeout=args.patch_timeout,
         )
+    elif args.command == "add-issue":
+        issue = json.loads(args.issue_json)
+        errors = validate_issue(issue)
+        if errors:
+            raise SystemExit("Issue rejected: " + "; ".join(errors))
+        append_jsonl_record(RunnerPaths(root).issues, issue)
     elif args.command == "report":
         print(generate_report(root))
     elif args.command == "status":

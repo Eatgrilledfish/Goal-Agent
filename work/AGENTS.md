@@ -16,7 +16,7 @@ Do not depend on files outside `work/` at runtime.
 
 ## Execution
 
-Do not install a plugin or copy files into the target repository. The platform loads `/INSTRUCTION.md`; the running agent should read `work/skill/SKILL.md`, then load subagent definitions from `work/skills/*.md`, and execute against the target `HW-ICT-CMP-04` repository in place.
+Do not install a plugin or copy files into the target repository. The platform loads `/INSTRUCTION.md`; the running agent should read `work/skill/SKILL.md`, then load subagent definitions from `work/skills/*.md`, and execute against the target repository in place.
 
 ## Target Repository Truth
 
@@ -29,10 +29,10 @@ design-docs/
 test-cases/
 ```
 
-The frozen API baseline is:
+The frozen API baseline is identified semantically from:
 
-- `README.md`, section `6. API 基线（冻结契约）`
-- `design-docs/附录A-API接口参考.md`
+- `README.md` (its API baseline / frozen-contract section — not a hard-coded section number).
+- The design-doc file(s) that carry the REST API reference (semantically identified, not a hard-coded filename).
 
 Use the target repository files listed above as the complete required competition inputs.
 
