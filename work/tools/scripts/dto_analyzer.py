@@ -220,24 +220,60 @@ def analyze_dtos(root: Path) -> dict[str, Any]:
     api_contract_path = paths.work / "api_contract.json"
     if api_contract_path.exists():
         api_contract = runner.read_json(api_contract_path, {})
+
+        # Build endpoint -> request_body_type mapping from code snapshot
+        code_snapshot = runner.snapshot_code_api(root)
+        endpoint_to_dto: dict[tuple[str, str], str] = {}
+        for ep in code_snapshot.get("endpoints", []):
+            key = (ep.get("method", ""), ep.get("url", ""))
+            dto_name = ep.get("request_body_type")
+            if dto_name:
+                endpoint_to_dto[key] = dto_name
+
+        # Build DTO index for quick lookup
+        dto_index: dict[str, dict[str, Any]] = {}
+        for dto_info in report["dtos"]:
+            dto_index[dto_info["class_name"]] = dto_info
+
         for endpoint in api_contract.get("endpoints", []):
-            for field_name, field_spec in endpoint.get("request", {}).get("body", {}).items():
-                # Find which DTO corresponds
-                for dto_info in report["dtos"]:
-                    gaps = check_validation_gaps(
-                        dto_info["fields"],
-                        field_name,
-                        field_spec.get("type", "string"),
+            key = (endpoint["method"], endpoint["path"])
+            dto_name = endpoint_to_dto.get(key)
+
+            if not dto_name:
+                # Try alternative key without leading/trailing differences
+                for ep_key, ep_dto in endpoint_to_dto.items():
+                    if ep_key[0] == endpoint["method"] and endpoint["path"].rstrip("/") in ep_key[1].rstrip("/"):
+                        dto_name = ep_dto
+                        break
+                if not dto_name:
+                    report.setdefault("warnings", []).append(
+                        f"No request DTO mapped for {endpoint['method']} {endpoint['path']} — "
+                        f"skipping validation gap check"
                     )
-                    if gaps:
-                        report["gap_details"].append({
-                            "endpoint": f"{endpoint['method']} {endpoint['path']}",
-                            "dto": dto_info["class_name"],
-                            "field": field_name,
-                            "expected": f"type={field_spec.get('type')}, required={field_spec.get('required')}",
-                            "gaps": gaps,
-                        })
-                        report["summary"]["validation_gaps"] += len(gaps)
+                    continue
+
+            dto_info = dto_index.get(dto_name)
+            if not dto_info:
+                report.setdefault("warnings", []).append(
+                    f"DTO '{dto_name}' for {endpoint['method']} {endpoint['path']} not found in scanned DTOs"
+                )
+                continue
+
+            for field_name, field_spec in endpoint.get("request", {}).get("body", {}).items():
+                gaps = check_validation_gaps(
+                    dto_info["fields"],
+                    field_name,
+                    field_spec.get("type", "string"),
+                )
+                if gaps:
+                    report["gap_details"].append({
+                        "endpoint": f"{endpoint['method']} {endpoint['path']}",
+                        "dto": dto_name,
+                        "field": field_name,
+                        "expected": f"type={field_spec.get('type')}, required={field_spec.get('required')}",
+                        "gaps": gaps,
+                    })
+                    report["summary"]["validation_gaps"] += len(gaps)
 
     runner.write_json(paths.work / "dto_validation_report.json", report)
     return report

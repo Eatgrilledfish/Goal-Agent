@@ -197,12 +197,6 @@ def analyze_exceptions(root: Path) -> dict[str, Any]:
                 f"may return 200 unconditionally — violates error semantics"
             )
 
-    # Check if ApiResponse wrapper is consistent
-    has_api_response = any(
-        "@RestControllerAdvice" in runner.read_text(code_dir / "**" / "*.java")
-        for _ in [1]  # Simple flag
-    )
-
     runner.write_json(paths.work / "exception_coverage.json", report)
 
     # Summary

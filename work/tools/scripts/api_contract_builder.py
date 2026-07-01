@@ -136,39 +136,123 @@ def extract_summary_from_context(text: str, start_pos: int, end_pos: int) -> str
     return ""
 
 
+def extract_markdown_tables(context: str) -> list[list[list[str]]]:
+    """Parse markdown tables from text into list of tables, each a list of rows of cells."""
+    tables: list[list[list[str]]] = []
+    lines = context.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        if not line.startswith("|"):
+            i += 1
+            continue
+        block: list[str] = []
+        while i < len(lines) and lines[i].strip().startswith("|"):
+            block.append(lines[i].strip())
+            i += 1
+        if len(block) >= 2:
+            rows: list[list[str]] = []
+            for row in block:
+                cells = [c.strip().strip("`") for c in row.strip("|").split("|")]
+                rows.append(cells)
+            # Skip separator rows (|---|)
+            if not all(re.match(r"^[-: ]+$", c) for c in rows[0]):
+                tables.append(rows)
+    return tables
+
+
+def find_col(headers: list[str], candidates: list[str]) -> int:
+    """Find the index of a column matching one of the candidate header names."""
+    for idx, h in enumerate(headers):
+        h_lower = h.strip().lower()
+        for cand in candidates:
+            if cand.lower() == h_lower:
+                return idx
+    return -1
+
+
+def parse_required(value: str) -> bool:
+    """Parse required field value from Chinese or English markers."""
+    v = value.strip().lower()
+    return v in {"是", "必填", "必须", "y", "yes", "true", "required", "mandatory"}
+
+
 def extract_fields_from_nearby_table(text: str, after_pos: int, direction: str) -> dict[str, dict[str, Any]]:
     """Extract request/response fields from markdown tables near the endpoint.
 
-    Looks for tables with headers like 'Field', 'Type', 'Required', 'Description'.
+    Supports flexible headers:
+      - Field: 字段, 字段名, 名称, name, field, 参数名
+      - Type: 类型, type
+      - Required: 是否必填, 必填, required, 是否必须
+      - Description: 说明, 描述, description
     """
-    # Search up to 2000 chars after the endpoint for a relevant table
     search_end = min(after_pos + 3000, len(text))
     context = text[after_pos:search_end]
 
-    # Match markdown tables with field descriptions
-    # Pattern: | field_name | type | required? | description |
-    table_pattern = re.compile(
-        r"\|\s*`?([A-Za-z_][A-Za-z0-9_.]*)`?\s*\|\s*([A-Za-z0-9_<>\[\],. ]+?)\s*\|"
-        r"\s*(?:是|必填|[Yy]es|[Rr]equired|true|否|选填|[Nn]o|[Oo]ptional|false)?\s*\|",
-        re.M,
-    )
-
+    tables = extract_markdown_tables(context)
     fields: dict[str, dict[str, Any]] = {}
-    for match in table_pattern.finditer(context):
-        field_name = match.group(1).strip()
-        field_type = normalize_field_type(match.group(2).strip())
-        if field_name.lower() in ("field", "字段", "name", "名称", "type", "类型", "parameter"):
-            continue
-        required = False
-        if match.lastindex and match.lastindex >= 3:
-            req_text = match.group(3).strip() if match.group(3) else ""
-            required = req_text.lower() in ("是", "必填", "yes", "required", "true")
 
-        fields[field_name] = {
-            "type": field_type,
-            "required": required,
-            "constraints": infer_constraints(field_name, field_type),
-        }
+    for table in tables:
+        if len(table) < 2:
+            continue
+        headers = table[0]
+        field_col = find_col(headers, ["字段", "字段名", "名称", "field", "name", "参数名"])
+        type_col = find_col(headers, ["类型", "type"])
+        required_col = find_col(headers, ["是否必填", "必填", "required", "是否必须"])
+        desc_col = find_col(headers, ["说明", "描述", "description"])
+
+        if field_col < 0:
+            continue  # can't parse without field name column
+
+        for row in table[1:]:
+            if len(row) <= field_col:
+                continue
+            field_name = row[field_col].strip()
+            if not field_name:
+                continue
+            if field_name.lower() in ("field", "字段", "name", "名称", "type", "类型", "parameter"):
+                continue
+
+            field_type = "string"
+            if type_col >= 0 and type_col < len(row):
+                field_type = normalize_field_type(row[type_col].strip())
+
+            required = False
+            if required_col >= 0 and required_col < len(row):
+                required = parse_required(row[required_col])
+
+            description = ""
+            if desc_col >= 0 and desc_col < len(row):
+                description = row[desc_col].strip()
+
+            fields[field_name] = {
+                "type": field_type,
+                "required": required,
+                "constraints": infer_constraints(field_name, field_type),
+                "description": description,
+            }
+
+    # Fallback: if no tables found, try regex-based extraction
+    if not fields:
+        table_pattern = re.compile(
+            r"\|\s*`?([A-Za-z_][A-Za-z0-9_.]*)`?\s*\|\s*([A-Za-z0-9_<>\[\],. ]+?)\s*\|"
+            r"\s*(?:是|必填|[Yy]es|[Rr]equired|true|否|选填|[Nn]o|[Oo]ptional|false)?\s*\|",
+            re.M,
+        )
+        for match in table_pattern.finditer(context):
+            field_name = match.group(1).strip()
+            field_type = normalize_field_type(match.group(2).strip())
+            if field_name.lower() in ("field", "字段", "name", "名称", "type", "类型", "parameter"):
+                continue
+            required = False
+            if match.lastindex and match.lastindex >= 3:
+                req_text = match.group(3).strip() if match.group(3) else ""
+                required = req_text.lower() in ("是", "必填", "yes", "required", "true")
+            fields[field_name] = {
+                "type": field_type,
+                "required": required,
+                "constraints": infer_constraints(field_name, field_type),
+            }
 
     return fields
 

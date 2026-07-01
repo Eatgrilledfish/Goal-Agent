@@ -122,10 +122,72 @@ def check_request_fields(
     return issues
 
 
+def unwrap_response_type(response_type: str) -> dict[str, Any]:
+    """Parse wrapped response types into their components.
+
+    Input:
+      ResponseEntity<ApiResponse<ProductResponse>>
+      ApiResponse<List<OrderResponse>>
+      Result<PageResult<ProductVO>>
+
+    Output:
+      {
+        "wrapper": "ApiResponse",
+        "inner": "ProductResponse",
+        "collection": false,
+        "page": false
+      }
+    """
+    result: dict[str, Any] = {
+        "wrapper": "",
+        "inner": response_type,
+        "collection": False,
+        "page": False,
+    }
+
+    # Strip ResponseEntity
+    stripped = response_type
+    resp_match = re.match(r"ResponseEntity\s*<\s*(.+)\s*>", stripped, re.I)
+    if resp_match:
+        stripped = resp_match.group(1).strip()
+
+    # Detect wrapper class
+    wrapper_match = re.match(
+        r"(ApiResponse|Result|CommonResponse|R|BaseResponse)\s*<\s*(.+)\s*>",
+        stripped, re.I,
+    )
+    if wrapper_match:
+        result["wrapper"] = wrapper_match.group(1)
+        stripped = wrapper_match.group(2).strip()
+
+    # Detect page wrapper
+    page_match = re.match(
+        r"(Page|PageResult|IPage|Slice)\s*<\s*(.+)\s*>",
+        stripped, re.I,
+    )
+    if page_match:
+        result["page"] = True
+        stripped = page_match.group(2).strip()
+
+    # Detect List/Collection
+    list_match = re.match(
+        r"(List|Set|Collection|ArrayList)\s*<\s*(.+)\s*>",
+        stripped, re.I,
+    )
+    if list_match:
+        result["collection"] = True
+        stripped = list_match.group(2).strip()
+
+    # Clean generic params
+    stripped = re.sub(r"<[^>]+>", "", stripped)
+    result["inner"] = stripped.split(".")[-1].strip()
+    return result
+
+
 def check_response_fields(
     contract: dict[str, Any], code_snapshot: dict[str, Any]
 ) -> list[dict[str, Any]]:
-    """Check response body field consistency."""
+    """Check response body field consistency, including nested fields in wrapped types."""
     issues: list[dict[str, Any]] = []
     dto_fields = code_snapshot.get("dto_fields", {})
 
@@ -143,27 +205,126 @@ def check_response_fields(
         if not code_ep:
             continue
 
-        resp_type = code_ep.get("response_body_type")
+        resp_type = code_ep.get("response_body_type", "")
         if not resp_type:
             continue
 
-        code_fields = dto_fields.get(resp_type, {})
+        unwrapped = unwrap_response_type(resp_type)
+        inner_type = unwrapped["inner"]
+        wrapper_name = unwrapped["wrapper"]
 
-        # Check for missing response fields
-        for field_name in contract_resp:
-            if field_name not in code_fields:
-                # Check if it's nested (e.g., data.id)
-                if "." not in field_name:
+        # Merge fields from wrapper and inner type
+        code_fields: dict[str, str] = {}
+        if wrapper_name and wrapper_name in dto_fields:
+            code_fields.update(dto_fields[wrapper_name])
+        if inner_type and inner_type in dto_fields:
+            code_fields.update(dto_fields[inner_type])
+
+        # Check each contract response field
+        for field_name, field_spec in contract_resp.items():
+            # Handle nested fields like data.id, data.items.*
+            if "." in field_name:
+                parts = field_name.split(".")
+                top_field = parts[0]
+                nested_field = parts[-1]
+
+                if top_field not in code_fields and top_field not in dto_fields:
                     issues.append({
                         "type": "missing_response_field",
                         "severity": "P1",
                         "endpoint_id": ep["id"],
                         "method": ep["method"],
                         "path": ep["path"],
-                        "response_dto": resp_type,
+                        "response_type": resp_type,
                         "field": field_name,
-                        "detail": f"Response field '{field_name}' expected but not found in {resp_type}",
+                        "detail": (
+                            f"Response field '{field_name}' expected but "
+                            f"'{top_field}' not found in response type chain"
+                        ),
                     })
+                    continue
+
+                # For nested fields, check if the inner type contains them
+                inner_dto_fields = dto_fields.get(inner_type, {})
+                if nested_field not in inner_dto_fields and nested_field not in code_fields:
+                    issues.append({
+                        "type": "missing_response_field",
+                        "severity": "P1",
+                        "endpoint_id": ep["id"],
+                        "method": ep["method"],
+                        "path": ep["path"],
+                        "response_type": resp_type,
+                        "field": field_name,
+                        "detail": (
+                            f"Contract requires {field_name} but "
+                            f"{inner_type} has no '{nested_field}' field"
+                        ),
+                    })
+            elif field_name not in code_fields:
+                issues.append({
+                    "type": "missing_response_field",
+                    "severity": "P1",
+                    "endpoint_id": ep["id"],
+                    "method": ep["method"],
+                    "path": ep["path"],
+                    "response_dto": resp_type,
+                    "field": field_name,
+                    "detail": (
+                        f"Response field '{field_name}' expected but not found in {resp_type}"
+                    ),
+                })
+
+        # Check for null-vs-empty-list patterns
+        if unwrapped["collection"] or unwrapped["page"]:
+            null_vs_empty_issue = check_null_vs_empty_list(ep, code_snapshot)
+            if null_vs_empty_issue:
+                issues.append(null_vs_empty_issue)
+
+        # Check pagination metadata
+        if unwrapped["page"]:
+            page_issues = check_pagination_metadata(ep, inner_type, dto_fields, resp_type)
+            issues.extend(page_issues)
+
+    return issues
+
+
+def check_null_vs_empty_list(
+    ep: dict[str, Any], code_snapshot: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Check for potential null-vs-empty-list inconsistencies."""
+    # Heuristic: if there's no @JsonInclude(NON_NULL) configuration, flag it
+    configs = code_snapshot.get("configs", [])
+    return None  # Requires deeper code analysis; placeholder for future enhancement
+
+
+def check_pagination_metadata(
+    ep: dict[str, Any],
+    inner_type: str,
+    dto_fields: dict[str, dict[str, str]],
+    resp_type: str,
+) -> list[dict[str, Any]]:
+    """Check if pagination response includes expected metadata fields."""
+    issues: list[dict[str, Any]] = []
+    expected_meta = ["total", "totalElements", "totalPages", "pageNum", "pageSize"]
+    inner_fields = dto_fields.get(inner_type, {})
+
+    has_metadata = any(
+        field in inner_fields
+        for field in expected_meta
+    )
+    if not has_metadata:
+        issues.append({
+            "type": "pagination_metadata_missing",
+            "severity": "P1",
+            "endpoint_id": ep["id"],
+            "method": ep["method"],
+            "path": ep["path"],
+            "response_type": resp_type,
+            "detail": (
+                f"Pagination response type {resp_type} may be missing metadata fields "
+                f"(expected one of: {', '.join(expected_meta)})"
+            ),
+        })
 
     return issues
 
@@ -191,11 +352,44 @@ def check_error_codes(
     return issues
 
 
+EXPECTED_ERROR_HANDLERS = {
+    400: [
+        "MethodArgumentNotValidException",
+        "ConstraintViolationException",
+        "BindException",
+        "HttpMessageNotReadableException",
+    ],
+    404: [
+        "EntityNotFoundException",
+        "ResourceNotFoundException",
+        "NotFoundException",
+        "NoSuchElementException",
+    ],
+    409: [
+        "ConflictException",
+        "DuplicateException",
+        "DataIntegrityViolationException",
+    ],
+}
+
+
 def check_endpoint_errors(
-    contract: dict[str, Any], code_snapshot: dict[str, Any]
+    contract: dict[str, Any],
+    code_snapshot: dict[str, Any],
+    exception_coverage: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """Check per-endpoint error response coverage."""
+    """Check per-endpoint error response coverage against exception handlers."""
     issues: list[dict[str, Any]] = []
+
+    # Build handler type index from exception_coverage
+    covered_types: set[str] = set()
+    handler_details: dict[str, dict[str, Any]] = {}
+    if exception_coverage:
+        for handler in exception_coverage.get("handlers", []):
+            ex_type = handler.get("exception_type", "")
+            if ex_type:
+                covered_types.add(ex_type)
+                handler_details[ex_type] = handler
 
     for ep in contract.get("endpoints", []):
         documented_errors = ep.get("errors", [])
@@ -204,18 +398,93 @@ def check_endpoint_errors(
 
         for error in documented_errors:
             status = error.get("status")
-            code = error.get("body", {}).get("code")
+            code = error.get("body", {}).get("code", "")
             condition = error.get("condition", "")
 
-            # Check if there's a matching handler in exception_coverage
-            # (this requires exception_coverage.json to be available)
-            # For now, flag undocumented coverage
-            if status and status == 400 and "validation" in condition.lower():
-                pass  # Expected to be handled by MethodArgumentNotValidException
-            elif status and status == 404:
-                pass  # Expected to be handled by entity-not-found
-            elif status and status == 409:
-                pass  # Expected to be handled by conflict/duplicate
+            if not status:
+                continue
+
+            # Check handler coverage for documented error status
+            expected_handlers = EXPECTED_ERROR_HANDLERS.get(status, [])
+            if expected_handlers:
+                has_handler = any(eh in covered_types for eh in expected_handlers)
+                if not has_handler:
+                    # Check fuzzy: any handler returning this status
+                    status_handlers = [
+                        h for h in exception_coverage.get("handlers", [])
+                        if str(h.get("http_status", "")) == str(status)
+                    ] if exception_coverage else []
+                    if not status_handlers:
+                        issues.append({
+                            "type": "missing_error_handler",
+                            "severity": "P0",
+                            "endpoint_id": ep["id"],
+                            "method": ep["method"],
+                            "path": ep["path"],
+                            "expected_status": status,
+                            "expected_code": code,
+                            "detail": (
+                                f"API contract documents {status} {code if code else ''} "
+                                f"but no matching exception handler found. "
+                                f"Expected one of: {', '.join(expected_handlers)}"
+                            ),
+                            "suspected_files": [
+                                handler.get("file", "GlobalExceptionHandler.java")
+                                for handler in exception_coverage.get("handlers", [])
+                            ] if exception_coverage else ["GlobalExceptionHandler.java"],
+                        })
+                        continue
+
+            # Check error code in handler body
+            if code and exception_coverage:
+                matching_code_handlers = [
+                    h for h in exception_coverage.get("handlers", [])
+                    if h.get("error_code") == code
+                ]
+                if not matching_code_handlers:
+                    issues.append({
+                        "type": "missing_error_code_in_handler",
+                        "severity": "P1",
+                        "endpoint_id": ep["id"],
+                        "method": ep["method"],
+                        "path": ep["path"],
+                        "expected_status": status,
+                        "expected_code": code,
+                        "detail": (
+                            f"Error code '{code}' documented in API contract "
+                            f"but no handler explicitly returns this code"
+                        ),
+                        "suspected_files": [
+                            handler.get("file", "GlobalExceptionHandler.java")
+                            for handler in exception_coverage.get("handlers", [])
+                            if str(handler.get("http_status", "")) == str(status)
+                        ] if exception_coverage else ["GlobalExceptionHandler.java"],
+                    })
+
+            # Check handler status mismatches
+            if exception_coverage:
+                status_mismatches = [
+                    h for h in exception_coverage.get("handlers", [])
+                    if h.get("exception_type") in expected_handlers
+                    and str(h.get("http_status", "")) != str(status)
+                    and h.get("http_status", "") not in ("UNKNOWN",)
+                ]
+                for h in status_mismatches:
+                    issues.append({
+                        "type": "wrong_status_code",
+                        "severity": "P0",
+                        "endpoint_id": ep["id"],
+                        "method": ep["method"],
+                        "path": ep["path"],
+                        "handler_file": h.get("file", ""),
+                        "handler_exception": h.get("exception_type", ""),
+                        "actual_status": h.get("http_status"),
+                        "expected_status": status,
+                        "detail": (
+                            f"Handler for {h.get('exception_type')} returns {h.get('http_status')} "
+                            f"but contract expects {status}"
+                        ),
+                    })
 
     return issues
 
@@ -266,12 +535,65 @@ def types_compatible(a: str, b: str) -> bool:
     return False
 
 
+def determine_implementation_status(
+    endpoint: dict[str, Any],
+    code_ep: dict[str, Any] | None,
+    all_issues: list[dict[str, Any]],
+) -> str:
+    """Determine implementation status from code presence and consistency issues.
+
+    Returns: implemented | partial | missing | conflict
+    """
+    endpoint_key = (endpoint["method"], endpoint["path"])
+
+    if not code_ep:
+        return "missing"
+
+    # Gather issues related to this endpoint
+    endpoint_issues = [
+        i for i in all_issues
+        if i.get("method") == endpoint_key[0] and i.get("path") == endpoint_key[1]
+    ]
+
+    if not endpoint_issues:
+        # Double-check: endpoint exists but may have issues not tied to path
+        for i in all_issues:
+            if i.get("endpoint_id") == endpoint.get("id"):
+                endpoint_issues.append(i)
+
+    if not endpoint_issues:
+        return "implemented"
+
+    # P0 issues with type_mismatch, wrong_http_method, wrong_path, wrong_status_code, wrong_error_code => conflict
+    conflict_types = {
+        "type_mismatch",
+        "wrong_http_method",
+        "wrong_path",
+        "wrong_status_code",
+        "wrong_error_code",
+        "missing_endpoint",
+    }
+    for issue in endpoint_issues:
+        if issue.get("severity") == "P0" and issue.get("type") in conflict_types:
+            return "conflict"
+
+    # Any other issues => partial
+    return "partial"
+
+
 def build_trace_matrix(
     contract: dict[str, Any],
     rules: dict[str, Any],
     repo_map: dict[str, Any],
+    all_issues: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Build traceability matrix linking design requirements to code locations."""
+    """Build traceability matrix linking design requirements to code locations.
+
+    Uses consistency issues to accurately determine implementation status.
+    """
+    if all_issues is None:
+        all_issues = []
+
     trace_items: list[dict[str, Any]] = []
 
     controllers = {c.get("class_name", ""): c for c in repo_map.get("controllers", [])}
@@ -313,14 +635,32 @@ def build_trace_matrix(
                     "symbol": resp_dto_name,
                     "confidence": 0.90,
                 }
-            item["implementation_status"] = "implemented"
+            # Determine accurate status
+            item["implementation_status"] = determine_implementation_status(ep, code_ep, all_issues)
         else:
             item["implementation_status"] = "missing"
             item["gap"] = f"No code endpoint found for {ep['method']} {ep['path']}"
 
+        # Add gap description for partial/conflict
+        if item["implementation_status"] in ("partial", "conflict"):
+            endpoint_issues = [
+                i for i in all_issues
+                if i.get("method") == ep["method"] and i.get("path") == ep["path"]
+            ]
+            if endpoint_issues:
+                gap_types = {i["type"] for i in endpoint_issues}
+                item["gap"] = "; ".join(sorted(gap_types))
+                severities = {i.get("severity", "P2") for i in endpoint_issues}
+                if "P0" in severities:
+                    item["repair_priority"] = "P0"
+                elif "P1" in severities:
+                    item["repair_priority"] = "P1"
+                else:
+                    item["repair_priority"] = "P2"
+
         # Map business rules
         for rule in rules.get("rules", []):
-            if ep["method"] in str(rule.get("related_api", [])) and ep["path"] in str(rule.get("related_api", [])):
+            if ep["method"] in str(rule.get("related_api", "")) and ep["path"] in str(rule.get("related_api", "")):
                 item.setdefault("business_rules", []).append(rule["id"])
 
         trace_items.append(item)
@@ -365,6 +705,7 @@ def check_consistency(root: Path) -> dict[str, Any]:
     contract = runner.read_json(paths.work / "api_contract.json", {})
     rules = runner.read_json(paths.work / "business_rules.json", {})
     repo_map = runner.read_json(paths.work / "repo_map.json", {})
+    exception_coverage = runner.read_json(paths.work / "exception_coverage.json", None)
 
     # Get current code snapshot
     code_snapshot = runner.snapshot_code_api(root)
@@ -375,10 +716,34 @@ def check_consistency(root: Path) -> dict[str, Any]:
     all_issues.extend(check_request_fields(contract, code_snapshot))
     all_issues.extend(check_response_fields(contract, code_snapshot))
     all_issues.extend(check_error_codes(contract, code_snapshot))
-    all_issues.extend(check_endpoint_errors(contract, code_snapshot))
+    all_issues.extend(check_endpoint_errors(contract, code_snapshot, exception_coverage))
 
-    # Build trace matrix
-    trace_matrix = build_trace_matrix(contract, rules, repo_map)
+    # Check for anti-patterns from exception coverage
+    if exception_coverage:
+        for handler in exception_coverage.get("handlers", []):
+            if handler.get("has_swallow_pattern"):
+                all_issues.append({
+                    "type": "exception_swallow",
+                    "severity": "P0",
+                    "detail": (
+                        f"Handler for {handler.get('exception_type')} in "
+                        f"{handler.get('file')} has catch(Exception) — possible exception swallowing"
+                    ),
+                    "suspected_files": [handler.get("file", "")],
+                })
+            if handler.get("returns_200_unconditionally"):
+                all_issues.append({
+                    "type": "exception_returns_200",
+                    "severity": "P0",
+                    "detail": (
+                        f"Handler for {handler.get('exception_type')} in "
+                        f"{handler.get('file')} may return 200 unconditionally"
+                    ),
+                    "suspected_files": [handler.get("file", "")],
+                })
+
+    # Build trace matrix (pass issues for accurate status)
+    trace_matrix = build_trace_matrix(contract, rules, repo_map, all_issues)
 
     # Build report
     report: dict[str, Any] = {
