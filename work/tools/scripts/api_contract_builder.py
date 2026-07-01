@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """API Contract Builder — deterministic extraction of REST endpoints from README/design-docs.
 
-Produces ``api_contract.json`` per DESIGN.md §6.3 format.
+Produces ``api_contract.json`` from the target repository's frozen API baseline.
 Enhances the extraction logic already present in shophub_goal_runner.py.
 """
 

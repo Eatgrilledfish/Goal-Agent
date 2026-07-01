@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Business Rule Builder — deterministic extraction of business rules from design-docs.
 
-Produces ``business_rules.json`` per DESIGN.md §7.3 format.
+Produces ``business_rules.json`` from the target repository's design documents.
 Enhances the spec extraction logic already present in shophub_goal_runner.py.
 """
 
@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import shophub_goal_runner as runner
 
 
-# Rule type classification keywords (inferred from DESIGN.md §25)
+# Rule type classification keywords used by the competition repair pipeline.
 RULE_TYPE_KEYWORDS: dict[str, list[str]] = {
     "validation": [
         "不能为空", "必填", "不能为null", "不能为空白", "必须大于", "必须小于",

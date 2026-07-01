@@ -24,8 +24,8 @@ Your job is to read the frozen API baseline (from README.md and/or design-docs) 
 
 ## Outputs
 
-- `.agent-work/api_contract.json` — frozen API contract per DESIGN.md §6.3
-- `.agent-work/business_rules.json` — extracted business rules per DESIGN.md §7.3
+- `.agent-work/api_contract.json` — frozen API contract extracted from the target repository docs
+- `.agent-work/business_rules.json` — business rules extracted from the target repository design docs
 - `.agent-work/02_api_contract_index.md` — human-readable API contract index
 - `.agent-work/03_business_rules_index.md` — human-readable business rules index
 

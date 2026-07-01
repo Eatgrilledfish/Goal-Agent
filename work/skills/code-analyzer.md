@@ -24,7 +24,7 @@ Your job is to scan the `code/` directory of the target project and produce a co
 
 ## Outputs
 
-- `.agent-work/repo_map.json` — structured code map per DESIGN.md §8
+- `.agent-work/repo_map.json` — structured code map for the target Spring Boot project
 - `.agent-work/dto_validation_report.json` — per-DTO validation coverage
 - `.agent-work/exception_coverage.json` — ExceptionHandler coverage
 - `.agent-work/04_repo_map_summary.md` — human-readable summary

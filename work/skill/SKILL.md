@@ -5,7 +5,7 @@ description: Spec-driven design-implementation consistency repair. Builds API co
 
 # Goal Agent — Spec-Driven Pipeline
 
-This SKILL defines the main spec-driven pipeline for design-implementation consistency checking and automatic repair. It orchestrates subagents and deterministic Python scripts to execute the full flow described in DESIGN.md.
+This SKILL defines the main spec-driven pipeline for design-implementation consistency checking and automatic repair. It orchestrates subagents and deterministic Python scripts from the submitted `/work` directory.
 
 ## Pipeline Overview
 

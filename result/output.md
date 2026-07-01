@@ -6,13 +6,13 @@
 - 可运行交付件目录：`/work`
 - 主 Skill：`/work/skill/SKILL.md`
 - 规格驱动 Subagents：`/work/skills/contract-builder.md`, `code-analyzer.md`, `consistency-checker.md`, `patch-generator.md`, `stability-verifier.md`
-- 原有 Subagents：`/work/skills/shophub-*.md`（10个，保留）
-- Helper scripts：`/work/tools/scripts/*.py`（14个脚本：5个原有 + 9个新增）
+- ShopHub Subagents：`/work/skills/shophub-*.md`
+- Helper scripts：`/work/tools/scripts/*.py`
 - Agent 根目录：`/work`
 
 当前交付不需要安装插件，不需要安装额外命令入口，也不需要把运行资产复制到题目仓库。平台加载 `/INSTRUCTION.md` 后，直接读取 `/work` 内资产并作用于目标题目仓库。
 
-## 规格驱动 Pipeline 架构（DESIGN.md 适配）
+## 规格驱动 Pipeline 架构
 
 ```text
 Phase 0: Preflight

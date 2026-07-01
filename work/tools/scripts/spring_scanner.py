@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Spring Boot Code Scanner — produces structured ``repo_map.json`` per DESIGN.md §8.
+"""Spring Boot Code Scanner — produces structured ``repo_map.json``.
 
 Enhances the code mapping logic in shophub_goal_runner.py with:
 - Service method extraction

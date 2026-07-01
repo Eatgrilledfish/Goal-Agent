@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Stability Runner — runs tests N times consecutively to detect flaky behavior.
 
-Per DESIGN.md §17 — ensures tests pass consistently, not just once.
+Ensures verification commands pass consistently, not just once.
 """
 
 from __future__ import annotations

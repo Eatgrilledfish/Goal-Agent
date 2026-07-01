@@ -2,7 +2,7 @@
 """Forbidden Change Guard — deterministic checks that prevent illegal modifications.
 
 Checks git diff against forbidden paths and detects prohibited code patterns.
-Per DESIGN.md §16 — does not depend on LLM judgment.
+Deterministic guard for forbidden competition changes; does not depend on LLM judgment.
 """
 
 from __future__ import annotations
