@@ -238,6 +238,17 @@ def build_parser() -> argparse.ArgumentParser:
                        help="Path to candidate_patches.jsonl (default: .agent-work/candidate_patches.jsonl).")
     parser.add_argument("--output", default=None, help="Output path for validation results.")
     parser.add_argument("--timeout", type=int, default=600, help="Timeout per step in seconds.")
+    parser.add_argument(
+        "--gate-mode",
+        choices=["local", "final"],
+        default="local",
+        help="local: require no hard regression; final: require full matrix all-green.",
+    )
+    parser.add_argument(
+        "--previous-matrix",
+        default=None,
+        help="Previous matrix path for regression comparison in local gate.",
+    )
     return parser
 
 
@@ -312,6 +323,8 @@ def validate_candidate(
     root: Path,
     candidate: dict[str, Any],
     timeout: int,
+    gate_mode: str = "local",
+    previous_matrix: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Validate one candidate patch in an isolated sandbox workspace.
 
@@ -332,6 +345,8 @@ def validate_candidate(
         "generated_tests": "SKIPPED",
         "contract_check": "SKIPPED",
         "forbidden_guard": "SKIPPED",
+        "matrix_gate": "SKIPPED",
+        "gate_mode": gate_mode,
         "diff_files": 0,
         "diff_lines": 0,
         "patch_file": "",
@@ -503,12 +518,16 @@ def validate_candidate(
                     passed_count / total_tests if total_tests > 0 else 0.0
                 )
 
-            # --- FSM-DESIGN §11: Hard elimination based on test outcome matrix ---
-            # Check public black-box matrix for FAILURE/ERROR/TIMEOUT/NOT_RUN
-            matrix_blocked, matrix_reasons = _check_sandbox_matrix(sandbox_root, root)
+            # --- FSM-DESIGN §11: local gate only blocks hard regressions;
+            # final gate requires full public matrix convergence.
+            if gate_mode == "final":
+                matrix_blocked, matrix_reasons = _check_sandbox_final_matrix(sandbox_root)
+            else:
+                matrix_blocked, matrix_reasons = _check_sandbox_local_matrix(sandbox_root, previous_matrix)
+            result["matrix_gate"] = "FAIL" if matrix_blocked else "PASS"
             if matrix_blocked and not result.get("elimination_reason"):
                 result["elimination_reason"] = (
-                    f"Public black-box matrix has blocking issues: {'; '.join(matrix_reasons)}"
+                    f"Public black-box matrix gate failed: {'; '.join(matrix_reasons)}"
                 )
                 result["errors"].append(result["elimination_reason"])
                 result["public_tests"] = "FAIL"
@@ -617,19 +636,13 @@ def _load_baseline_p0_count(root: Path) -> int:
         return 0
 
 
-def _check_sandbox_matrix(sandbox_root: Path, project_root: Path) -> tuple[bool, list[str]]:
-    """Check sandbox test matrix for blocking issues (FAILURE/ERROR/TIMEOUT/NOT_RUN).
-
-    Per FSM-DESIGN §11: Public black-box matrix non-all-green → hard elimination.
-
-    Returns (has_blocking_issues, reasons_list).
-    """
+def _check_sandbox_final_matrix(sandbox_root: Path) -> tuple[bool, list[str]]:
+    """Final gate: public black-box matrix must be all-green."""
     try:
         import test_outcome_collector
     except ImportError:
         return False, []
 
-    # Collect matrix from sandbox Surefire XML (blackbox only for now)
     try:
         matrix = test_outcome_collector.build_test_outcome_matrix(
             sandbox_root,
@@ -638,6 +651,9 @@ def _check_sandbox_matrix(sandbox_root: Path, project_root: Path) -> tuple[bool,
             run_id="sandbox-candidate",
         )
     except Exception:
+        return False, []
+
+    if test_outcome_collector.matrix_is_all_green(matrix):
         return False, []
 
     summary = matrix.get("summary", {})
@@ -650,15 +666,60 @@ def _check_sandbox_matrix(sandbox_root: Path, project_root: Path) -> tuple[bool,
         reasons.append(f"{summary['timeout']} TIMEOUT(s)")
     if summary.get("not_run", 0) > 0:
         reasons.append(f"{summary['not_run']} NOT_RUN")
+    if summary.get("has_unexpected_skipped", False):
+        reasons.append(f"{summary.get('skipped', 0)} unexpected SKIPPED")
 
-    return bool(reasons), reasons
+    return True, reasons or ["matrix is not all-green"]
 
 
-def validate_all_candidates(root: Path, candidates: list[dict[str, Any]], timeout: int) -> list[dict[str, Any]]:
+def _check_sandbox_local_matrix(
+    sandbox_root: Path,
+    previous_matrix: dict[str, Any] | None,
+) -> tuple[bool, list[str]]:
+    """Local gate: only block hard regressions from previous PASS to failing."""
+    if previous_matrix is None:
+        return False, []
+
+    try:
+        import matrix_diff
+        import test_outcome_collector
+    except ImportError:
+        return False, []
+
+    try:
+        current_matrix = test_outcome_collector.build_test_outcome_matrix(
+            sandbox_root,
+            suite_filter="blackbox-public",
+            discover_sources=True,
+            run_id="sandbox-candidate",
+        )
+        diff = matrix_diff.compute_diff(previous_matrix, current_matrix)
+    except Exception:
+        return False, []
+
+    hard_regressions = [c for c in diff.get("changes", []) if c.get("hard_regression")]
+    if hard_regressions:
+        return True, [f"{len(hard_regressions)} hard regression(s): previous PASS now failing"]
+    return False, []
+
+
+def validate_all_candidates(
+    root: Path,
+    candidates: list[dict[str, Any]],
+    timeout: int,
+    gate_mode: str,
+    previous_matrix: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
     """Validate all candidates and return results."""
     results: list[dict[str, Any]] = []
     for candidate in candidates:
-        result = validate_candidate(root, candidate, timeout)
+        result = validate_candidate(
+            root,
+            candidate,
+            timeout,
+            gate_mode=gate_mode,
+            previous_matrix=previous_matrix,
+        )
         results.append(result)
     return results
 
@@ -683,7 +744,35 @@ def load_candidates(root: Path, candidate_file: str | None, task_id: str | None)
     return candidates
 
 
-def validate(root: Path, task_id: str | None, candidate_file: str | None, timeout: int) -> dict[str, Any]:
+def _load_previous_matrix(root: Path, previous_matrix_path: str | None) -> dict[str, Any] | None:
+    if not previous_matrix_path:
+        return None
+    try:
+        import matrix_diff
+
+        resolved = matrix_diff.resolve_matrix_path(root, previous_matrix_path)
+        if resolved.exists():
+            return runner.read_json(resolved, {})
+    except Exception:
+        pass
+    path = Path(previous_matrix_path)
+    if not path.exists():
+        path = root / previous_matrix_path
+    if not path.exists():
+        path = runner.RunnerPaths(root).test_matrix / previous_matrix_path
+    if not path.exists():
+        return None
+    return runner.read_json(path, {})
+
+
+def validate(
+    root: Path,
+    task_id: str | None,
+    candidate_file: str | None,
+    timeout: int,
+    gate_mode: str = "local",
+    previous_matrix_path: str | None = None,
+) -> dict[str, Any]:
     """Main validation entry point."""
     paths = runner.RunnerPaths(root)
 
@@ -696,7 +785,8 @@ def validate(root: Path, task_id: str | None, candidate_file: str | None, timeou
             "results": [],
         }
 
-    results = validate_all_candidates(root, candidates, timeout)
+    previous_matrix = _load_previous_matrix(root, previous_matrix_path)
+    results = validate_all_candidates(root, candidates, timeout, gate_mode, previous_matrix)
 
     # Persist results
     runner.append_jsonl(paths.work / "candidate_validation.jsonl", results)
@@ -738,6 +828,7 @@ def validate(root: Path, task_id: str | None, candidate_file: str | None, timeou
         "status": "ok",
         "total": len(results),
         "eligible": len(eligible),
+        "gate_mode": gate_mode,
         "results": results,
     }
 
@@ -748,7 +839,14 @@ def main() -> int:
     paths = runner.RunnerPaths(root)
     runner.ensure_work_layout(paths)
 
-    report = validate(root, args.task_id, args.candidate_file, args.timeout)
+    report = validate(
+        root,
+        args.task_id,
+        args.candidate_file,
+        args.timeout,
+        gate_mode=args.gate_mode,
+        previous_matrix_path=args.previous_matrix,
+    )
 
     if args.output:
         runner.write_json(Path(args.output), report)

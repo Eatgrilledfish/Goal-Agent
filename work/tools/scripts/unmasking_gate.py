@@ -93,35 +93,40 @@ def run_unmasking_gate(
     # Step 5: Classify new issues
     changes = diff.get("changes", [])
     new_issues = [c for c in changes if c["is_new_issue"]]
+    hard_regressions = [c for c in changes if c.get("hard_regression")]
     regressions = [c for c in changes if c["is_regression"]]
-    unmasked_issues = [c for c in changes if c["change"] == "UNMASKED" and not c["is_regression"]]
+    unmasked_issues = [c for c in changes if c["change"] == "UNMASKED"]
 
-    # Step 6: Attribute regressions to the patch
-    patch_caused_regression = False
-    if regressions and current_diff:
-        patch_caused_regression = _attribute_regressions(regressions, current_diff)
+    # Step 6: Keep weak attribution only as report metadata. It must not decide rollback.
+    heuristic_related_to_diff = _attribute_regressions(hard_regressions, current_diff)
+    patch_caused_regression = bool(hard_regressions)
 
     # Step 7: Determine verdict
     diff_summary = diff.get("summary", {})
     current_all_green = diff_summary.get("current_all_green", False)
 
-    if not new_issues and current_all_green:
+    if hard_regressions:
+        verdict = "REJECT_AND_REVERT"
+        verdict_reason = (
+            f"Patch caused {len(hard_regressions)} hard regression(s): previously PASS now failing"
+        )
+    elif not new_issues and current_all_green:
         verdict = "PASS"
         verdict_reason = "Matrix is all-green with no new issues"
-    elif regressions and patch_caused_regression:
-        verdict = "REJECT_AND_REVERT"
-        verdict_reason = f"Patch introduced {len(regressions)} regression(s)"
+    elif unmasked_issues:
+        verdict = "REQUEUE"
+        verdict_reason = f"{len(unmasked_issues)} previously hidden issue(s) are now visible"
     elif new_issues:
         verdict = "REQUEUE"
-        verdict_reason = f"{len(new_issues)} new issue(s) need attention ({len(regressions)} regressions, {len(unmasked_issues)} unmasked)"
+        verdict_reason = f"{len(new_issues)} new non-hard issue(s) need attention"
     else:
-        verdict = "PASS"
-        verdict_reason = "No blocking issues detected"
+        verdict = "PASS" if current_all_green else "REQUEUE"
+        verdict_reason = "No hard regression; continue until matrix is all-green"
 
     # Step 8: Generate repair tasks for new issues
     new_tasks: list[dict[str, Any]] = []
     if new_issues:
-        tasks = m2t.generate_tasks_from_matrix(root, current_matrix, diff, prefix="UNMASK")
+        tasks = m2t.generate_legacy_issues_from_matrix(root, current_matrix, diff, prefix="UNMASK")
         new_tasks = [t for t in tasks if t.get("matrix_context", {}).get("diff_change") in
                      ("NEW", "REGRESSED", "UNMASKED", "FAILURE_TYPE_CHANGED")]
         # Persist tasks
@@ -150,8 +155,10 @@ def run_unmasking_gate(
         "diff_summary": diff_summary,
         "new_issue_count": len(new_issues),
         "regression_count": len(regressions),
+        "hard_regression_count": len(hard_regressions),
         "unmasked_count": len(unmasked_issues),
         "patch_caused_regression": patch_caused_regression,
+        "heuristic_related_to_diff": heuristic_related_to_diff,
         "new_tasks_count": len(new_tasks),
         "new_tasks": new_tasks,
         "matrix_paths": {
@@ -253,13 +260,16 @@ def render_unmasking_report(report: dict[str, Any]) -> str:
         lines.extend([
             "## New Repair Tasks",
             "",
-            "| Task ID | Priority | Type | Test | Failure Kind |",
-            "|---------|----------|------|------|-------------|",
+            "| Issue ID | Severity | Type | Test | Failure Kind |",
+            "|----------|----------|------|------|-------------|",
         ])
         for t in new_tasks[:20]:
             ctx = t.get("matrix_context", {})
+            item_id = t.get("issue_id") or t.get("task_id") or ""
+            severity = t.get("severity") or t.get("priority") or ""
+            issue_type = t.get("type") or t.get("issue_type") or ""
             lines.append(
-                f"| `{t['task_id']}` | {t['priority']} | {t['issue_type']} | "
+                f"| `{item_id}` | {severity} | {issue_type} | "
                 f"`{ctx.get('class_name', '')}#{ctx.get('method_name', '')}` | "
                 f"{ctx.get('failure_kind', '')} |"
             )

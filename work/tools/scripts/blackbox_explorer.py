@@ -26,6 +26,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -35,6 +36,17 @@ from typing import Any
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import shophub_goal_runner as runner
 import test_outcome_collector as collector
+
+
+OUTCOME_RANK = {
+    "ERROR": 60,
+    "FAILURE": 50,
+    "TIMEOUT": 45,
+    "SKIPPED": 30,
+    "EXPECTED_SKIPPED": 20,
+    "PASS": 10,
+    "NOT_RUN": 0,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -72,7 +84,7 @@ def _parse_test_class(root: Path, test_file: Path) -> dict[str, Any] | None:
     class_name = class_match.group(1)
     methods: list[dict[str, Any]] = []
 
-    test_annotation = re.compile(r'@Test\s*(?:\([^)]*\))?')
+    test_annotation = re.compile(r'@(Test|ParameterizedTest|RepeatedTest|TestFactory|TestTemplate)\b')
     method_decl = re.compile(
         r'(?:public|protected|private)?\s*(?:static\s+)?'
         r'(?:[A-Za-z0-9_<>, ?.\[\]]+)\s+'
@@ -98,6 +110,134 @@ def _parse_test_class(root: Path, test_file: Path) -> dict[str, Any] | None:
 # ---------------------------------------------------------------------------
 # Maven execution helpers
 # ---------------------------------------------------------------------------
+
+def _safe_label(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip("-")[:120] or "run"
+
+
+def clear_surefire_reports(root: Path) -> None:
+    for pattern in (
+        "test-cases/**/target/surefire-reports/TEST-*.xml",
+        "test-cases/**/target/failsafe-reports/TEST-*.xml",
+    ):
+        for xml_path in root.glob(pattern):
+            try:
+                xml_path.unlink()
+            except OSError:
+                pass
+
+
+def snapshot_surefire_reports(root: Path, run_label: str) -> Path:
+    paths = runner.RunnerPaths(root)
+    snapshot_dir = paths.test_matrix / "runs" / _safe_label(run_label)
+    if snapshot_dir.exists():
+        shutil.rmtree(snapshot_dir, ignore_errors=True)
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+
+    for pattern in (
+        "test-cases/**/target/surefire-reports/TEST-*.xml",
+        "test-cases/**/target/failsafe-reports/TEST-*.xml",
+    ):
+        for xml_path in root.glob(pattern):
+            rel_name = "__".join(xml_path.relative_to(root).parts)
+            shutil.copy2(xml_path, snapshot_dir / rel_name)
+    return snapshot_dir
+
+
+def build_matrix_from_snapshot(
+    root: Path,
+    snapshot_dir: Path,
+    run_id: str,
+    discover_sources: bool = False,
+) -> dict[str, Any]:
+    records: list[dict[str, Any]] = []
+    xml_paths = sorted(snapshot_dir.glob("*.xml"))
+    for xml_path in xml_paths:
+        parsed = collector.parse_surefire_xml(xml_path)
+        for record in parsed:
+            record["run_id"] = run_id
+            record["source_xml"] = str(xml_path)
+        records.extend(parsed)
+
+    if discover_sources:
+        records = collector._annotate_with_context(root, records)
+
+    return {
+        "generated_at": runner.now_iso(),
+        "run_id": run_id,
+        "suite_filter": "blackbox-public",
+        "source_xml_count": len(xml_paths),
+        "matrix": records,
+        "summary": collector._build_summary(records),
+    }
+
+
+def merge_run_matrices(
+    root: Path,
+    matrices: list[dict[str, Any]],
+    run_id: str,
+    suite_filter: str = "blackbox-public",
+) -> dict[str, Any]:
+    merged: dict[tuple[str, str], dict[str, Any]] = {}
+
+    for matrix in matrices:
+        for record in matrix.get("matrix", []):
+            key = (record.get("class_name", ""), record.get("method_name", ""))
+            if not key[0] or not key[1]:
+                continue
+            current = merged.get(key)
+            if current is None:
+                merged[key] = dict(record)
+                continue
+            old_rank = OUTCOME_RANK.get(current.get("outcome", "NOT_RUN"), 0)
+            new_rank = OUTCOME_RANK.get(record.get("outcome", "NOT_RUN"), 0)
+            if new_rank > old_rank:
+                merged[key] = dict(record)
+            elif new_rank == old_rank:
+                if not current.get("message") and record.get("message"):
+                    current["message"] = record["message"]
+                if not current.get("stack_top") and record.get("stack_top"):
+                    current["stack_top"] = record["stack_top"]
+
+    records = list(merged.values())
+    discovered = collector.discover_test_sources(root, suite_filter)
+    existing_keys = {(record["class_name"], record["method_name"]) for record in records}
+
+    for discovered_record in discovered:
+        key = (discovered_record["class_name"], discovered_record["method_name"])
+        if key in existing_keys:
+            continue
+        expected_skip = bool(discovered_record.get("is_conditionally_disabled"))
+        records.append({
+            "suite": discovered_record["suite"],
+            "class_name": discovered_record["class_name"],
+            "full_class_name": discovered_record["class_name"],
+            "method_name": discovered_record["method_name"],
+            "outcome": "EXPECTED_SKIPPED" if expected_skip else "NOT_RUN",
+            "failure_kind": "",
+            "message": "Conditionally disabled test method"
+            if expected_skip else "Test method not observed in any suite/class/method run",
+            "stack_top": "",
+            "time_seconds": 0.0,
+            "source_xml": "",
+            "source_file": discovered_record["source_file"],
+            "run_id": run_id,
+            "masked_by": "",
+            "is_conditionally_disabled": expected_skip,
+        })
+
+    records = collector._annotate_with_context(root, records)
+    records.sort(key=lambda item: (item.get("class_name", ""), item.get("method_name", "")))
+    return {
+        "generated_at": runner.now_iso(),
+        "run_id": run_id,
+        "suite_filter": suite_filter,
+        "source_xml_count": sum(m.get("source_xml_count", 0) for m in matrices),
+        "summary": collector._build_summary(records),
+        "matrix": records,
+        "merged_from": [m.get("run_id", "") for m in matrices],
+    }
+
 
 def run_maven_test(
     root: Path,
@@ -127,6 +267,7 @@ def run_maven_test(
         cmd.append(f"-Dtest={test_filter}")
     cmd.append("test")
 
+    clear_surefire_reports(root)
     start_time = time.time()
     try:
         completed = subprocess.run(
@@ -175,19 +316,13 @@ def run_baseline_exploration(root: Path, timeout: int) -> dict[str, Any]:
     paths = runner.RunnerPaths(root)
     matrix_dir = paths.work / "test_matrix"
     runs: list[dict[str, Any]] = []
+    run_matrices: list[dict[str, Any]] = []
 
     # --- Suite-level run ---
     suite_result = run_maven_test(root, timeout=timeout, label="suite")
     runs.append(suite_result)
-
-    # Collect matrix after suite run
-    _ = collector.build_test_outcome_matrix(
-        root,
-        suite_filter="blackbox-public",
-        discover_sources=True,
-        run_id="explorer-suite",
-        log_paths=[],
-    )
+    snapshot = snapshot_surefire_reports(root, "001-suite")
+    run_matrices.append(build_matrix_from_snapshot(root, snapshot, "001-suite"))
 
     # --- Class-level runs ---
     classes = discover_test_classes(root)
@@ -202,14 +337,11 @@ def run_baseline_exploration(root: Path, timeout: int) -> dict[str, Any]:
         result["method_count"] = len(cls.get("methods", []))
         runs.append(result)
         class_results.append(result)
+        snapshot = snapshot_surefire_reports(root, f"class-{class_name}")
+        run_matrices.append(build_matrix_from_snapshot(root, snapshot, f"class-{class_name}"))
 
-    # --- Collect full matrix after all runs ---
-    matrix = collector.build_test_outcome_matrix(
-        root,
-        suite_filter="blackbox-public",
-        discover_sources=True,
-        run_id="explorer-baseline",
-    )
+    # --- Merge per-run matrices after all runs ---
+    matrix = merge_run_matrices(root, run_matrices, run_id="explorer-baseline")
     save_matrix(matrix_dir / "baseline_test_matrix.json", matrix)
     save_matrix(matrix_dir / "current_test_matrix.json", matrix)
 
@@ -239,6 +371,7 @@ def run_sweep_exploration(
     paths = runner.RunnerPaths(root)
     matrix_dir = paths.work / "test_matrix"
     runs: list[dict[str, Any]] = []
+    run_matrices: list[dict[str, Any]] = []
 
     # Determine focus targets
     focus_methods: list[tuple[str, str]] = []  # (class_name, method_name)
@@ -262,6 +395,8 @@ def run_sweep_exploration(
     # --- Suite-level run first ---
     suite_result = run_maven_test(root, timeout=timeout, label="sweep-suite")
     runs.append(suite_result)
+    snapshot = snapshot_surefire_reports(root, "001-sweep-suite")
+    run_matrices.append(build_matrix_from_snapshot(root, snapshot, "001-sweep-suite"))
 
     # --- Class-level runs for focus classes ---
     for class_name in sorted(focus_classes):
@@ -273,6 +408,8 @@ def run_sweep_exploration(
         )
         result["class_name"] = class_name
         runs.append(result)
+        snapshot = snapshot_surefire_reports(root, f"sweep-class-{class_name}")
+        run_matrices.append(build_matrix_from_snapshot(root, snapshot, f"sweep-class-{class_name}"))
 
     # --- Method-level runs for focus methods ---
     for class_name, method_name in focus_methods[:30]:  # limit to avoid explosion
@@ -285,14 +422,11 @@ def run_sweep_exploration(
         result["class_name"] = class_name
         result["method_name"] = method_name
         runs.append(result)
+        snapshot = snapshot_surefire_reports(root, f"sweep-method-{class_name}-{method_name}")
+        run_matrices.append(build_matrix_from_snapshot(root, snapshot, f"sweep-method-{class_name}-{method_name}"))
 
-    # --- Collect full matrix ---
-    matrix = collector.build_test_outcome_matrix(
-        root,
-        suite_filter="blackbox-public",
-        discover_sources=True,
-        run_id="explorer-sweep",
-    )
+    # --- Merge per-run matrices ---
+    matrix = merge_run_matrices(root, run_matrices, run_id="explorer-sweep")
     save_matrix(matrix_dir / "current_test_matrix.json", matrix)
 
     # --- Find unmasked (newly visible) failures ---

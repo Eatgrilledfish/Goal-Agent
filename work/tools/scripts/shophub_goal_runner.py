@@ -1729,6 +1729,65 @@ def generate_report(root: Path) -> Path:
     return report_path
 
 
+def _yes_no(value: bool) -> str:
+    return "YES" if value else "NO"
+
+
+def _render_matrix_report_section(root: Path) -> list[str]:
+    paths = RunnerPaths(root)
+    matrix = read_json(paths.test_matrix / "current_test_matrix.json", {})
+    if not matrix:
+        return ["## 测试矩阵收敛情况", "", "尚未生成测试矩阵。", ""]
+    summary = matrix.get("summary", {})
+    rows = [
+        ("Total", summary.get("total", 0)),
+        ("PASS", summary.get("pass", 0)),
+        ("FAILURE", summary.get("failure", 0)),
+        ("ERROR", summary.get("error", 0)),
+        ("TIMEOUT", summary.get("timeout", 0)),
+        ("SKIPPED", summary.get("skipped", 0)),
+        ("EXPECTED_SKIPPED", summary.get("expected_skipped", 0)),
+        ("NOT_RUN", summary.get("not_run", 0)),
+        ("All Green", _yes_no(_check_matrix_all_green(root))),
+    ]
+    lines = ["## 测试矩阵收敛情况", "", "| 指标 | 数量 |", "|---|---:|"]
+    lines.extend(f"| {name} | {value} |" for name, value in rows)
+    lines.append("")
+    return lines
+
+
+def _render_unmasking_report_section(root: Path) -> list[str]:
+    report = read_json(RunnerPaths(root).test_matrix / "unmasking_report.json", {})
+    if not report:
+        return ["## Unmasking Gate 结果", "", "尚未生成 Unmasking Gate 报告。", ""]
+    return [
+        "## Unmasking Gate 结果",
+        "",
+        f"- Verdict: {report.get('verdict', 'UNKNOWN')}",
+        f"- New issues: {report.get('new_issue_count', 0)}",
+        f"- Regressions: {report.get('regression_count', 0)}",
+        f"- Hard regressions: {report.get('hard_regression_count', 0)}",
+        f"- Unmasked: {report.get('unmasked_count', 0)}",
+        f"- New repair tasks: {report.get('new_tasks_count', 0)}",
+        "",
+    ]
+
+
+def _render_stability_report_section(root: Path) -> list[str]:
+    report = read_json(RunnerPaths(root).work / "stability_report.json", {})
+    if not report:
+        return ["## Stability Gate 结果", "", "尚未生成 Stability Gate 报告。", ""]
+    return [
+        "## Stability Gate 结果",
+        "",
+        f"- Runs requested: {report.get('runs_requested', 0)}",
+        f"- Runs completed: {report.get('runs_completed', 0)}",
+        f"- Stable: {_yes_no(report.get('stable') is True)}",
+        f"- Matrix flaky count: {report.get('matrix_flaky_count', len(report.get('flaky_findings', []) or []))}",
+        "",
+    ]
+
+
 def render_report(
     root: Path,
     issues: list[dict[str, Any]],
@@ -1787,6 +1846,10 @@ def render_report(
             lines.extend(f"- `{item}`" for item in missing)
         else:
             lines.append("未记录开放风险。")
+    lines.extend([""])
+    lines.extend(_render_matrix_report_section(root))
+    lines.extend(_render_unmasking_report_section(root))
+    lines.extend(_render_stability_report_section(root))
     api_safe = "是" if api_compare.get("safe", state.get("api_contract_safe", True)) else "否"
     final_test_result = state.get("last_full_test", "not_run")
     verification_commands = [
@@ -1917,8 +1980,75 @@ def done_decision(root: Path, no_tests: bool = False) -> tuple[bool, str | None]
         return False, None
 
     if high_medium_open == 0 and last_full_test == "passed" and matrix_all_green:
+        if not _stability_gate_passed(root):
+            return False, "stability_gate_not_passed"
+        if not _forbidden_guard_passed(root):
+            return False, "forbidden_guard_not_passed"
         return True, "completed_all_gates_passed"
     return False, None
+
+
+def _stability_gate_passed(root: Path) -> bool:
+    report = read_json(RunnerPaths(root).work / "stability_report.json", {})
+    return report.get("stable") is True
+
+
+def _forbidden_guard_passed(root: Path) -> bool:
+    paths = RunnerPaths(root)
+    for report_path in (
+        paths.work / "forbidden_change_guard.json",
+        paths.work / "forbidden_change_report.json",
+    ):
+        if not report_path.exists():
+            continue
+        report = read_json(report_path, {})
+        if "passed" in report:
+            return report.get("passed") is True
+        if report.get("status") in ("PASS", "passed"):
+            return True
+        if int(report.get("blocker_count", report.get("summary", {}).get("blockers", 1)) or 0) == 0:
+            return True
+    return False
+
+
+def _should_run_final_gates(root: Path, no_tests: bool) -> bool:
+    if no_tests:
+        return False
+    state = load_state(RunnerPaths(root))
+    if state.get("last_full_test") != "passed" or not state.get("api_contract_safe", True):
+        return False
+    buckets = open_issues_by_severity(root)
+    if len(buckets["high"]) + len(buckets["medium"]) > 0:
+        return False
+    return not (_check_matrix_all_green(root) and _stability_gate_passed(root) and _forbidden_guard_passed(root))
+
+
+def _run_final_gates(root: Path, timeout: int) -> None:
+    paths = RunnerPaths(root)
+    if not _check_matrix_all_green(root):
+        return
+    scripts_dir = Path(__file__).resolve().parent
+    try:
+        subprocess.run(
+            [sys.executable, str(scripts_dir / "forbidden_change_guard.py"), "--root", str(root), "--strict"],
+            cwd=root,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+            timeout=120,
+        )
+        subprocess.run(
+            [sys.executable, str(scripts_dir / "stability_runner.py"), "--root", str(root), "--runs", "3", "--timeout", str(timeout)],
+            cwd=root,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+            timeout=max(timeout * 4, 120),
+        )
+    except (OSError, subprocess.SubprocessError, subprocess.TimeoutExpired) as exc:
+        write_json(paths.work / "final_gate_error.json", {"generated_at": now_iso(), "error": str(exc)})
 
 
 def _check_matrix_all_green(root: Path) -> bool:
@@ -1926,13 +2056,11 @@ def _check_matrix_all_green(root: Path) -> bool:
 
     Returns True if:
       - current_test_matrix.json exists AND shows all-green
-      - OR no matrix exists yet (pre-matrix era, fall back to last_full_test)
     """
     paths = RunnerPaths(root)
     current_matrix_path = paths.test_matrix / "current_test_matrix.json"
     if not current_matrix_path.exists():
-        # No matrix yet — fall back to legacy behavior
-        return load_state(paths).get("last_full_test") == "passed"
+        return False
 
     try:
         matrix = read_json(current_matrix_path, {})
@@ -1943,6 +2071,7 @@ def _check_matrix_all_green(root: Path) -> bool:
             and summary.get("error", 0) == 0
             and summary.get("timeout", 0) == 0
             and summary.get("not_run", 0) == 0
+            and summary.get("has_unexpected_skipped", False) is False
         )
     except Exception:
         return False
@@ -2047,6 +2176,115 @@ def verification_command_summary(verification: dict[str, Any]) -> str:
     return "; ".join(parts)
 
 
+def _append_new_matrix_tasks(paths: RunnerPaths, new_tasks: list[dict[str, Any]]) -> int:
+    existing = read_jsonl(paths.issues)
+    existing_ids = {issue.get("issue_id") for issue in existing}
+    existing_keys = {
+        (
+            issue.get("matrix_context", {}).get("class_name"),
+            issue.get("matrix_context", {}).get("method_name"),
+            issue.get("type"),
+        )
+        for issue in existing
+    }
+    appended = 0
+    for task in new_tasks:
+        key = (
+            task.get("matrix_context", {}).get("class_name"),
+            task.get("matrix_context", {}).get("method_name"),
+            task.get("type"),
+        )
+        if task.get("issue_id") in existing_ids or key in existing_keys:
+            continue
+        append_jsonl_record(paths.issues, task)
+        existing_ids.add(task.get("issue_id"))
+        existing_keys.add(key)
+        appended += 1
+    return appended
+
+
+def _handle_post_patch_verification(
+    root: Path,
+    round_no: int,
+    verification: dict[str, Any],
+    tests_summary: str,
+    timeout: int,
+    no_tests: bool,
+) -> tuple[str, str | None]:
+    """Run matrix-based post-patch decision regardless of coarse Maven status."""
+    paths = RunnerPaths(root)
+
+    if no_tests:
+        finish_round(
+            root,
+            round_no,
+            "REWORK_REQUIRED",
+            tests=f"{tests_summary}; no-tests mode cannot satisfy matrix gate",
+            risk="Tests skipped; matrix gate unavailable.",
+        )
+        return "REWORK_CONTINUE", None
+
+    unmask_result = _run_unmasking_gate_if_available(root, round_no, timeout, no_tests)
+    if not unmask_result:
+        if verification["status"] == "passed":
+            finish_round(root, round_no, "PASS", tests=tests_summary, risk="Matrix gate unavailable.")
+            return "PASS_CONTINUE", None
+
+        finish_round(
+            root,
+            round_no,
+            "REWORK_REQUIRED",
+            tests=tests_summary,
+            risk="Verification failed and matrix gate unavailable.",
+        )
+        return "REWORK_CONTINUE", None
+
+    verdict = unmask_result.get("verdict")
+    reason = unmask_result.get("verdict_reason", "")
+
+    if verdict == "REJECT_AND_REVERT":
+        state = load_state(paths)
+        save_state(paths, consecutive_regressions=int(state.get("consecutive_regressions", 0)) + 1)
+        finish_round(
+            root,
+            round_no,
+            "REJECT_AND_REVERT",
+            tests=f"{tests_summary}; Unmasking Gate: REJECT_AND_REVERT — {reason}",
+            risk="Patch introduced regression. Rollback required.",
+        )
+        return "REJECT_STOP", "unmasking_gate_reject_and_revert"
+
+    if verdict == "REQUEUE":
+        appended = _append_new_matrix_tasks(paths, unmask_result.get("new_tasks", []))
+        finish_round(
+            root,
+            round_no,
+            "PASS",
+            tests=f"{tests_summary}; Unmasking Gate: REQUEUE — {appended} new tasks queued",
+            risk=f"Unmasked {unmask_result.get('new_issue_count', 0)} hidden failure(s); continue repair.",
+        )
+        return "REQUEUE_CONTINUE", None
+
+    if verdict == "PASS" and verification["status"] == "passed":
+        finish_round(
+            root,
+            round_no,
+            "PASS",
+            tests=f"{tests_summary}; Unmasking Gate: PASS",
+            risk="None recorded.",
+        )
+        return "PASS_CONTINUE", None
+
+    finish_round(
+        root,
+        round_no,
+        "REWORK_REQUIRED",
+        tests=f"{tests_summary}; Unmasking Gate: {verdict} — {reason}",
+        risk="Verification did not converge; continue repair.",
+    )
+    return "REWORK_CONTINUE", None
+
+
 def run_until_done(
     root: Path,
     no_tests: bool,
@@ -2085,6 +2323,10 @@ def run_until_done(
 
     while True:
         done, reason = done_decision(root, no_tests=no_tests)
+        if not done and _should_run_final_gates(root, no_tests):
+            append_auto_log(paths, "running final matrix/stability/forbidden gates")
+            _run_final_gates(root, timeout)
+            done, reason = done_decision(root, no_tests=no_tests)
         if done:
             append_auto_log(paths, f"stopping: {reason}")
             save_state(paths, phase="WRITE_REPORT", should_continue=False, stop_reason=reason, auto_run_finished_at=now_iso())
@@ -2144,42 +2386,19 @@ def run_until_done(
 
         verification = run_verification_tests(root, f"round-{round_no:03d}", timeout=timeout, no_tests=no_tests)
         tests_summary = verification_command_summary(verification)
-        if verification["status"] in {"passed", "skipped"}:
-            # --- FSM-DESIGN §9: Unmasking Gate after patch acceptance ---
-            unmask_result = _run_unmasking_gate_if_available(root, round_no, timeout, no_tests)
-            if unmask_result and unmask_result.get("verdict") == "REJECT_AND_REVERT":
-                save_state(paths, consecutive_regressions=int(state.get("consecutive_regressions", 0)) + 1)
-                finish_round(
-                    root, round_no,
-                    "REJECT_AND_REVERT",
-                    tests=f"{tests_summary}; Unmasking Gate: REJECT_AND_REVERT — {unmask_result.get('verdict_reason', '')}",
-                    risk="Patch unmasked regressions. Manual rollback or repair required.",
-                )
-                reason = "unmasking_gate_reject_and_revert"
-                append_auto_log(paths, f"stopping: {reason}")
-                save_state(paths, should_continue=False, stop_reason=reason, auto_run_finished_at=now_iso())
-                break
-            if unmask_result and unmask_result.get("verdict") == "REQUEUE":
-                # Patch is kept but new tasks are queued
-                new_tasks = unmask_result.get("new_tasks", [])
-                for task in new_tasks:
-                    append_jsonl_record(paths.issues, task)
-                append_auto_log(
-                    paths,
-                    f"round {round_no:03d}: Unmasking Gate found {len(new_tasks)} new issue(s) — re-queued",
-                )
-                finish_round(
-                    root, round_no,
-                    "PASS",
-                    tests=f"{tests_summary}; Unmasking Gate: REQUEUE — {len(new_tasks)} new tasks queued",
-                    risk=f"Unmasked {unmask_result.get('new_issue_count', 0)} hidden failure(s); will need further rounds.",
-                )
-            else:
-                finish_round(root, round_no, "PASS", tests=tests_summary, risk="Full tests skipped." if no_tests else "None recorded.")
-        else:
-            state = load_state(paths)
-            save_state(paths, consecutive_regressions=int(state.get("consecutive_regressions", 0)) + 1)
-            finish_round(root, round_no, "REWORK_REQUIRED", tests=tests_summary, risk="Verification did not pass after patch.")
+        action, stop_reason = _handle_post_patch_verification(
+            root=root,
+            round_no=round_no,
+            verification=verification,
+            tests_summary=tests_summary,
+            timeout=timeout,
+            no_tests=no_tests,
+        )
+
+        if action == "REJECT_STOP":
+            append_auto_log(paths, f"stopping: {stop_reason}")
+            save_state(paths, should_continue=False, stop_reason=stop_reason, auto_run_finished_at=now_iso())
+            break
 
         map_code(root)
         audit_inconsistencies(root)
@@ -2215,6 +2434,12 @@ def _run_unmasking_gate_if_available(
             current_diff=current_diff,
         )
     except ImportError:
+        return None
+    except Exception as exc:
+        write_json(
+            RunnerPaths(root).test_matrix / "unmasking_gate_error.json",
+            {"generated_at": now_iso(), "round": round_no, "error": str(exc)},
+        )
         return None
 
 

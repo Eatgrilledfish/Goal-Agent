@@ -38,6 +38,10 @@ import shophub_goal_runner as runner
 import test_outcome_collector as collector
 
 
+FAILING_OUTCOMES = ("FAILURE", "ERROR", "TIMEOUT")
+BLOCKING_OUTCOMES = set(FAILING_OUTCOMES) | {"SKIPPED", "NOT_RUN"}
+
+
 # ---------------------------------------------------------------------------
 # Change classification
 # ---------------------------------------------------------------------------
@@ -53,31 +57,27 @@ def classify_change(prev_outcome: str, curr_outcome: str) -> str:
         One of: NEW, RESOLVED, REGRESSED, UNMASKED, MASKED, UNCHANGED.
     """
     if prev_outcome == "NOT_SEEN":
-        return "NEW"
+        return "NEW" if curr_outcome in BLOCKING_OUTCOMES else "NEW_PASSING"
 
-    if prev_outcome in ("FAILURE", "ERROR", "TIMEOUT") and curr_outcome == "PASS":
+    if prev_outcome in FAILING_OUTCOMES and curr_outcome in ("PASS", "EXPECTED_SKIPPED"):
         return "RESOLVED"
 
-    if prev_outcome == "PASS" and curr_outcome in ("FAILURE", "ERROR", "TIMEOUT"):
+    if prev_outcome == "PASS" and curr_outcome in FAILING_OUTCOMES:
         return "REGRESSED"
 
-    if prev_outcome in ("NOT_RUN", "") and curr_outcome in ("FAILURE", "ERROR"):
+    if prev_outcome in ("NOT_RUN", "SKIPPED", "NOT_SEEN", "") and curr_outcome in FAILING_OUTCOMES:
         return "UNMASKED"
 
-    if prev_outcome in ("FAILURE", "ERROR") and curr_outcome in ("NOT_RUN", ""):
+    if prev_outcome in FAILING_OUTCOMES and curr_outcome in ("NOT_RUN", ""):
         return "MASKED"
 
     # Failure type change (e.g., FAILURE → ERROR or vice versa)
-    if (prev_outcome in ("FAILURE", "ERROR") and curr_outcome in ("FAILURE", "ERROR")
+    if (prev_outcome in FAILING_OUTCOMES and curr_outcome in FAILING_OUTCOMES
             and prev_outcome != curr_outcome):
         return "FAILURE_TYPE_CHANGED"
 
-    # SKIPPED → FAILURE/ERROR
-    if prev_outcome == "SKIPPED" and curr_outcome in ("FAILURE", "ERROR"):
-        return "UNMASKED"
-
     # FAILURE/ERROR → SKIPPED
-    if prev_outcome in ("FAILURE", "ERROR") and curr_outcome == "SKIPPED":
+    if prev_outcome in FAILING_OUTCOMES and curr_outcome == "SKIPPED":
         return "MASKED"
 
     return "UNCHANGED"
@@ -85,7 +85,13 @@ def classify_change(prev_outcome: str, curr_outcome: str) -> str:
 
 def is_regression(change: str) -> bool:
     """Whether the change represents a regression (things got worse)."""
-    return change in ("REGRESSED", "UNMASKED")
+    return change in ("REGRESSED", "FAILURE_TYPE_CHANGED")
+
+
+def is_hard_regression(change: str, prev_outcome: str, curr_outcome: str) -> bool:
+    """Whether a previously passing test now has a blocking failing outcome."""
+    _ = change
+    return prev_outcome == "PASS" and curr_outcome in FAILING_OUTCOMES
 
 
 def is_improvement(change: str) -> bool:
@@ -146,6 +152,7 @@ def compute_diff(
             "current_outcome": curr_outcome,
             "change": change,
             "is_regression": is_regression(change),
+            "hard_regression": is_hard_regression(change, prev_outcome, curr_outcome),
             "is_improvement": is_improvement(change),
             "is_new_issue": is_new_issue(change),
             "previous_failure_kind": prev_rec.get("failure_kind", "") if prev_rec else "",
@@ -194,6 +201,7 @@ def _build_diff_summary(
         "failure_type_changed": change_counts.get("FAILURE_TYPE_CHANGED", 0),
         "new_issues": sum(1 for c in changes if c["is_new_issue"]),
         "regressions": sum(1 for c in changes if c["is_regression"]),
+        "hard_regressions": sum(1 for c in changes if c.get("hard_regression")),
         "improvements": sum(1 for c in changes if c["is_improvement"]),
         "previous_all_green": prev_summary.get("all_green", False),
         "current_all_green": curr_summary.get("all_green", False),
@@ -243,6 +251,7 @@ def render_diff_report(diff: dict[str, Any]) -> str:
         f"| ⭐ NEW | {summary['new']} |",
         f"| ✅ RESOLVED | {summary['resolved']} |",
         f"| 🔴 REGRESSED | {summary['regressed']} |",
+        f"| 🚫 HARD REGRESSIONS | {summary.get('hard_regressions', 0)} |",
         f"| ⚠️ UNMASKED | {summary['unmasked']} |",
         f"| 🙈 MASKED | {summary['masked']} |",
         f"| ➡️ UNCHANGED | {summary['unchanged']} |",
@@ -397,8 +406,8 @@ def main() -> int:
     print(f"  New issues: {s['new_issues']} | Net: {s['net_improvement']}")
     print(f"  Output: {output_path}")
 
-    # Return non-zero if there are new issues that need attention
-    return 0 if s["new_issues"] == 0 else 1
+    # Return non-zero only for hard regressions; unmasked issues are re-queued.
+    return 1 if s.get("hard_regressions", 0) else 0
 
 
 if __name__ == "__main__":

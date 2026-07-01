@@ -31,6 +31,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import shophub_goal_runner as runner
 
 
+TEST_ANNOTATION_RE = re.compile(r'@(Test|ParameterizedTest|RepeatedTest|TestFactory|TestTemplate)\b')
+DISABLED_ANNOTATION_RE = re.compile(
+    r'@(Disabled|DisabledIf|DisabledOnOs|DisabledOnJre|EnabledIf|EnabledOnOs|EnabledOnJre)\b'
+)
+
+
 # ---------------------------------------------------------------------------
 # Surefire XML discovery
 # ---------------------------------------------------------------------------
@@ -92,7 +98,7 @@ def parse_surefire_xml(xml_path: Path) -> list[dict[str, Any]]:
 
     for testcase in root_node.findall("testcase"):
         class_name = testcase.get("classname", "")
-        method_name = testcase.get("name", "")
+        method_name = _normalize_method_name(testcase.get("name", ""))
         time_seconds = float(testcase.get("time", 0) or 0)
 
         failure = testcase.find("failure")
@@ -152,6 +158,14 @@ def _infer_suite(xml_path: str) -> str:
     if "generated" in normalized.lower():
         return "generated-spec"
     return "code-unit"
+
+
+def _normalize_method_name(value: str) -> str:
+    """Normalize JUnit5 parameterized display names back to source method names."""
+    value = value.strip()
+    value = re.sub(r"\(.*\)$", "", value)
+    value = re.sub(r"\[[^\]]+\]$", "", value)
+    return value
 
 
 def _classify_failure(exception_type: str, message: str, stack_text: str) -> str:
@@ -261,20 +275,8 @@ def _extract_test_methods(root: Path, test_file: Path, suite: str) -> list[dict[
         return []
     class_name = class_match.group(1)
 
-    # Find @Test methods
+    # Find test methods
     methods: list[dict[str, Any]] = []
-    # Match method declarations in the file, then check if preceded by @Test
-    method_pattern = re.compile(
-        r'(?:@Test\s*(?:\([^)]*\))?\s*\n\s*)?'  # optional @Test annotation
-        r'(?:public|protected|private)?\s*'
-        r'(?:static\s+)?'
-        r'(?:[A-Za-z0-9_<>, ?.\[\]]+)\s+'
-        r'([A-Za-z_][A-Za-z0-9_]*)\s*\([^)]*\)',
-        re.MULTILINE,
-    )
-
-    # Better approach: find @Test then the following method
-    test_annotation = re.compile(r'@Test\s*(?:\([^)]*\))?')
     method_decl = re.compile(
         r'(?:public|protected|private)?\s*(?:static\s+)?'
         r'(?:[A-Za-z0-9_<>, ?.\[\]]+)\s+'
@@ -282,21 +284,27 @@ def _extract_test_methods(root: Path, test_file: Path, suite: str) -> list[dict[
     )
 
     lines = text.splitlines()
+    pending_annotations: list[str] = []
     for i, line in enumerate(lines):
-        if test_annotation.search(line):
-            # Look ahead up to 5 lines for the method declaration
-            for j in range(i + 1, min(i + 6, len(lines))):
-                method_match = method_decl.search(lines[j])
-                if method_match:
-                    method_name = method_match.group(1)
-                    if method_name not in ("class", "interface", "enum"):
-                        methods.append({
-                            "class_name": class_name,
-                            "method_name": method_name,
-                            "source_file": str(test_file),
-                            "suite": suite,
-                        })
-                    break
+        stripped = line.strip()
+        if stripped.startswith("@"):
+            pending_annotations.append(stripped)
+            continue
+        if not pending_annotations:
+            continue
+        annotation_block = "\n".join(pending_annotations)
+        method_match = method_decl.search(line)
+        if method_match and TEST_ANNOTATION_RE.search(annotation_block):
+            method_name = method_match.group(1)
+            if method_name not in ("class", "interface", "enum"):
+                methods.append({
+                    "class_name": class_name,
+                    "method_name": method_name,
+                    "source_file": str(test_file),
+                    "suite": suite,
+                    "is_conditionally_disabled": bool(DISABLED_ANNOTATION_RE.search(annotation_block)),
+                })
+        pending_annotations = []
 
     return methods
 
@@ -348,20 +356,23 @@ def build_test_outcome_matrix(
         for d in discovered:
             key = (d["class_name"], d["method_name"])
             if key not in xml_keys:
+                expected_skipped = bool(d.get("is_conditionally_disabled"))
                 records.append({
                     "suite": d["suite"],
                     "class_name": d["class_name"],
                     "full_class_name": d["class_name"],
                     "method_name": d["method_name"],
-                    "outcome": "NOT_RUN",
+                    "outcome": "EXPECTED_SKIPPED" if expected_skipped else "NOT_RUN",
                     "failure_kind": "",
-                    "message": f"Test method not found in Surefire XML reports",
+                    "message": "Conditionally disabled test method"
+                    if expected_skipped else "Test method not found in Surefire XML reports",
                     "stack_top": "",
                     "time_seconds": 0.0,
                     "source_xml": "",
                     "source_log": log_paths[-1] if log_paths else "",
                     "source_file": d["source_file"],
                     "run_id": run_id,
+                    "is_conditionally_disabled": expected_skipped,
                     "masked_by": _guess_masked_by(records, d["class_name"]),
                 })
 
@@ -394,6 +405,10 @@ def _guess_masked_by(records: list[dict[str, Any]], class_name: str) -> str:
 
 def _annotate_with_context(root: Path, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Annotate records with module and endpoint context (best-effort)."""
+    discovered = {
+        (d.get("class_name"), d.get("method_name")): d
+        for d in discover_test_sources(root, "all")
+    }
     # Load code map for cross-referencing
     code_map_path = root / ".agent-work" / "code_map.jsonl"
     api_contract_path = root / ".agent-work" / "api_contract.json"
@@ -416,6 +431,13 @@ def _annotate_with_context(root: Path, records: list[dict[str, Any]]) -> list[di
                 modules.add(module)
 
     for record in records:
+        source_record = discovered.get((record.get("class_name"), record.get("method_name")))
+        if source_record:
+            record.setdefault("source_file", source_record.get("source_file", ""))
+            record["is_conditionally_disabled"] = bool(source_record.get("is_conditionally_disabled"))
+            if record.get("outcome") == "SKIPPED" and source_record.get("is_conditionally_disabled"):
+                record["outcome"] = "EXPECTED_SKIPPED"
+
         record.setdefault("related_endpoint", "")
         record.setdefault("related_module", "")
         record.setdefault("related_design_rule", "")
@@ -440,9 +462,10 @@ def _build_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
         "failure": outcomes.count("FAILURE"),
         "error": outcomes.count("ERROR"),
         "skipped": outcomes.count("SKIPPED"),
+        "expected_skipped": outcomes.count("EXPECTED_SKIPPED"),
         "timeout": outcomes.count("TIMEOUT"),
         "not_run": outcomes.count("NOT_RUN"),
-        "all_green": all(o == "PASS" for o in outcomes),
+        "all_green": bool(records) and all(o in ("PASS", "EXPECTED_SKIPPED") for o in outcomes),
         "has_failures": "FAILURE" in outcomes,
         "has_errors": "ERROR" in outcomes,
         "has_timeouts": "TIMEOUT" in outcomes,
@@ -475,6 +498,7 @@ def matrix_is_all_green(matrix: dict[str, Any]) -> bool:
         and summary.get("error", 0) == 0
         and summary.get("timeout", 0) == 0
         and summary.get("not_run", 0) == 0
+        and summary.get("has_unexpected_skipped", False) is False
     )
 
 

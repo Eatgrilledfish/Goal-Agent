@@ -208,34 +208,114 @@ def _default_strategy(outcome: str, failure_kind: str) -> str:
     return "Diagnose and repair"
 
 
+def matrix_task_to_legacy_issue(task: dict[str, Any]) -> dict[str, Any]:
+    """Convert a matrix-generated task into the legacy issues.jsonl schema."""
+    ctx = task.get("matrix_context", {})
+    evidence = task.get("evidence", {})
+    class_name = ctx.get("class_name", "")
+    method_name = ctx.get("method_name", "")
+    outcome = ctx.get("outcome", "")
+    failure_kind = ctx.get("failure_kind", "")
+    stack_top = ctx.get("stack_top", "")
+    message = ctx.get("message", "")
+    issue_type = task.get("issue_type", "test_matrix_issue")
+
+    raw_id = task.get("task_id") or f"{class_name}-{method_name}-{outcome}"
+    issue_id = str(raw_id).replace("TASK-", "")
+
+    priority = task.get("priority", "P1")
+    if priority == "P0":
+        severity = "high"
+    elif priority == "P1":
+        severity = "medium"
+    else:
+        severity = "low"
+
+    module = task.get("localization", {}).get("module") or ctx.get("suite", "blackbox-public")
+
+    return {
+        "issue_id": issue_id,
+        "type": issue_type,
+        "severity": severity,
+        "module": module or "unknown",
+        "confidence": 0.60,
+        "estimated_fix_effort": "medium",
+        "status": "open",
+        "design_basis": (
+            "Public black-box test matrix symptom. This is not design evidence by itself; "
+            "patch-agent must localize the related endpoint/controller/service and cite "
+            "design-docs or API baseline before editing."
+        ),
+        "code_location": "code/<to_be_localized>#<to_be_localized>",
+        "design_behavior": task.get(
+            "expected_behavior",
+            f"Test `{class_name}#{method_name}` should pass according to design/API contract.",
+        ),
+        "actual_behavior": task.get(
+            "observed_behavior",
+            f"Test `{class_name}#{method_name}` outcome={outcome}, failure_kind={failure_kind}, "
+            f"message={message}, stack_top={stack_top}",
+        ),
+        "fix_suggestion": task.get(
+            "repair_strategy",
+            "Run the test independently, map it to endpoint/controller/service/repository, "
+            "then fix implementation against design evidence.",
+        ),
+        "api_impact": "unknown; must be checked by API guardian before patch acceptance",
+        "evidence": evidence,
+        "matrix_context": ctx,
+        "source": "test_outcome_matrix",
+        "is_design_evidence": False,
+    }
+
+
+def generate_legacy_issues_from_matrix(
+    root: Path,
+    matrix: dict[str, Any],
+    diff: dict[str, Any] | None = None,
+    prefix: str = "MATRIX",
+) -> list[dict[str, Any]]:
+    tasks = generate_tasks_from_matrix(root, matrix, diff, prefix)
+    return [matrix_task_to_legacy_issue(task) for task in tasks]
+
+
 # ---------------------------------------------------------------------------
 # Merge with existing issue queue
 # ---------------------------------------------------------------------------
 
-def merge_into_queue(root: Path, tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Merge matrix-generated tasks into the existing issue queue, avoiding duplicates.
+def merge_into_queue(root: Path, issues: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Merge matrix-generated legacy issues into the existing issue queue.
 
-    Returns the list of newly-added tasks.
+    Returns the list of newly-added issues.
     """
     paths = runner.RunnerPaths(root)
     existing = runner.read_jsonl(paths.issues)
 
-    existing_test_cases: set[str] = set()
-    for issue in existing:
-        for tc in (issue.get("evidence") or {}).get("test_cases", []):
-            existing_test_cases.add(tc)
+    existing_ids = {issue.get("issue_id") for issue in existing}
+    existing_keys = {
+        (
+            issue.get("matrix_context", {}).get("class_name"),
+            issue.get("matrix_context", {}).get("method_name"),
+            issue.get("type"),
+        )
+        for issue in existing
+    }
 
-    new_tasks: list[dict[str, Any]] = []
-    for task in tasks:
-        task_test_cases = task.get("evidence", {}).get("test_cases", [])
-        is_duplicate = any(tc in existing_test_cases for tc in task_test_cases)
-        if not is_duplicate:
-            runner.append_jsonl_record(paths.issues, task)
-            new_tasks.append(task)
-            for tc in task_test_cases:
-                existing_test_cases.add(tc)
+    new_issues: list[dict[str, Any]] = []
+    for issue in issues:
+        key = (
+            issue.get("matrix_context", {}).get("class_name"),
+            issue.get("matrix_context", {}).get("method_name"),
+            issue.get("type"),
+        )
+        if issue.get("issue_id") in existing_ids or key in existing_keys:
+            continue
+        runner.append_jsonl_record(paths.issues, issue)
+        new_issues.append(issue)
+        existing_ids.add(issue.get("issue_id"))
+        existing_keys.add(key)
 
-    return new_tasks
+    return new_issues
 
 
 # ---------------------------------------------------------------------------
@@ -283,10 +363,10 @@ def main() -> int:
         if diff_path.exists():
             diff = runner.read_json(diff_path, {})
 
-    # Generate tasks
-    tasks = generate_tasks_from_matrix(root, matrix, diff, prefix=args.prefix)
+    # Generate legacy issues for downstream issue queue compatibility.
+    issues = generate_legacy_issues_from_matrix(root, matrix, diff, prefix=args.prefix)
 
-    if not tasks:
+    if not issues:
         print("No repair tasks generated — matrix is all green or has no actionable issues.")
         return 0
 
@@ -295,24 +375,24 @@ def main() -> int:
     runner.write_json(output_path, {
         "generated_at": runner.now_iso(),
         "source_matrix": str(matrix_path),
-        "task_count": len(tasks),
-        "tasks": tasks,
+        "task_count": len(issues),
+        "tasks": issues,
     })
 
     # Merge into issue queue
     new_count = 0
     if args.merge:
-        new_tasks = merge_into_queue(root, tasks)
-        new_count = len(new_tasks)
+        new_issues = merge_into_queue(root, issues)
+        new_count = len(new_issues)
 
     # Summary
     by_type: dict[str, int] = {}
     by_priority: dict[str, int] = {}
-    for t in tasks:
-        by_type[t["issue_type"]] = by_type.get(t["issue_type"], 0) + 1
-        by_priority[t["priority"]] = by_priority.get(t["priority"], 0) + 1
+    for t in issues:
+        by_type[t["type"]] = by_type.get(t["type"], 0) + 1
+        by_priority[t["severity"]] = by_priority.get(t["severity"], 0) + 1
 
-    print(f"Generated {len(tasks)} repair tasks:")
+    print(f"Generated {len(issues)} repair issues:")
     print(f"  By type: {dict(by_type)}")
     print(f"  By priority: {dict(by_priority)}")
     if args.merge:
