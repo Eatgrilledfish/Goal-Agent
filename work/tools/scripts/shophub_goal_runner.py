@@ -2189,6 +2189,35 @@ def run_until_done(
     append_auto_log(paths, "auto-run finished")
 
 
+def _run_unmasking_gate_if_available(
+    root: Path, round_no: int, timeout: int, no_tests: bool
+) -> dict[str, Any] | None:
+    """Run the Unmasking Gate if the script is available.
+
+    Returns the gate report dict, or None if unmasking_gate is unavailable or
+    tests were skipped (no_tests mode).
+    """
+    if no_tests:
+        return None
+    try:
+        from unmasking_gate import run_unmasking_gate
+        paths = RunnerPaths(root)
+        previous_matrix_path = paths.test_matrix / "previous_test_matrix.json"
+        if not previous_matrix_path.exists():
+            return None
+        previous = read_json(previous_matrix_path, {"matrix": [], "run_id": "unknown"})
+        current_diff = run_git_diff(root)
+        return run_unmasking_gate(
+            root,
+            previous_matrix=previous,
+            round_no=round_no,
+            timeout=timeout,
+            current_diff=current_diff,
+        )
+    except ImportError:
+        return None
+
+
 def command_status(root: Path) -> None:
     paths = RunnerPaths(root)
     state = load_state(paths)

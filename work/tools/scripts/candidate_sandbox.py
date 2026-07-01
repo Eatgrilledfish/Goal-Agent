@@ -502,6 +502,16 @@ def validate_candidate(
                 result["score_inputs"]["public_test_pass_rate"] = (
                     passed_count / total_tests if total_tests > 0 else 0.0
                 )
+
+            # --- FSM-DESIGN §11: Hard elimination based on test outcome matrix ---
+            # Check public black-box matrix for FAILURE/ERROR/TIMEOUT/NOT_RUN
+            matrix_blocked, matrix_reasons = _check_sandbox_matrix(sandbox_root, root)
+            if matrix_blocked and not result.get("elimination_reason"):
+                result["elimination_reason"] = (
+                    f"Public black-box matrix has blocking issues: {'; '.join(matrix_reasons)}"
+                )
+                result["errors"].append(result["elimination_reason"])
+                result["public_tests"] = "FAIL"
         else:
             result["public_tests"] = "SKIPPED"
 
@@ -605,6 +615,43 @@ def _load_baseline_p0_count(root: Path) -> int:
         return baseline.get("summary", {}).get("p0_issues", 0)
     except Exception:
         return 0
+
+
+def _check_sandbox_matrix(sandbox_root: Path, project_root: Path) -> tuple[bool, list[str]]:
+    """Check sandbox test matrix for blocking issues (FAILURE/ERROR/TIMEOUT/NOT_RUN).
+
+    Per FSM-DESIGN §11: Public black-box matrix non-all-green → hard elimination.
+
+    Returns (has_blocking_issues, reasons_list).
+    """
+    try:
+        import test_outcome_collector
+    except ImportError:
+        return False, []
+
+    # Collect matrix from sandbox Surefire XML (blackbox only for now)
+    try:
+        matrix = test_outcome_collector.build_test_outcome_matrix(
+            sandbox_root,
+            suite_filter="blackbox-public",
+            discover_sources=True,
+            run_id="sandbox-candidate",
+        )
+    except Exception:
+        return False, []
+
+    summary = matrix.get("summary", {})
+    reasons: list[str] = []
+    if summary.get("failure", 0) > 0:
+        reasons.append(f"{summary['failure']} FAILURE(s)")
+    if summary.get("error", 0) > 0:
+        reasons.append(f"{summary['error']} ERROR(s)")
+    if summary.get("timeout", 0) > 0:
+        reasons.append(f"{summary['timeout']} TIMEOUT(s)")
+    if summary.get("not_run", 0) > 0:
+        reasons.append(f"{summary['not_run']} NOT_RUN")
+
+    return bool(reasons), reasons
 
 
 def validate_all_candidates(root: Path, candidates: list[dict[str, Any]], timeout: int) -> list[dict[str, Any]]:

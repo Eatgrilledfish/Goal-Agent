@@ -339,12 +339,21 @@ def run_full_gate_iteration(root: Path, timeout: int, test_filter: str | None) -
 
 def run_stability(root: Path, runs: int, timeout: int, test_filter: str | None,
                   mode: str = "full-gate") -> dict[str, Any]:
-    """Run stability verification."""
+    """Run stability verification.
+
+    FSM-DESIGN §8: Each run outputs test matrix; multi-run matrices compared to
+    detect intermittent/flaky outcomes at the method level, not just coarse
+    gate PASS/FAIL strings.
+    """
     paths = runner.RunnerPaths(root)
     runner.ensure_work_layout(paths)
 
+    matrix_dir = paths.test_matrix
+    matrix_dir.mkdir(parents=True, exist_ok=True)
+
     gate_results: list[dict[str, Any]] = []
     all_outputs: list[str] = []
+    run_matrices: list[dict[str, Any]] = []
 
     if mode == "public-only":
         # Simple mode: only run public tests
@@ -358,6 +367,11 @@ def run_stability(root: Path, runs: int, timeout: int, test_filter: str | None,
             runner.write_text(log_path, result.get("stdout_snippet", ""))
 
             all_outputs.append(result.get("stdout_snippet", ""))
+
+            # --- NEW: Collect test outcome matrix for this run ---
+            matrix = _collect_stability_matrix(root, run_no=i)
+            run_matrices.append(matrix)
+
             gate_results.append({
                 "run": i,
                 "public_tests": "PASS" if result["passed"] else "FAIL",
@@ -369,12 +383,26 @@ def run_stability(root: Path, runs: int, timeout: int, test_filter: str | None,
             gate["run"] = i
             gate_results.append(gate)
 
+            # --- NEW: Collect test outcome matrix for this run ---
+            matrix = _collect_stability_matrix(root, run_no=i)
+            run_matrices.append(matrix)
+
     # Analyze
     all_passed = all("FAIL" not in [v for k, v in g.items() if k != "run"] for g in gate_results)
     has_intermittent = detect_intermittent_gate_failures(gate_results)
     flaky_findings = analyze_flaky_patterns(all_outputs)
 
+    # --- NEW: Matrix-based flaky detection ---
+    matrix_flaky = _detect_flaky_from_matrices(run_matrices)
+    if matrix_flaky:
+        flaky_findings.extend(matrix_flaky)
+        has_intermittent = has_intermittent or bool(matrix_flaky)
+
     is_stable = all_passed and not has_intermittent and len(gate_results) == runs
+
+    # --- NEW: Persist stability matrices ---
+    if run_matrices:
+        _persist_stability_matrices(matrix_dir, run_matrices, run_matrices[0] if run_matrices else {})
 
     report: dict[str, Any] = {
         "generated_at": runner.now_iso(),
@@ -385,6 +413,7 @@ def run_stability(root: Path, runs: int, timeout: int, test_filter: str | None,
         "has_intermittent_failures": has_intermittent,
         "mode": mode,
         "flaky_findings": flaky_findings,
+        "matrix_flaky_count": len(matrix_flaky) if matrix_flaky else 0,
         "gate_results": gate_results,
     }
 
@@ -453,6 +482,77 @@ def detect_intermittent_gate_failures(gate_results: list[dict[str, Any]]) -> boo
         if "PASS" in results and "FAIL" in results:
             return True
     return False
+
+
+# ---------------------------------------------------------------------------
+# Matrix-based stability helpers (FSM-DESIGN §8)
+# ---------------------------------------------------------------------------
+
+def _collect_stability_matrix(root: Path, run_no: int) -> dict[str, Any]:
+    """Collect test outcome matrix for a single stability run."""
+    try:
+        import test_outcome_collector
+        return test_outcome_collector.build_test_outcome_matrix(
+            root,
+            suite_filter="blackbox-public",
+            discover_sources=True,
+            run_id=f"stability-run-{run_no:02d}",
+        )
+    except ImportError:
+        return {"matrix": [], "summary": {}, "run_id": f"stability-run-{run_no:02d}"}
+
+
+def _detect_flaky_from_matrices(run_matrices: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Detect method-level flaky outcomes across multiple matrix runs.
+
+    A test is flaky if its outcome changes across runs without being a clear
+    regression (e.g., PASS→FAIL→PASS or FAILURE→ERROR→FAILURE).
+    """
+    if len(run_matrices) < 2:
+        return []
+
+    history: dict[tuple[str, str], list[str]] = {}
+    for matrix in run_matrices:
+        run_id = matrix.get("run_id", "?")
+        for record in matrix.get("matrix", []):
+            key = (record.get("class_name", ""), record.get("method_name", ""))
+            if key not in history:
+                history[key] = []
+            history[key].append(record.get("outcome", "?"))
+
+    flaky: list[dict[str, Any]] = []
+    for key, outcomes in history.items():
+        unique = set(outcomes)
+        if len(unique) > 1 and "NOT_RUN" not in unique:
+            has_pass = "PASS" in unique
+            has_fail = bool({"FAILURE", "ERROR", "TIMEOUT"} & unique)
+            if has_pass and has_fail:
+                flaky.append({
+                    "pattern": "Method-level outcome fluctuation",
+                    "class_name": key[0],
+                    "method_name": key[1],
+                    "outcomes": outcomes,
+                    "unique_outcomes": sorted(unique),
+                    "runs": len(outcomes),
+                    "sample_matches": [f"{key[0]}#{key[1]}: {' → '.join(outcomes)}"],
+                    "match_count": 1,
+                    "sample": f"{key[0]}#{key[1]}: {' → '.join(outcomes)}",
+                })
+    return flaky
+
+
+def _persist_stability_matrices(
+    matrix_dir: Path,
+    run_matrices: list[dict[str, Any]],
+    baseline_matrix: dict[str, Any],
+) -> None:
+    """Persist stability-related matrix files for audit trail."""
+    for i, matrix in enumerate(run_matrices):
+        runner.write_json(
+            matrix_dir / f"stability_run_{i + 1:02d}_matrix.json", matrix
+        )
+    if run_matrices:
+        runner.write_json(matrix_dir / "stability_final_matrix.json", run_matrices[-1])
 
 
 def main() -> int:

@@ -261,7 +261,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
-    args = parser.parse_args()
+    args = build_parser().parse_args()
     root = Path(args.root).resolve()
     paths = runner.RunnerPaths(root)
     matrix_dir = paths.work / "test_matrix"
