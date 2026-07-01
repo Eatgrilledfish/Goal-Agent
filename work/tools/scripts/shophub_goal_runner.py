@@ -174,6 +174,10 @@ class RunnerPaths:
     def specs(self) -> Path:
         return self.work / "spec_rules.jsonl"
 
+    @property
+    def test_matrix(self) -> Path:
+        return self.work / "test_matrix"
+
 
 def find_maven_settings(root: Path) -> Path | None:
     env_value = os.environ.get("SHOPHUB_MAVEN_SETTINGS") or os.environ.get("MAVEN_SETTINGS")
@@ -1156,8 +1160,28 @@ def run_baseline_tests(root: Path, timeout: int = 900, no_tests: bool = False, t
         state_value = "partial_skipped"
     else:
         state_value = "passed"
+
+    # --- NEW: Collect test outcome matrix from Surefire XML ---
+    baseline_matrix: dict[str, Any] = {"matrix": [], "summary": {}}
+    try:
+        from test_outcome_collector import build_test_outcome_matrix, save_matrix
+        matrix_dir = paths.test_matrix
+        matrix_dir.mkdir(parents=True, exist_ok=True)
+        baseline_matrix = build_test_outcome_matrix(
+            root,
+            suite_filter="all",
+            discover_sources=True,
+            run_id="baseline",
+            log_paths=[str(paths.test_results / r["log"]) for r in results if r.get("log")],
+        )
+        save_matrix(baseline_matrix, matrix_dir / "baseline_test_matrix.json")
+        save_matrix(baseline_matrix, matrix_dir / "current_test_matrix.json")
+        save_matrix(baseline_matrix, matrix_dir / "previous_test_matrix.json")
+    except ImportError:
+        pass  # test_outcome_collector not available
+
     save_state(paths, phase="RUN_BASELINE_TESTS", last_full_test=state_value)
-    return {"results": results, "summary": summary}
+    return {"results": results, "summary": summary, "baseline_matrix": baseline_matrix}
 
 
 def run_verification_tests(root: Path, label: str, timeout: int = 900, no_tests: bool = False, test_filter: str | None = None) -> dict[str, Any]:
@@ -1212,8 +1236,26 @@ def run_verification_tests(root: Path, label: str, timeout: int = 900, no_tests:
     else:
         status = "passed"
     summarize_test_logs(root)
+
+    # --- NEW: Collect current test matrix from Surefire XML ---
+    current_matrix: dict[str, Any] = {"matrix": [], "summary": {}}
+    try:
+        from test_outcome_collector import build_test_outcome_matrix, save_matrix
+        matrix_dir = paths.test_matrix
+        matrix_dir.mkdir(parents=True, exist_ok=True)
+        current_matrix = build_test_outcome_matrix(
+            root,
+            suite_filter="blackbox-public",
+            discover_sources=True,
+            run_id=label,
+            log_paths=[str(paths.test_results / r["log"]) for r in results if r.get("log")],
+        )
+        save_matrix(current_matrix, matrix_dir / "current_test_matrix.json")
+    except ImportError:
+        pass
+
     save_state(paths, phase="RUN_FULL_TESTS", last_full_test=status)
-    return {"status": status, "results": results}
+    return {"status": status, "results": results, "current_matrix": current_matrix}
 
 
 def summarize_test_logs(root: Path) -> dict[str, Any]:
@@ -1831,6 +1873,18 @@ def done_decision(root: Path, no_tests: bool = False) -> tuple[bool, str | None]
     open issue also does not auto-stop: it returns to the orchestrator so
     auditors can be fanned out again (the queue may be empty because auditors
     have not yet covered the failing behavior).
+
+    **FSM-DESIGN §12**: DONE now requires:
+      1. code tests passed
+      2. code install passed
+      3. public black-box suite passed
+      4. Test outcome matrix ALL-GREEN (no FAILURE/ERROR/TIMEOUT/unexpected SKIPPED/NOT_RUN)
+      5. Unmasking Gate passed (checked in run_until_done)
+      6. Stability Gate passed
+      7. Contract Gate passed (api_contract_safe)
+      8. Forbidden Guard passed
+      9. Issue Queue converged (no open P0/P1)
+      10. Report completed
     """
     paths = RunnerPaths(root)
     state = load_state(paths)
@@ -1850,9 +1904,81 @@ def done_decision(root: Path, no_tests: bool = False) -> tuple[bool, str | None]
         return True, "consecutive_no_progress"
     if int(state.get("consecutive_regressions", 0)) >= 2:
         return True, "consecutive_regressions"
-    if high_medium_open == 0 and last_full_test == "passed":
-        return True, "completed_high_medium_and_tests_passed"
+
+    # --- NEW: Check test outcome matrix for all-green ---
+    matrix_all_green = _check_matrix_all_green(root)
+    if last_full_test == "passed" and not matrix_all_green:
+        # Maven returned 0 but matrix shows issues — don't stop
+        pass
+    if not matrix_all_green:
+        # Matrix is not all-green — more work needed
+        if high_medium_open == 0:
+            return False, "matrix_not_all_green_no_open_issues"
+        return False, None
+
+    if high_medium_open == 0 and last_full_test == "passed" and matrix_all_green:
+        return True, "completed_all_gates_passed"
     return False, None
+
+
+def _check_matrix_all_green(root: Path) -> bool:
+    """Check whether the current test outcome matrix is all-green.
+
+    Returns True if:
+      - current_test_matrix.json exists AND shows all-green
+      - OR no matrix exists yet (pre-matrix era, fall back to last_full_test)
+    """
+    paths = RunnerPaths(root)
+    current_matrix_path = paths.test_matrix / "current_test_matrix.json"
+    if not current_matrix_path.exists():
+        # No matrix yet — fall back to legacy behavior
+        return load_state(paths).get("last_full_test") == "passed"
+
+    try:
+        matrix = read_json(current_matrix_path, {})
+        summary = matrix.get("summary", {})
+        return (
+            summary.get("all_green", False)
+            and summary.get("failure", 0) == 0
+            and summary.get("error", 0) == 0
+            and summary.get("timeout", 0) == 0
+            and summary.get("not_run", 0) == 0
+        )
+    except Exception:
+        return False
+
+
+def _load_current_matrix(root: Path) -> dict[str, Any]:
+    """Load the current test outcome matrix, or an empty default."""
+    paths = RunnerPaths(root)
+    current_matrix_path = paths.test_matrix / "current_test_matrix.json"
+    if not current_matrix_path.exists():
+        return {"matrix": [], "summary": {}}
+    return read_json(current_matrix_path, {"matrix": [], "summary": {}})
+
+
+def _matrix_has_blocking_issues(root: Path) -> tuple[bool, list[str]]:
+    """Check if the current matrix has blocking issues."""
+    paths = RunnerPaths(root)
+    current_matrix_path = paths.test_matrix / "current_test_matrix.json"
+    if not current_matrix_path.exists():
+        return False, []
+
+    try:
+        matrix = read_json(current_matrix_path, {})
+        summary = matrix.get("summary", {})
+        reasons: list[str] = []
+        if summary.get("failure", 0) > 0:
+            reasons.append(f"{summary['failure']} FAILURE(s)")
+        if summary.get("error", 0) > 0:
+            reasons.append(f"{summary['error']} ERROR(s)")
+        if summary.get("timeout", 0) > 0:
+            reasons.append(f"{summary['timeout']} TIMEOUT(s)")
+        if summary.get("not_run", 0) > 0:
+            reasons.append(f"{summary['not_run']} NOT_RUN")
+        return bool(reasons), reasons
+    except Exception:
+        return False, []
 
 
 def format_patch_command(command_template: str, root: Path, round_no: int, round_path: Path, issue: dict[str, Any]) -> str:
@@ -2019,7 +2145,37 @@ def run_until_done(
         verification = run_verification_tests(root, f"round-{round_no:03d}", timeout=timeout, no_tests=no_tests)
         tests_summary = verification_command_summary(verification)
         if verification["status"] in {"passed", "skipped"}:
-            finish_round(root, round_no, "PASS", tests=tests_summary, risk="Full tests skipped." if no_tests else "None recorded.")
+            # --- FSM-DESIGN §9: Unmasking Gate after patch acceptance ---
+            unmask_result = _run_unmasking_gate_if_available(root, round_no, timeout, no_tests)
+            if unmask_result and unmask_result.get("verdict") == "REJECT_AND_REVERT":
+                save_state(paths, consecutive_regressions=int(state.get("consecutive_regressions", 0)) + 1)
+                finish_round(
+                    root, round_no,
+                    "REJECT_AND_REVERT",
+                    tests=f"{tests_summary}; Unmasking Gate: REJECT_AND_REVERT — {unmask_result.get('verdict_reason', '')}",
+                    risk="Patch unmasked regressions. Manual rollback or repair required.",
+                )
+                reason = "unmasking_gate_reject_and_revert"
+                append_auto_log(paths, f"stopping: {reason}")
+                save_state(paths, should_continue=False, stop_reason=reason, auto_run_finished_at=now_iso())
+                break
+            if unmask_result and unmask_result.get("verdict") == "REQUEUE":
+                # Patch is kept but new tasks are queued
+                new_tasks = unmask_result.get("new_tasks", [])
+                for task in new_tasks:
+                    append_jsonl_record(paths.issues, task)
+                append_auto_log(
+                    paths,
+                    f"round {round_no:03d}: Unmasking Gate found {len(new_tasks)} new issue(s) — re-queued",
+                )
+                finish_round(
+                    root, round_no,
+                    "PASS",
+                    tests=f"{tests_summary}; Unmasking Gate: REQUEUE — {len(new_tasks)} new tasks queued",
+                    risk=f"Unmasked {unmask_result.get('new_issue_count', 0)} hidden failure(s); will need further rounds.",
+                )
+            else:
+                finish_round(root, round_no, "PASS", tests=tests_summary, risk="Full tests skipped." if no_tests else "None recorded.")
         else:
             state = load_state(paths)
             save_state(paths, consecutive_regressions=int(state.get("consecutive_regressions", 0)) + 1)
