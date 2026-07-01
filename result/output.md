@@ -5,11 +5,27 @@
 - 入口文件：`/INSTRUCTION.md`
 - 可运行交付件目录：`/work`
 - 主 Skill：`/work/skill/SKILL.md`
-- Subagents：`/work/skills/shophub-*.md`
-- Helper scripts：`/work/tools/scripts/*.py`
+- 规格驱动 Subagents：`/work/skills/contract-builder.md`, `code-analyzer.md`, `consistency-checker.md`, `patch-generator.md`, `stability-verifier.md`
+- 原有 Subagents：`/work/skills/shophub-*.md`（10个，保留）
+- Helper scripts：`/work/tools/scripts/*.py`（14个脚本：5个原有 + 9个新增）
 - Agent 根目录：`/work`
 
-当前交付不需要安装插件，不需要安装额外命令入口，也不需要把运行资产复制到题目仓库。平台加载 `/INSTRUCTION.md` 后，直接读取 `/work` 内资产并作用于目标 `HW-ICT-CMP-04` 题目仓库。
+当前交付不需要安装插件，不需要安装额外命令入口，也不需要把运行资产复制到题目仓库。平台加载 `/INSTRUCTION.md` 后，直接读取 `/work` 内资产并作用于目标题目仓库。
+
+## 规格驱动 Pipeline 架构（DESIGN.md 适配）
+
+```text
+Phase 0: Preflight
+Phase 1: Build Contracts (API + Business Rules)
+Phase 2: Scan Code (Controller/DTO/Service/Repository/Entity/Exception)
+Phase 3: Build Trace Matrix + Static Consistency Check
+Phase 4: Generate Spec-Driven Tests
+Phase 5: Baseline Test Run
+Phase 6: Localize & Prioritize Repair Tasks
+Phase 7: Fix Loop (per task: 3-5 candidates → sandbox → score → apply best)
+Phase 8: Stability Gate (3x rerun + contract re-check + forbidden-change guard)
+Phase 9: Report & Deliver
+```
 
 ## 本地结构自检
 
@@ -23,58 +39,53 @@
 /logs/trace
 ```
 
-可选路径：
+规格驱动新增文件：
 
 ```text
-/work/skill/SKILL.md
-/work/skills/shophub-api-guardian.md
-/work/skills/shophub-code-mapper.md
-/work/skills/shophub-module-auditor.md
-/work/skills/shophub-orchestrator.md
-/work/skills/shophub-patch-agent.md
-/work/skills/shophub-report-writer.md
-/work/skills/shophub-review-agent.md
-/work/skills/shophub-spec-librarian.md
-/work/skills/shophub-test-diagnoser.md
+/work/skills/contract-builder.md       ← API Contract + Business Rule 抽取
+/work/skills/code-analyzer.md           ← Spring Boot 代码扫描
+/work/skills/consistency-checker.md     ← 静态一致性检查 + Trace Matrix
+/work/skills/patch-generator.md         ← 多候选补丁生成
+/work/skills/stability-verifier.md      ← 验证 + guard + 稳定性
+
+/work/tools/scripts/api_contract_builder.py
+/work/tools/scripts/business_rule_builder.py
+/work/tools/scripts/spring_scanner.py
+/work/tools/scripts/dto_analyzer.py
+/work/tools/scripts/exception_analyzer.py
+/work/tools/scripts/contract_checker.py
+/work/tools/scripts/spec_test_generator.py
+/work/tools/scripts/forbidden_change_guard.py
+/work/tools/scripts/stability_runner.py
 ```
-
-已执行轻量验证：
-
-```text
-python3 -m py_compile work/tools/scripts/*.py
-YAML frontmatter ok for work/skills/*.md and work/skill/SKILL.md
-strict submission structure ok
-```
-
-## 真实公开用例验证记录
-
-已在真实题库克隆 `/tmp/HW-ICT-CMP-04` 中按设计文档修复公开用例暴露的问题，并通过公开用例验证。
-
-比赛黑箱环境应使用本机 Maven。若题库根目录存在 `maven-settings.xml`，必须使用内网镜像配置：
-
-```text
-mvn -s maven-settings.xml -f code/pom.xml test
-mvn -s maven-settings.xml -f code/pom.xml install -DskipTests
-mvn -s maven-settings.xml -f test-cases/pom.xml test
-```
-
-结果：
-
-```text
-code/pom.xml test: BUILD SUCCESS
-code/pom.xml install -DskipTests: BUILD SUCCESS
-test-cases/pom.xml test: 24 tests, 0 failures, 0 errors, BUILD SUCCESS
-```
-
-本次实测暴露出的设计不一致已同步进 `/work/skill/SKILL.md` 与 `/work/skills/*.md` 的公开基线诊断清单。
 
 ## 运行成功后的预期输出
 
-在真实 ShopHub 比赛仓库中按 `/INSTRUCTION.md` 执行后，应生成：
+在目标题目仓库中按 `/INSTRUCTION.md` 执行后，应生成：
 
 ```text
 .agent-work/
-修复报告.md
+├── api_contract.json              ← Phase 1: 冻结 API 契约
+├── business_rules.json            ← Phase 1: 业务规则
+├── repo_map.json                  ← Phase 2: 代码结构地图
+├── dto_validation_report.json     ← Phase 2: DTO 校验覆盖
+├── exception_coverage.json        ← Phase 2: 异常处理覆盖
+├── trace_matrix.json              ← Phase 3: 需求→代码追踪
+├── consistency_report.json        ← Phase 3: 一致性检查报告
+├── repair_tasks.json              ← Phase 6: 修复任务
+├── candidate_patches.jsonl        ← Phase 7: 候选补丁记录
+├── forbidden_change_report.json   ← Phase 8: 禁止修改检查
+├── stability_report.json          ← Phase 8: 稳定性报告
+└── validation_results.jsonl       ← Phase 7-8: 验证结果
+
+.tmp/generated-tests/              ← Phase 4: 生成测试（不提交）
+修复报告.md                         ← Phase 9: 最终修复报告
 ```
 
-最终输出应报告 DONE、BLOCKED 或 STOPPED_BY_SAFETY，并列出 issue 统计、API 契约状态、验证命令及结果。
+最终输出应报告 `DONE`、`BLOCKED` 或 `STOPPED_BY_SAFETY`，并列出：
+- Issue 发现/修复/剩余数量
+- API 契约状态
+- Forbidden-change guard 状态
+- Stability rerun 状态
+- 验证命令及结果
+- 剩余风险
