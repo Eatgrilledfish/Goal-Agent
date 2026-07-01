@@ -341,6 +341,7 @@ def validate_candidate(
         "strategy": candidate.get("strategy", ""),
         "compile": "SKIPPED",
         "code_tests": "SKIPPED",
+        "code_install": "SKIPPED",
         "public_tests": "SKIPPED",
         "generated_tests": "SKIPPED",
         "contract_check": "SKIPPED",
@@ -474,7 +475,10 @@ def validate_candidate(
         if not code_pom.exists():
             result["compile"] = "SKIPPED"
             result["code_tests"] = "SKIPPED"
-            result["errors"].append("code/pom.xml not found in sandbox — compile skipped")
+            result["code_install"] = "SKIPPED"
+            result["elimination_reason"] = "code/pom.xml not found in sandbox — cannot validate candidate"
+            result["errors"].append(result["elimination_reason"])
+            return result
         else:
             # Compile in sandbox
             compile_cmd = runner.maven_command(sandbox_root, ["-f", "code/pom.xml", "compile", "-q"])
@@ -491,12 +495,23 @@ def validate_candidate(
             test_cmd = runner.maven_command(sandbox_root, ["-f", "code/pom.xml", "test"])
             test_result = run_step(test_cmd, sandbox_root, timeout)
             result["code_tests"] = "PASS" if test_result["passed"] else "FAIL"
+            if not test_result["passed"]:
+                result["elimination_reason"] = "Code module tests failed after patch"
+                result["errors"].append(
+                    f"Code module tests failed: {test_result.get('output_snippet', '')[:500]}"
+                )
+                return result
 
             # Code install
             install_cmd = runner.maven_command(sandbox_root, ["-f", "code/pom.xml", "install", "-DskipTests"])
             install_result = run_step(install_cmd, sandbox_root, timeout)
+            result["code_install"] = "PASS" if install_result["passed"] else "FAIL"
             if not install_result["passed"]:
-                result["errors"].append("code install failed — public tests will be skipped")
+                result["elimination_reason"] = "Code install failed after patch"
+                result["errors"].append(
+                    f"Code install failed: {install_result.get('output_snippet', '')[:500]}"
+                )
+                return result
 
         # --- Step 4: Public black-box tests ---
         public_pom = sandbox_root / "test-cases" / "pom.xml"
@@ -571,16 +586,26 @@ def validate_candidate(
                         )
                         result["errors"].append(result["elimination_reason"])
                         result["score_inputs"]["contract_checker_pass"] = 0.0
+                        return result
                     else:
-                        result["contract_check"] = "PASS"
+                        result["contract_check"] = "PASS_WITH_EXISTING_ISSUES"
+                        result["warnings"].append(
+                            f"Contract checker returned non-zero but no new P0 issues "
+                            f"(candidate={candidate_p0}, baseline={baseline_p0})"
+                        )
                         result["score_inputs"]["contract_checker_pass"] = 0.5
-                except (json.JSONDecodeError, KeyError):
+                except (json.JSONDecodeError, KeyError, TypeError, AttributeError):
                     result["contract_check"] = "FAIL"
+                    result["elimination_reason"] = "Contract checker failed and output was not parseable"
+                    result["errors"].append(result["elimination_reason"])
                     result["score_inputs"]["contract_checker_pass"] = 0.0
+                    return result
         except (OSError, subprocess.SubprocessError) as exc:
             result["contract_check"] = "ERROR"
-            result["errors"].append(f"Contract checker failed in sandbox: {exc}")
-            result["score_inputs"]["contract_checker_pass"] = 0.5
+            result["elimination_reason"] = f"Contract checker execution failed in sandbox: {exc}"
+            result["errors"].append(result["elimination_reason"])
+            result["score_inputs"]["contract_checker_pass"] = 0.0
+            return result
 
         # --- Step 7: Forbidden change guard in sandbox ---
         try:
@@ -602,7 +627,8 @@ def validate_candidate(
                 result["errors"].append(result["elimination_reason"])
         except (OSError, subprocess.SubprocessError) as exc:
             result["forbidden_guard"] = "ERROR"
-            result["errors"].append(f"Forbidden guard failed in sandbox: {exc}")
+            result["elimination_reason"] = f"Forbidden guard execution failed in sandbox: {exc}"
+            result["errors"].append(result["elimination_reason"])
 
         # --- Determine eligibility ---
         if not result["elimination_reason"]:
@@ -810,8 +836,13 @@ def validate(
         for r in eligible:
             lines.append(
                 f"- **{r['candidate_id']}** ({r.get('strategy', '')}): "
-                f"compile={r['compile']} code_tests={r['code_tests']} "
-                f"public={r['public_tests']} contract={r['contract_check']}"
+                f"compile={r['compile']} "
+                f"code_tests={r['code_tests']} "
+                f"code_install={r.get('code_install', 'N/A')} "
+                f"public={r['public_tests']} "
+                f"matrix_gate={r.get('matrix_gate', 'N/A')} "
+                f"contract={r['contract_check']} "
+                f"guard={r['forbidden_guard']}"
             )
         lines.append("")
     eliminated = [r for r in results if not r.get("eligible")]
@@ -819,7 +850,16 @@ def validate(
         lines.append("## Eliminated Candidates")
         lines.append("")
         for r in eliminated:
-            lines.append(f"- **{r['candidate_id']}**: {r.get('elimination_reason', 'Unknown')}")
+            lines.append(
+                f"- **{r['candidate_id']}**: {r.get('elimination_reason', 'Unknown')} "
+                f"(compile={r['compile']} "
+                f"code_tests={r['code_tests']} "
+                f"code_install={r.get('code_install', 'N/A')} "
+                f"public={r['public_tests']} "
+                f"matrix_gate={r.get('matrix_gate', 'N/A')} "
+                f"contract={r['contract_check']} "
+                f"guard={r['forbidden_guard']})"
+            )
         lines.append("")
 
     runner.write_text(paths.work / "candidate_validation.md", "\n".join(lines).rstrip() + "\n")
