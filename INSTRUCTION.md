@@ -1,6 +1,6 @@
 # ShopHub Goal Runner 入口说明
 
-本文件是比赛作品入口。评分平台加载本 Markdown 后，请按这里定位目标仓库、加载 `work/` 运行资产，并在目标 `HW-ICT-CMP-04` 仓库中完成修复与验证。
+本文件是比赛作品入口。评分平台加载本 Markdown 后，请按这里定位目标仓库、加载 `work/` 运行资产，并在符合题目结构的目标仓库中完成修复与验证。目标仓库名称不固定，不应依赖仓库目录名。
 
 不需要安装插件，不需要复制文件到目标仓库，也不需要额外命令入口。
 
@@ -31,11 +31,11 @@ ${SUBMISSION_ROOT}/work
 进入 `PROJECT_ROOT` 执行实际修复。运行前读取以下资产：
 
 ```text
-${WORK_ROOT}/AGENTS.md
 ${WORK_ROOT}/skill/SKILL.md
 ${WORK_ROOT}/skills/shophub-orchestrator.md
 ${WORK_ROOT}/skills/*.md
 ${WORK_ROOT}/tools/scripts/*.py
+${WORK_ROOT}/tools/config/*.json
 ```
 
 优先调用 `shophub-orchestrator` 作为总控 agent。若当前运行环境不支持 subagent/Task 调用，则由主 agent 读取 `work/skill/SKILL.md` 和 `work/skills/*.md`，按其中职责顺序执行。

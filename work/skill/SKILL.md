@@ -7,6 +7,37 @@ description: Spec-driven design-implementation consistency repair. Builds API co
 
 This SKILL defines the main spec-driven pipeline for design-implementation consistency checking and automatic repair. It orchestrates subagents and deterministic Python scripts from the submitted `/work` directory.
 
+## Runtime Work Rules
+
+Treat the submitted `work/` directory as the delivery root.
+
+All runnable assets are under:
+
+```text
+skill/SKILL.md
+skills/*.md
+tools/scripts/*.py
+tools/config/*.json
+```
+
+Do not depend on files outside `work/` at runtime. Do not install a plugin or copy delivery assets into the target repository. The platform loads `/INSTRUCTION.md`; the running agent should read this Skill, then load subagent definitions from `work/skills/*.md`, and execute against the target repository in place.
+
+The target competition repository layout is:
+
+```text
+README.md
+code/
+design-docs/
+test-cases/
+```
+
+The frozen API baseline is identified semantically from:
+
+- `README.md` (its API baseline / frozen-contract section, not a hard-coded section number).
+- The design-doc file(s) that carry the REST API reference (semantically identified, not a hard-coded filename).
+
+Use the target repository files listed above as the complete required competition inputs.
+
 ## Pipeline Overview
 
 ```text

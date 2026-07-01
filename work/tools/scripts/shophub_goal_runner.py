@@ -60,9 +60,9 @@ PHASES = [
 ]
 SEVERITY_WEIGHT = {"high": 3.0, "medium": 2.0, "low": 1.0}
 COMPLEXITY_WEIGHT = {"small": 1.0, "medium": 2.0, "large": 4.0}
-# Submission-internal config location (work/config/), independent of PROJECT_ROOT.
+# Submission-internal config location (work/tools/config/), independent of PROJECT_ROOT.
 WORK_ROOT = Path(__file__).resolve().parent.parent.parent
-AUDIT_PRIORITIES_PATH = WORK_ROOT / "config" / "audit_priorities.json"
+AUDIT_PRIORITIES_PATH = WORK_ROOT / "tools" / "config" / "audit_priorities.json"
 # Generic engineering priority (non-business): issue types more likely to affect hidden tests.
 DEFAULT_PRIORITY_TYPES = ("api_drift", "business_rule_mismatch", "state_machine_error", "money_calc_error")
 
@@ -1499,7 +1499,7 @@ def mark_issue_status(root: Path, issue_id: str, status: str) -> bool:
 
 
 def load_audit_priorities() -> dict[str, Any]:
-    """Load submission-internal audit priorities (work/config/audit_priorities.json)."""
+    """Load submission-internal audit priorities (work/tools/config/audit_priorities.json)."""
     return read_json(AUDIT_PRIORITIES_PATH, {}) or {}
 
 

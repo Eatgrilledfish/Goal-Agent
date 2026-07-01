@@ -8,6 +8,7 @@
 - 规格驱动 Subagents：`/work/skills/contract-builder.md`, `code-analyzer.md`, `consistency-checker.md`, `patch-generator.md`, `stability-verifier.md`
 - ShopHub Subagents：`/work/skills/shophub-*.md`
 - Helper scripts：`/work/tools/scripts/*.py`
+- Runtime config：`/work/tools/config/*.json`
 - Agent 根目录：`/work`
 
 当前交付不需要安装插件，不需要安装额外命令入口，也不需要把运行资产复制到题目仓库。平台加载 `/INSTRUCTION.md` 后，直接读取 `/work` 内资产并作用于目标题目仓库。
@@ -57,6 +58,7 @@ Phase 9: Report & Deliver
 /work/tools/scripts/spec_test_generator.py
 /work/tools/scripts/forbidden_change_guard.py
 /work/tools/scripts/stability_runner.py
+/work/tools/config/audit_priorities.json
 ```
 
 ## 运行成功后的预期输出
