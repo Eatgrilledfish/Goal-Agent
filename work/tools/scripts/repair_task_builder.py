@@ -147,7 +147,7 @@ def tasks_from_consistency_report(consistency: dict[str, Any]) -> list[dict[str,
     return tasks
 
 
-def tasks_from_dto_validation(report: dict[str, Any]) -> list[dict[str, Any]]:
+def tasks_from_dto_validation(root: Path, report: dict[str, Any]) -> list[dict[str, Any]]:
     """Convert DTO validation gaps into repair tasks."""
     tasks: list[dict[str, Any]] = []
     for gap in report.get("gap_details", []):
@@ -160,6 +160,15 @@ def tasks_from_dto_validation(report: dict[str, Any]) -> list[dict[str, Any]]:
             dto = gap.get("dto", "")
             expected = gap.get("expected", "")
 
+            # Try to get real file path: gap.file > find by DTO name > placeholder
+            file_path = gap.get("file", "")
+            if not file_path and dto:
+                file_path = find_dto_file(root, dto)
+            if not file_path and dto:
+                file_path = f"code/.../{dto}.java"  # last-resort placeholder
+
+            suspected = [file_path] if file_path else []
+
             task: dict[str, Any] = {
                 "type": task_type,
                 "priority": priority,
@@ -169,7 +178,7 @@ def tasks_from_dto_validation(report: dict[str, Any]) -> list[dict[str, Any]]:
                 "related_field": field,
                 "related_dto": dto,
                 "symptom": f"{field} field lacks validation — expected {expected}, gap: {gap_type}",
-                "suspected_files": [f"code/.../{dto}.java"],
+                "suspected_files": suspected,
                 "expected_fix": (
                     f"Add validation annotation to {field} in {dto} "
                     f"({desired_annotation(gap_type, field)})"
@@ -181,6 +190,22 @@ def tasks_from_dto_validation(report: dict[str, Any]) -> list[dict[str, Any]]:
             }
             tasks.append(task)
     return tasks
+
+
+def find_dto_file(root: Path, dto_name: str) -> str:
+    """Find the real file path for a DTO class.
+
+    Returns the relative path from root, or empty string if not found.
+    """
+    if not dto_name:
+        return ""
+    code_dir = root / "code"
+    if not code_dir.exists():
+        return ""
+    matches = list(code_dir.rglob(f"{dto_name}.java"))
+    if matches:
+        return runner.rel(root, matches[0])
+    return ""
 
 
 def desired_annotation(gap_type: str, field_name: str) -> str:
@@ -302,7 +327,7 @@ def build_repair_tasks(root: Path) -> dict[str, Any]:
 
     # Gather from each source
     all_tasks.extend(tasks_from_consistency_report(consistency))
-    all_tasks.extend(tasks_from_dto_validation(dto_report))
+    all_tasks.extend(tasks_from_dto_validation(root, dto_report))
     all_tasks.extend(tasks_from_exception_coverage(exception_coverage))
     all_tasks.extend(tasks_from_test_symptoms(paths.work / "test_symptoms.jsonl"))
 

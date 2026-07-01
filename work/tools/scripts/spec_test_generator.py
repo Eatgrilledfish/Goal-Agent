@@ -40,10 +40,16 @@ def generate_test_class_name(endpoint: dict[str, Any]) -> str:
     return f"{method}{path.capitalize()}ContractTest"
 
 
-def status_assertion(status_codes: list[int]) -> str:
-    """Generate status assertion from contract success_status."""
+def status_expect_line(status_codes: list[int]) -> str:
+    """Generate complete .andExpect(status().{...}) line from contract success_status.
+
+    For single status codes, uses MockMvc shorthand (isOk, isCreated, etc.).
+    For multiple allowed success codes, generates a lambda-based assertion
+    that checks any of the allowed codes.
+    """
     if not status_codes:
-        return "isOk()"
+        return ".andExpect(status().isOk())"
+
     if len(status_codes) == 1:
         code = status_codes[0]
         status_map = {
@@ -51,15 +57,19 @@ def status_assertion(status_codes: list[int]) -> str:
             201: "isCreated()",
             202: "isAccepted()",
             204: "isNoContent()",
+            400: "isBadRequest()",
+            404: "isNotFound()",
+            409: "isConflict()",
         }
         if code in status_map:
-            return status_map[code]
-        return f"is({code})"
-    # Multiple allowed success codes
+            return f".andExpect(status().{status_map[code]})"
+        return f".andExpect(status().is({code}))"
+
+    # Multiple allowed success codes — use lambda-based assertion
     codes_str = ", ".join(str(c) for c in status_codes)
     return (
-        f"hasStatusCode(status -> assertTrue("
-        f"java.util.List.of({codes_str}).contains(status), "
+        ".andExpect(result -> org.junit.jupiter.api.Assertions.assertTrue("
+        f"java.util.List.of({codes_str}).contains(result.getResponse().getStatus()), "
         f"\"Expected one of [{codes_str}]\"))"
     )
 
@@ -92,7 +102,7 @@ def generate_positive_test(endpoint: dict[str, Any]) -> list[str]:
 
     # Read success status from contract
     success_status = endpoint.get("response", {}).get("success_status", [200])
-    status_check = status_assertion(success_status)
+    status_line = status_expect_line(success_status)
 
     # Read response fields from contract for jsonPath assertions
     response_body = endpoint.get("response", {}).get("body", {})
@@ -106,7 +116,7 @@ def generate_positive_test(endpoint: dict[str, Any]) -> list[str]:
     void {test_name}() throws Exception {{
         mockMvc.perform({method}({java_string(path)})
                 .contentType(MediaType.APPLICATION_JSON))
-            .andExpect(status().{status_check})
+            {status_line}
 {chr(10).join('            ' + a for a in jsonpath_asserts if jsonpath_asserts) if jsonpath_asserts else '            .andExpect(jsonPath("$").exists())'};
     }}
 """)
@@ -122,7 +132,7 @@ def generate_positive_test(endpoint: dict[str, Any]) -> list[str]:
         mockMvc.perform({method}({java_string(path)})
                 .contentType(MediaType.APPLICATION_JSON)
                 .content(requestBody))
-            .andExpect(status().{status_check})
+            {status_line}
 {chr(10).join('            ' + a for a in jsonpath_asserts if jsonpath_asserts) if jsonpath_asserts else '            .andExpect(jsonPath("$").exists())'};
     }}
 """)
@@ -556,7 +566,7 @@ def generate_get_tests(endpoint: dict[str, Any]) -> list[str]:
     @DisplayName("GET should return correct response schema")
     void test_{path_slug}_response_schema() throws Exception {{
         mockMvc.perform(get({java_string(path)}, 1))
-            .andExpect(status().{status_assertion(endpoint.get("response", {}).get("success_status", [200]))})
+            {status_expect_line(endpoint.get("response", {}).get("success_status", [200]))}
 {chr(10).join('            ' + a for a in jsonpath_asserts if jsonpath_asserts) if jsonpath_asserts else '            .andExpect(jsonPath("$").exists())'};
     }}
 """)
@@ -585,14 +595,14 @@ def generate_delete_tests(endpoint: dict[str, Any]) -> list[str]:
 """)
         # Delete existing (200 or 204)
         success_status = endpoint.get("response", {}).get("success_status", [200, 204])
-        status_check = status_assertion(success_status)
+        status_line = status_expect_line(success_status)
         tests.append(f"""
     @Test
     @DisplayName("DELETE existing should return success")
     void test_{path_slug}_success() throws Exception {{
         // Note: depends on test data — may need setup
         mockMvc.perform(delete({java_string(path)}, 1))
-            .andExpect(status().{status_check});
+            {status_line};
     }}
 """)
 

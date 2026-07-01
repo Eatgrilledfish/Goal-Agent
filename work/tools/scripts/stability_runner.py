@@ -8,14 +8,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any
-
-import os
-import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import shophub_goal_runner as runner
@@ -190,6 +190,115 @@ def run_script(root: Path, script_name: str, extra_args: list[str] | None = None
         }
 
 
+def run_generated_tests(root: Path, timeout: int) -> dict[str, Any]:
+    """Copy and execute compilable generated tests against the current code.
+
+    Reads .agent-work/generated_tests_manifest.json, copies compilable tests
+    into code/src/test/java/generated/, and runs them via Maven.
+    """
+    manifest_path = root / ".agent-work" / "generated_tests_manifest.json"
+    if not manifest_path.exists():
+        return {
+            "generated_tests": "NONE",
+            "generated_test_summary": {"reason": "No generated_tests_manifest.json"},
+        }
+
+    manifest = runner.read_json(manifest_path, {})
+    test_classes = manifest.get("test_classes", [])
+    compilable = [tc for tc in test_classes if tc.get("compilable") in (True, None)]
+
+    if not compilable:
+        return {
+            "generated_tests": "NONE",
+            "generated_test_summary": {"reason": "No compilable generated tests"},
+        }
+
+    # Copy generated test files into code module
+    dest_dir = root / "code" / "src" / "test" / "java" / "generated"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    class_names: list[str] = []
+
+    for tc in compilable:
+        cls_name = tc.get("test_class", "")
+        source_file = tc.get("file", "")
+        if not cls_name or not source_file:
+            continue
+        source_path = Path(source_file)
+        if not source_path.exists():
+            continue
+        try:
+            shutil.copy2(source_path, dest_dir / f"{cls_name}.java")
+            class_names.append(cls_name)
+        except (OSError, Exception):
+            continue
+
+    if not class_names:
+        return {
+            "generated_tests": "NONE",
+            "generated_test_summary": {"reason": "Could not copy generated test files"},
+        }
+
+    # Run generated tests
+    test_filter = ",".join(class_names)
+    try:
+        settings = runner.find_maven_settings(root)
+        cmd = ["mvn"]
+        if settings:
+            cmd.extend(["-s", runner.rel(root, settings)])
+        cmd.extend(["-f", "code/pom.xml", f"-Dtest={test_filter}", "test"])
+
+        start_time = time.time()
+        completed = subprocess.run(
+            cmd, cwd=root, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            check=False, timeout=max(timeout, 900),
+        )
+        elapsed = time.time() - start_time
+
+        output = completed.stdout if completed.stdout else ""
+        surefire_match = re.findall(
+            r"Tests run:\s*(\d+),\s*Failures:\s*(\d+),\s*Errors:\s*(\d+),\s*Skipped:\s*(\d+)",
+            output,
+        )
+        if surefire_match:
+            last = surefire_match[-1]
+            total = int(last[0])
+            failures = int(last[1])
+            errors = int(last[2])
+            skipped = int(last[3])
+            passed_count = total - failures - errors
+            pass_rate = passed_count / total if total > 0 else 0.0
+            return {
+                "generated_tests": "PASS" if failures == 0 and errors == 0 else "FAIL",
+                "generated_test_summary": {
+                    "tests_run": total,
+                    "failures": failures,
+                    "errors": errors,
+                    "skipped": skipped,
+                    "pass_rate": pass_rate,
+                },
+            }
+        else:
+            passed = completed.returncode == 0
+            return {
+                "generated_tests": "PASS" if passed else "FAIL",
+                "generated_test_summary": {
+                    "returncode": completed.returncode,
+                    "elapsed_seconds": round(elapsed, 1),
+                },
+            }
+    except subprocess.TimeoutExpired:
+        return {
+            "generated_tests": "TIMEOUT",
+            "generated_test_summary": {"reason": "Generated test execution timed out"},
+        }
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {
+            "generated_tests": "UNUSABLE",
+            "generated_test_summary": {"reason": f"Maven execution error: {exc}"},
+        }
+
+
 def run_full_gate_iteration(root: Path, timeout: int, test_filter: str | None) -> dict[str, Any]:
     """Run one iteration of the full gate."""
     gate: dict[str, Any] = {}
@@ -213,16 +322,9 @@ def run_full_gate_iteration(root: Path, timeout: int, test_filter: str | None) -
     public_result = run_maven_command(root, public_test_args, timeout * 2)
     gate["public_tests"] = "PASS" if public_result["passed"] else "FAIL"
 
-    # 4. Generated tests (if available)
-    gen_test_dir = root / ".tmp" / "generated-tests"
-    if gen_test_dir.exists():
-        gen_manifest = runner.read_json(gen_test_dir / "generated_tests.json", {})
-        if gen_manifest.get("compilable_count", 0) > 0:
-            gate["generated_tests"] = "SKIPPED"  # Generated tests run via separate Maven config
-        else:
-            gate["generated_tests"] = "NONE"
-    else:
-        gate["generated_tests"] = "NONE"
+    # 4. Generated tests (real execution)
+    gen_result = run_generated_tests(root, timeout)
+    gate["generated_tests"] = gen_result.get("generated_tests", "NONE")
 
     # 5. Contract checker
     contract_result = run_script(root, "contract_checker.py", timeout=timeout)

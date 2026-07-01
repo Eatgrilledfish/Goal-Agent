@@ -24,6 +24,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Check API contract consistency against code.")
     parser.add_argument("--root", default=".", help="Project root.")
     parser.add_argument("--output", default=None, help="Output path.")
+    parser.add_argument("--save-baseline", action="store_true",
+                       help="Save a baseline copy as baseline_consistency_report.json for P0 comparison.")
     return parser
 
 
@@ -697,8 +699,12 @@ def find_code_endpoint(contract_ep: dict[str, Any], repo_map: dict[str, Any]) ->
     return None
 
 
-def check_consistency(root: Path) -> dict[str, Any]:
-    """Full consistency check producing report."""
+def check_consistency(root: Path, save_baseline: bool = False) -> dict[str, Any]:
+    """Full consistency check producing report.
+
+    If save_baseline is True, also writes baseline_consistency_report.json
+    for later comparison by candidate_sandbox.py.
+    """
     paths = runner.RunnerPaths(root)
 
     # Load all inputs
@@ -768,6 +774,10 @@ def check_consistency(root: Path) -> dict[str, Any]:
     runner.write_json(paths.work / "consistency_report.json", report)
     runner.write_json(paths.work / "trace_matrix.json", trace_matrix)
 
+    # Optionally save baseline for P0 comparison
+    if save_baseline:
+        runner.write_json(paths.work / "baseline_consistency_report.json", report)
+
     # Summary markdown
     lines = [
         "# Consistency Check Report",
@@ -816,7 +826,7 @@ def main() -> int:
     paths = runner.RunnerPaths(root)
     runner.ensure_work_layout(paths)
 
-    report = check_consistency(root)
+    report = check_consistency(root, save_baseline=args.save_baseline)
 
     if args.output:
         runner.write_json(Path(args.output), report)

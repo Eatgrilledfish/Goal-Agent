@@ -122,6 +122,8 @@ def select_patch(root: Path, validation_file: str | None) -> dict[str, Any]:
             "task_id": candidate.get("task_id", ""),
             "strategy": candidate.get("strategy", ""),
             "score": score,
+            "patch_file": candidate.get("patch_file", ""),
+            "patch_file_exists": candidate.get("patch_file_exists", False),
             "public_test_pass_rate": candidate.get("score_inputs", {}).get("public_test_pass_rate", 0),
             "generated_test_pass_rate": candidate.get("score_inputs", {}).get("generated_test_pass_rate", 0),
             "contract_checker_pass": candidate.get("score_inputs", {}).get("contract_checker_pass", 0),
@@ -138,6 +140,22 @@ def select_patch(root: Path, validation_file: str | None) -> dict[str, Any]:
     best = scored[0]
     fallbacks = scored[1:4] if len(scored) > 1 else []
 
+    # Use real patch_file from candidate validation, fallback to inferred path
+    real_patch = best.get("patch_file", "")
+    warnings: list[str] = []
+    if real_patch and best.get("patch_file_exists", False):
+        patch_file_out = real_patch
+        patch_source = "candidate_validation"
+    elif real_patch:
+        patch_file_out = real_patch
+        patch_source = "candidate_validation"
+        warnings.append(f"patch_file from validation ({real_patch}) does not exist on disk")
+    else:
+        inferred = f".agent-work/patches/{best['task_id']}-{best['candidate_id']}.patch"
+        patch_file_out = inferred
+        patch_source = "inferred"
+        warnings.append(f"patch_file not in validation result, inferred: {inferred}")
+
     selected: dict[str, Any] = {
         "task_id": best["task_id"],
         "selected_candidate": best["candidate_id"],
@@ -150,13 +168,16 @@ def select_patch(root: Path, validation_file: str | None) -> dict[str, Any]:
             f"diff={best['diff_files']}f/{best['diff_lines']}l, "
             f"compile={best['compile']}"
         ),
-        "patch_file": f".agent-work/patches/{best['task_id']}-{best['candidate_id']}.patch",
+        "patch_file": patch_file_out,
+        "patch_file_source": patch_source,
         "fallback_candidates": [
             {"candidate_id": fb["candidate_id"], "score": fb["score"]}
             for fb in fallbacks
         ],
         "selection_details": scored,
     }
+    if warnings:
+        selected["warnings"] = warnings
 
     # Persist
     runner.write_json(paths.work / "selected_patch.json", selected)

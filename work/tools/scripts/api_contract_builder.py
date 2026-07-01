@@ -171,6 +171,11 @@ def find_col(headers: list[str], candidates: list[str]) -> int:
     return -1
 
 
+def is_separator_row(row: list[str]) -> bool:
+    """Check if a markdown table row is a separator row like |---|---|."""
+    return all(re.match(r"^[-: ]+$", c.strip()) for c in row if c.strip())
+
+
 def parse_required(value: str) -> bool:
     """Parse required field value from Chinese or English markers."""
     v = value.strip().lower()
@@ -205,6 +210,8 @@ def extract_fields_from_nearby_table(text: str, after_pos: int, direction: str) 
             continue  # can't parse without field name column
 
         for row in table[1:]:
+            if is_separator_row(row):
+                continue
             if len(row) <= field_col:
                 continue
             field_name = row[field_col].strip()
