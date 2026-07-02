@@ -14,13 +14,13 @@ Treat the submitted `work/` directory as the delivery root.
 All runnable assets are under:
 
 ```text
-skill/SKILL.md
+skills/goal-agent-spec-driven/SKILL.md
 skills/*.md
 tools/scripts/*.py
 tools/config/*.json
 ```
 
-Do not depend on files outside `work/` at runtime. Do not install a plugin or copy delivery assets into the target repository. The platform loads `/INSTRUCTION.md`; the running agent should read this Skill, then load subagent definitions from `work/skills/*.md`, and execute against the target repository in place.
+Do not depend on files outside `work/` at runtime. Do not install a plugin or copy delivery assets into the target repository. The platform loads `/INSTRUCTION.md`; the running agent should read this Skill from `work/skills/goal-agent-spec-driven/SKILL.md`, then load subagent definitions from `work/skills/*.md`, and execute against the target repository in place.
 
 The target competition repository layout is:
 

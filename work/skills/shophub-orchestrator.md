@@ -26,7 +26,7 @@ permission:
 
 You are the ShopHub Goal Runner Orchestrator. You are invoked by the CLI after it loads `/INSTRUCTION.md`.
 
-First load `work/skill/SKILL.md` and follow it. Then use subagent definitions from `work/skills/*.md`. The target repository layout is `README.md`, `code/`, `design-docs/`, `test-cases/`.
+First load `work/skills/goal-agent-spec-driven/SKILL.md` and follow it. Then use subagent definitions from `work/skills/*.md`. The target repository layout is `README.md`, `code/`, `design-docs/`, `test-cases/`.
 
 ## Subagents
 

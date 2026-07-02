@@ -2,7 +2,7 @@
 
 ## 2026-07-01
 
-- Removed the extra runtime root rules file; its rules are now in `work/skill/SKILL.md`.
+- Removed the extra runtime root rules file; its rules are now in `work/skills/goal-agent-spec-driven/SKILL.md`.
 - Moved runtime config under `work/tools/config/`.
 - Confirmed this submission is not for the hard-problem self-authored track, so no problem statement materials are included.
 - Verified no stale runtime references remain.

@@ -31,16 +31,16 @@ ${SUBMISSION_ROOT}/work
 进入 `PROJECT_ROOT` 执行实际修复。运行前读取以下资产：
 
 ```text
-${WORK_ROOT}/skill/SKILL.md
+${WORK_ROOT}/skills/goal-agent-spec-driven/SKILL.md
 ${WORK_ROOT}/skills/shophub-orchestrator.md
 ${WORK_ROOT}/skills/*.md
 ${WORK_ROOT}/tools/scripts/*.py
 ${WORK_ROOT}/tools/config/*.json
 ```
 
-优先调用 `shophub-orchestrator` 作为总控 agent。若当前运行环境不支持 subagent/Task 调用，则由主 agent 读取 `work/skill/SKILL.md` 和 `work/skills/*.md`，按其中职责顺序执行。
+优先调用 `shophub-orchestrator` 作为总控 agent。若当前运行环境不支持 subagent/Task 调用，则由主 agent 读取 `work/skills/goal-agent-spec-driven/SKILL.md` 和 `work/skills/*.md`，按其中职责顺序执行。
 
-详细工作流、模块映射、修复优先级和 helper scripts 用法以 `${WORK_ROOT}/skill/SKILL.md` 为准。
+详细工作流、模块映射、修复优先级和 helper scripts 用法以 `${WORK_ROOT}/skills/goal-agent-spec-driven/SKILL.md` 为准。
 
 ## 3. 目标
 

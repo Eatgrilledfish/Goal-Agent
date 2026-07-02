@@ -4,7 +4,7 @@
 
 - 入口文件：`/INSTRUCTION.md`
 - 可运行交付件目录：`/work`
-- 主 Skill：`/work/skill/SKILL.md`
+- 主 Skill：`/work/skills/goal-agent-spec-driven/SKILL.md`
 - 规格驱动 Subagents：`/work/skills/contract-builder.md`, `code-analyzer.md`, `consistency-checker.md`, `patch-generator.md`, `stability-verifier.md`
 - ShopHub Subagents：`/work/skills/shophub-*.md`
 - Helper scripts：`/work/tools/scripts/*.py`
@@ -43,6 +43,7 @@ Phase 9: Report & Deliver
 规格驱动新增文件：
 
 ```text
+/work/skills/goal-agent-spec-driven/SKILL.md ← 主 Skill
 /work/skills/contract-builder.md       ← API Contract + Business Rule 抽取
 /work/skills/code-analyzer.md           ← Spring Boot 代码扫描
 /work/skills/consistency-checker.md     ← 静态一致性检查 + Trace Matrix
