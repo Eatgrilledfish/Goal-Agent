@@ -20,6 +20,27 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import shophub_goal_runner as runner
 
 
+def normalize_endpoint(endpoint: dict[str, Any]) -> dict[str, Any]:
+    """Return an endpoint carrying the legacy keys used by this generator."""
+    item = dict(endpoint)
+    item.setdefault("path", item.get("url", ""))
+    item.setdefault("id", item.get("endpoint_id", ""))
+    request = item.get("request")
+    if not isinstance(request, dict):
+        request = {}
+    if "body" not in request:
+        request["body"] = item.get("request_body", {}) if isinstance(item.get("request_body"), dict) else {}
+    item["request"] = request
+    response = item.get("response")
+    if not isinstance(response, dict):
+        response = {}
+    if "body" not in response:
+        response["body"] = item.get("response_body", {}) if isinstance(item.get("response_body"), dict) else {}
+    response.setdefault("success_status", [200])
+    item["response"] = response
+    return item
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Generate spec-driven tests from API contract.")
     parser.add_argument("--root", default=".", help="Project root.")
@@ -32,6 +53,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def generate_test_class_name(endpoint: dict[str, Any]) -> str:
     """Generate a test class name from an endpoint."""
+    endpoint = normalize_endpoint(endpoint)
     path = endpoint["path"].strip("/").replace("/", "_").replace("{", "").replace("}", "")
     method = endpoint["method"]
     summary = endpoint.get("summary", "").replace(" ", "")
@@ -617,7 +639,7 @@ def generate_tests(root: Path, output_dir: Path, format_type: str,
     contract = runner.read_json(paths.work / "api_contract.json", {})
     rules = runner.read_json(paths.work / "business_rules.json", {})
 
-    endpoints = contract.get("endpoints", [])
+    endpoints = [normalize_endpoint(endpoint) for endpoint in contract.get("endpoints", [])]
     if not endpoints:
         return {"status": "skipped", "reason": "No endpoints in API contract", "generated": 0}
 

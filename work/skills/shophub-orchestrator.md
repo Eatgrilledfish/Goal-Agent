@@ -41,20 +41,26 @@ First load `work/skills/goal-agent-spec-driven/SKILL.md` and follow it. Then use
 - `shophub-review-agent`: review diff, API safety, minimality, hidden-test risk.
 - `shophub-report-writer`: write `修复报告.md`.
 
-## State machine
+## State machine v2
 
 ```text
 INIT
-READ_SPECS                  (spec-librarian fills semantic fields)
-READ_API_BASELINE           (api-guardian fills endpoint DTO fields)
-MAP_CODE                    (code-mapper → modules.json, design_docs.json, code_map.jsonl)
-MAP_MODULES                 (module-mapper → module_mapping.json)
-RUN_BASELINE_TESTS          (test-diagnoser)
-FAN_OUT_MODULE_AUDIT        (one module-auditor per scanned module; append issues via add-issue)
-CROSS_CUT_AUDIT             (cross-cut-auditor: L1 signals → L2/L3)
-PRIORITIZE_ISSUES
-FIX_LOOP                    (patch-agent one issue → api-guardian → focused tests → review-agent)
-RUN_FULL_TESTS
+BUILD_EXTERNAL_MEMORY       (feature_registry/progress/goal_status)
+BUILD_RULES                 (api_contract_builder, business_rule_builder, public_case_rule_builder)
+SCAN_CODE                   (spring_scanner, dto_analyzer, exception_analyzer, code map)
+RUN_STATIC_CHECKERS         (contract + money/state/clock/failure/sorting checkers)
+RUN_BASELINE_MATRIX         (suite/class/method matrix, no fixed test count)
+BUILD_REPAIR_QUEUE          (rule_issue_builder, repair_task_builder, patch_prompt_emitter)
+REPAIR_LOOP
+  GENERATE_CANDIDATES       (patch-agent, multiple candidates when possible)
+  SANDBOX_VALIDATE          (candidate_sandbox using submission-local tools)
+  FRESH_REVIEW              (fresh_context_review + hardcoding_guard)
+  SELECT_PATCH              (patch_selector hard filter, then delta scoring)
+  APPLY_PATCH
+  UNMASKING_GATE            (newly exposed failures become tasks)
+  FLAKY_TO_TASKS            (stability findings become tasks)
+STABILITY_LOOP              (3x/5x, focused/shuffle supported)
+FINAL_GOAL_GATE             (final_goal_gate.py decides DONE)
 WRITE_REPORT
 DONE
 ```
@@ -96,12 +102,12 @@ mvn -s maven-settings.xml -f test-cases/pom.xml test
 
 Use local Maven only. `maven-settings.xml` is the required internal mirror configuration when present.
 
-Prefer local helper scripts only for bookkeeping:
+Use local helper scripts for bookkeeping and deterministic gates:
 
 ```bash
 python3 <SUBMISSION_ROOT>/work/tools/scripts/shophub_goal_runner.py --root . <subcommand>
 ```
 
-`auto-run` is a **fallback only** (for runtimes without subagent/Task support). The preferred path is the subagent fan-out above; `auto-run` cannot produce semantic issues on its own and stops at `patch_command_required` without an external patch command.
+`auto-run` is a complete deterministic fallback for runtimes without subagent/Task support. It must still produce `.agent-work/feature_list.json`, `.agent-work/issues.jsonl`, `.agent-work/repair_tasks.jsonl`, `.agent-work/patch_prompts/*.md`, `.agent-work/goal_status.json`, and `.agent-work/final_goal_report.json`. If no external patch command is available, stop with patch prompts ready, not `patch_command_required`.
 
-DONE requires compile/test evidence, API compatibility, accepted repair round records, and `修复报告.md`.
+DONE requires `final_goal_gate.py` to pass, including compile/test evidence, public matrix all green, stability, API compatibility, forbidden/hardcoding guards, P0/P1 feature convergence, and `修复报告.md`.

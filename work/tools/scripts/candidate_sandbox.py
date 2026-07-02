@@ -23,6 +23,7 @@ from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import shophub_goal_runner as runner
+from runtime_paths import review_path, script_path
 
 
 FORBIDDEN_PATHS = [
@@ -142,8 +143,6 @@ def run_generated_tests_in_sandbox(
         if not cls_name or not source_file:
             continue
         source_path = Path(source_file)
-        if not source_path.exists():
-            continue  # file may be relative to root
         source_abs = source_path if source_path.is_absolute() else root / source_path
         if not source_abs.exists():
             continue
@@ -346,6 +345,7 @@ def validate_candidate(
         "generated_tests": "SKIPPED",
         "contract_check": "SKIPPED",
         "forbidden_guard": "SKIPPED",
+        "hardcoding_guard": "SKIPPED",
         "matrix_gate": "SKIPPED",
         "gate_mode": gate_mode,
         "diff_files": 0,
@@ -558,7 +558,7 @@ def validate_candidate(
 
         # --- Step 6: Contract checker in sandbox ---
         try:
-            contract_script = sandbox_root / "work" / "tools" / "scripts" / "contract_checker.py"
+            contract_script = script_path("contract_checker.py")
             contract_result = subprocess.run(
                 [sys.executable, str(contract_script), "--root", str(sandbox_root)],
                 cwd=sandbox_root,
@@ -609,7 +609,7 @@ def validate_candidate(
 
         # --- Step 7: Forbidden change guard in sandbox ---
         try:
-            guard_script = sandbox_root / "work" / "tools" / "scripts" / "forbidden_change_guard.py"
+            guard_script = script_path("forbidden_change_guard.py")
             guard_result = subprocess.run(
                 [sys.executable, str(guard_script), "--root", str(sandbox_root), "--strict"],
                 cwd=sandbox_root,
@@ -629,6 +629,30 @@ def validate_candidate(
             result["forbidden_guard"] = "ERROR"
             result["elimination_reason"] = f"Forbidden guard execution failed in sandbox: {exc}"
             result["errors"].append(result["elimination_reason"])
+
+        # --- Step 8: Hardcoding guard in sandbox ---
+        if not result["elimination_reason"]:
+            try:
+                hardcoding_script = review_path("hardcoding_guard.py")
+                hardcoding_result = subprocess.run(
+                    [sys.executable, str(hardcoding_script), "--root", str(sandbox_root)],
+                    cwd=sandbox_root,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    check=False,
+                    timeout=60,
+                )
+                if hardcoding_result.returncode == 0:
+                    result["hardcoding_guard"] = "PASS"
+                else:
+                    result["hardcoding_guard"] = "FAIL"
+                    result["elimination_reason"] = "Hardcoding guard detected public fixture overfit risk"
+                    result["errors"].append(result["elimination_reason"])
+            except (OSError, subprocess.SubprocessError) as exc:
+                result["hardcoding_guard"] = "ERROR"
+                result["elimination_reason"] = f"Hardcoding guard execution failed in sandbox: {exc}"
+                result["errors"].append(result["elimination_reason"])
 
         # --- Determine eligibility ---
         if not result["elimination_reason"]:
@@ -842,7 +866,8 @@ def validate(
                 f"public={r['public_tests']} "
                 f"matrix_gate={r.get('matrix_gate', 'N/A')} "
                 f"contract={r['contract_check']} "
-                f"guard={r['forbidden_guard']}"
+                f"guard={r['forbidden_guard']} "
+                f"hardcoding={r.get('hardcoding_guard', 'N/A')}"
             )
         lines.append("")
     eliminated = [r for r in results if not r.get("eligible")]
@@ -858,7 +883,8 @@ def validate(
                 f"public={r['public_tests']} "
                 f"matrix_gate={r.get('matrix_gate', 'N/A')} "
                 f"contract={r['contract_check']} "
-                f"guard={r['forbidden_guard']})"
+                f"guard={r['forbidden_guard']} "
+                f"hardcoding={r.get('hardcoding_guard', 'N/A')})"
             )
         lines.append("")
 

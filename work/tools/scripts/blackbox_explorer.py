@@ -244,6 +244,7 @@ def run_maven_test(
     test_filter: str | None = None,
     timeout: int = 600,
     label: str = "",
+    extra_maven_args: list[str] | None = None,
 ) -> dict[str, Any]:
     """Run Maven black-box tests, optionally filtered to a class or method.
 
@@ -265,6 +266,8 @@ def run_maven_test(
     cmd.extend(["-f", "test-cases/pom.xml"])
     if test_filter:
         cmd.append(f"-Dtest={test_filter}")
+    if extra_maven_args:
+        cmd.extend(extra_maven_args)
     cmd.append("test")
 
     clear_surefire_reports(root)
@@ -440,6 +443,47 @@ def run_sweep_exploration(
     return {"runs": runs, "matrix": matrix, "unmasked_failures": unmasked}
 
 
+def run_shuffle_exploration(root: Path, timeout: int, seeds: list[int]) -> dict[str, Any]:
+    """Run public tests with Surefire random run order and merge outcomes."""
+    paths = runner.RunnerPaths(root)
+    matrix_dir = paths.work / "test_matrix"
+    runs: list[dict[str, Any]] = []
+    run_matrices: list[dict[str, Any]] = []
+
+    for seed in seeds:
+        result = run_maven_test(
+            root,
+            timeout=timeout,
+            label=f"shuffle:{seed}",
+            extra_maven_args=["-Dsurefire.runOrder=random", f"-Dsurefire.runOrder.random.seed={seed}"],
+        )
+        result["shuffle_seed"] = seed
+        runs.append(result)
+        snapshot = snapshot_surefire_reports(root, f"shuffle-{seed}")
+        run_matrices.append(build_matrix_from_snapshot(root, snapshot, f"shuffle-{seed}"))
+
+    matrix = merge_run_matrices(root, run_matrices, run_id="explorer-shuffle")
+    save_matrix(matrix_dir / "current_test_matrix.json", matrix)
+    runner.append_jsonl(matrix_dir / "blackbox_explorer_runs.jsonl", runs)
+    return {"runs": runs, "matrix": matrix, "unmasked_failures": []}
+
+
+def run_focused_exploration(root: Path, timeout: int, focused: str) -> dict[str, Any]:
+    """Run one focused class or method filter and write a current matrix."""
+    paths = runner.RunnerPaths(root)
+    matrix_dir = paths.work / "test_matrix"
+    result = run_maven_test(root, test_filter=focused, timeout=timeout, label=f"focused:{focused}")
+    snapshot = snapshot_surefire_reports(root, f"focused-{focused}")
+    matrix = merge_run_matrices(
+        root,
+        [build_matrix_from_snapshot(root, snapshot, f"focused-{focused}")],
+        run_id="explorer-focused",
+    )
+    save_matrix(matrix_dir / "current_test_matrix.json", matrix)
+    runner.append_jsonl(matrix_dir / "blackbox_explorer_runs.jsonl", [result])
+    return {"runs": [result], "matrix": matrix, "unmasked_failures": []}
+
+
 def _find_unmasked_failures(
     matrix: dict[str, Any],
     class_results: list[dict[str, Any]],
@@ -534,7 +578,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--root", default=".", help="Project root.")
     parser.add_argument("--mode", default="baseline",
-                        choices=["baseline", "sweep"],
+                        choices=["baseline", "sweep", "shuffle", "focused"],
                         help="Exploration mode (default: baseline).")
     parser.add_argument("--timeout", type=int, default=600,
                         help="Timeout per Maven run in seconds.")
@@ -542,6 +586,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Path to previous test matrix JSON (for sweep mode).")
     parser.add_argument("--output-dir", default=None,
                         help="Override output directory for matrix files.")
+    parser.add_argument("--focused", default=None,
+                        help="Focused test filter for --mode focused, e.g. ClassName#methodName.")
+    parser.add_argument("--shuffle-seeds", default="1,2,3",
+                        help="Comma-separated seeds for --mode shuffle.")
     return parser
 
 
@@ -561,8 +609,16 @@ def main() -> int:
 
     if args.mode == "baseline":
         result = run_baseline_exploration(root, timeout=args.timeout)
-    else:
+    elif args.mode == "sweep":
         result = run_sweep_exploration(root, timeout=args.timeout, previous_matrix=previous)
+    elif args.mode == "shuffle":
+        seeds = [int(part) for part in args.shuffle_seeds.split(",") if part.strip()]
+        result = run_shuffle_exploration(root, timeout=args.timeout, seeds=seeds or [1, 2, 3])
+    else:
+        if not args.focused:
+            print("ERROR: --mode focused requires --focused ClassName[#methodName]", file=sys.stderr)
+            return 2
+        result = run_focused_exploration(root, timeout=args.timeout, focused=args.focused)
 
     # Print summary
     matrix = result["matrix"]

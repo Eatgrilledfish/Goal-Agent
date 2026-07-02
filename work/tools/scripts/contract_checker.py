@@ -29,6 +29,30 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def contract_path(endpoint: dict[str, Any]) -> str:
+    return str(endpoint.get("path") or endpoint.get("url") or "")
+
+
+def contract_id(endpoint: dict[str, Any]) -> str:
+    return str(endpoint.get("id") or endpoint.get("endpoint_id") or "")
+
+
+def contract_request_body(endpoint: dict[str, Any]) -> dict[str, Any]:
+    request = endpoint.get("request") or {}
+    if isinstance(request, dict) and isinstance(request.get("body"), dict):
+        return request.get("body", {})
+    body = endpoint.get("request_body") or {}
+    return body if isinstance(body, dict) else {}
+
+
+def contract_response_body(endpoint: dict[str, Any]) -> dict[str, Any]:
+    response = endpoint.get("response") or {}
+    if isinstance(response, dict) and isinstance(response.get("body"), dict):
+        return response.get("body", {})
+    body = endpoint.get("response_body") or {}
+    return body if isinstance(body, dict) else {}
+
+
 def check_route_existence(
     contract: dict[str, Any], code_snapshot: dict[str, Any]
 ) -> list[dict[str, Any]]:
@@ -39,16 +63,18 @@ def check_route_existence(
         for ep in code_snapshot.get("endpoints", [])
     }
     for ep in contract.get("endpoints", []):
-        key = (ep["method"], ep["path"])
+        path = contract_path(ep)
+        endpoint_id = contract_id(ep)
+        key = (ep.get("method", ""), path)
         if key not in code_endpoints:
             issues.append({
                 "type": "missing_endpoint",
                 "severity": "P0",
-                "endpoint_id": ep["id"],
-                "method": ep["method"],
-                "path": ep["path"],
+                "endpoint_id": endpoint_id,
+                "method": ep.get("method", ""),
+                "path": path,
                 "summary": ep.get("summary", ""),
-                "detail": f"Endpoint {ep['method']} {ep['path']} defined in API contract but not found in code",
+                "detail": f"Endpoint {ep.get('method', '')} {path} defined in API contract but not found in code",
             })
     return issues
 
@@ -61,14 +87,17 @@ def check_request_fields(
     dto_fields = code_snapshot.get("dto_fields", {})
 
     for ep in contract.get("endpoints", []):
-        contract_fields = ep.get("request", {}).get("body", {})
+        path = contract_path(ep)
+        endpoint_id = contract_id(ep)
+        method = ep.get("method", "")
+        contract_fields = contract_request_body(ep)
         if not contract_fields:
             continue
 
         # Find matching code endpoint
         code_ep = next(
             (ce for ce in code_snapshot.get("endpoints", [])
-             if ce.get("method") == ep["method"] and ce.get("url") == ep["path"]),
+             if ce.get("method") == method and ce.get("url") == path),
             None,
         )
         if not code_ep:
@@ -80,10 +109,10 @@ def check_request_fields(
             issues.append({
                 "type": "missing_request_dto",
                 "severity": "P0",
-                "endpoint_id": ep["id"],
-                "method": ep["method"],
-                "path": ep["path"],
-                "detail": f"No request body type detected for {ep['method']} {ep['path']}",
+                "endpoint_id": endpoint_id,
+                "method": method,
+                "path": path,
+                "detail": f"No request body type detected for {method} {path}",
             })
             continue
 
@@ -95,9 +124,9 @@ def check_request_fields(
                 issues.append({
                     "type": "missing_field",
                     "severity": "P0",
-                    "endpoint_id": ep["id"],
-                    "method": ep["method"],
-                    "path": ep["path"],
+                    "endpoint_id": endpoint_id,
+                    "method": method,
+                    "path": path,
                     "dto": req_type,
                     "field": field_name,
                     "expected_type": field_spec.get("type"),
@@ -111,9 +140,9 @@ def check_request_fields(
                     issues.append({
                         "type": "type_mismatch",
                         "severity": "P0",
-                        "endpoint_id": ep["id"],
-                        "method": ep["method"],
-                        "path": ep["path"],
+                        "endpoint_id": endpoint_id,
+                        "method": method,
+                        "path": path,
                         "dto": req_type,
                         "field": field_name,
                         "expected_type": expected,
@@ -194,14 +223,17 @@ def check_response_fields(
     dto_fields = code_snapshot.get("dto_fields", {})
 
     for ep in contract.get("endpoints", []):
-        contract_resp = ep.get("response", {}).get("body", {})
+        path = contract_path(ep)
+        endpoint_id = contract_id(ep)
+        method = ep.get("method", "")
+        contract_resp = contract_response_body(ep)
         if not contract_resp:
             continue
 
         # Find matching code endpoint
         code_ep = next(
             (ce for ce in code_snapshot.get("endpoints", [])
-             if ce.get("method") == ep["method"] and ce.get("url") == ep["path"]),
+             if ce.get("method") == method and ce.get("url") == path),
             None,
         )
         if not code_ep:
@@ -234,9 +266,9 @@ def check_response_fields(
                     issues.append({
                         "type": "missing_response_field",
                         "severity": "P1",
-                        "endpoint_id": ep["id"],
-                        "method": ep["method"],
-                        "path": ep["path"],
+                        "endpoint_id": endpoint_id,
+                        "method": method,
+                        "path": path,
                         "response_type": resp_type,
                         "field": field_name,
                         "detail": (
@@ -252,9 +284,9 @@ def check_response_fields(
                     issues.append({
                         "type": "missing_response_field",
                         "severity": "P1",
-                        "endpoint_id": ep["id"],
-                        "method": ep["method"],
-                        "path": ep["path"],
+                        "endpoint_id": endpoint_id,
+                        "method": method,
+                        "path": path,
                         "response_type": resp_type,
                         "field": field_name,
                         "detail": (
@@ -266,9 +298,9 @@ def check_response_fields(
                 issues.append({
                     "type": "missing_response_field",
                     "severity": "P1",
-                    "endpoint_id": ep["id"],
-                    "method": ep["method"],
-                    "path": ep["path"],
+                    "endpoint_id": endpoint_id,
+                    "method": method,
+                    "path": path,
                     "response_dto": resp_type,
                     "field": field_name,
                     "detail": (
@@ -318,9 +350,9 @@ def check_pagination_metadata(
         issues.append({
             "type": "pagination_metadata_missing",
             "severity": "P1",
-            "endpoint_id": ep["id"],
-            "method": ep["method"],
-            "path": ep["path"],
+            "endpoint_id": contract_id(ep),
+            "method": ep.get("method", ""),
+            "path": contract_path(ep),
             "response_type": resp_type,
             "detail": (
                 f"Pagination response type {resp_type} may be missing metadata fields "
@@ -394,6 +426,9 @@ def check_endpoint_errors(
                 handler_details[ex_type] = handler
 
     for ep in contract.get("endpoints", []):
+        path = contract_path(ep)
+        endpoint_id = contract_id(ep)
+        method = ep.get("method", "")
         documented_errors = ep.get("errors", [])
         if not documented_errors:
             continue
@@ -420,9 +455,9 @@ def check_endpoint_errors(
                         issues.append({
                             "type": "missing_error_handler",
                             "severity": "P0",
-                            "endpoint_id": ep["id"],
-                            "method": ep["method"],
-                            "path": ep["path"],
+                            "endpoint_id": endpoint_id,
+                            "method": method,
+                            "path": path,
                             "expected_status": status,
                             "expected_code": code,
                             "detail": (
@@ -447,9 +482,9 @@ def check_endpoint_errors(
                     issues.append({
                         "type": "missing_error_code_in_handler",
                         "severity": "P1",
-                        "endpoint_id": ep["id"],
-                        "method": ep["method"],
-                        "path": ep["path"],
+                        "endpoint_id": endpoint_id,
+                        "method": method,
+                        "path": path,
                         "expected_status": status,
                         "expected_code": code,
                         "detail": (
@@ -475,9 +510,9 @@ def check_endpoint_errors(
                     issues.append({
                         "type": "wrong_status_code",
                         "severity": "P0",
-                        "endpoint_id": ep["id"],
-                        "method": ep["method"],
-                        "path": ep["path"],
+                        "endpoint_id": endpoint_id,
+                        "method": method,
+                        "path": path,
                         "handler_file": h.get("file", ""),
                         "handler_exception": h.get("exception_type", ""),
                         "actual_status": h.get("http_status"),
@@ -546,7 +581,7 @@ def determine_implementation_status(
 
     Returns: implemented | partial | missing | conflict
     """
-    endpoint_key = (endpoint["method"], endpoint["path"])
+    endpoint_key = (endpoint.get("method", ""), contract_path(endpoint))
 
     if not code_ep:
         return "missing"
@@ -604,10 +639,13 @@ def build_trace_matrix(
 
     # Map each API contract endpoint to code
     for ep in contract.get("endpoints", []):
+        ep_path = contract_path(ep)
+        ep_id = contract_id(ep)
+        ep_method = ep.get("method", "")
         code_ep = find_code_endpoint(ep, repo_map)
         item: dict[str, Any] = {
-            "requirement_id": ep["id"],
-            "api_id": ep["id"],
+            "requirement_id": ep_id,
+            "api_id": ep_id,
             "description": ep.get("summary", ""),
             "links": {},
             "implementation_status": "unknown",
@@ -641,13 +679,13 @@ def build_trace_matrix(
             item["implementation_status"] = determine_implementation_status(ep, code_ep, all_issues)
         else:
             item["implementation_status"] = "missing"
-            item["gap"] = f"No code endpoint found for {ep['method']} {ep['path']}"
+            item["gap"] = f"No code endpoint found for {ep_method} {ep_path}"
 
         # Add gap description for partial/conflict
         if item["implementation_status"] in ("partial", "conflict"):
             endpoint_issues = [
                 i for i in all_issues
-                if i.get("method") == ep["method"] and i.get("path") == ep["path"]
+                if i.get("method") == ep_method and i.get("path") == ep_path
             ]
             if endpoint_issues:
                 gap_types = {i["type"] for i in endpoint_issues}
@@ -662,7 +700,7 @@ def build_trace_matrix(
 
         # Map business rules
         for rule in rules.get("rules", []):
-            if ep["method"] in str(rule.get("related_api", "")) and ep["path"] in str(rule.get("related_api", "")):
+            if ep_method in str(rule.get("related_api", "")) and ep_path in str(rule.get("related_api", "")):
                 item.setdefault("business_rules", []).append(rule["id"])
 
         trace_items.append(item)
@@ -686,8 +724,8 @@ def find_code_endpoint(contract_ep: dict[str, Any], repo_map: dict[str, Any]) ->
     for ctrl in repo_map.get("controllers", []):
         for method in ctrl.get("methods", []):
             if (
-                method.get("http_method") == contract_ep["method"]
-                and method.get("full_path") == contract_ep["path"]
+                method.get("http_method") == contract_ep.get("method")
+                and method.get("full_path") == contract_path(contract_ep)
             ):
                 return {
                     "file": ctrl.get("file"),

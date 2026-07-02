@@ -44,6 +44,10 @@ VALIDATION_ANNOTATIONS = {
 }
 
 
+def endpoint_path(endpoint: dict[str, Any]) -> str:
+    return str(endpoint.get("path") or endpoint.get("url") or "")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Analyze DTO validation coverage.")
     parser.add_argument("--root", default=".", help="Project root.")
@@ -236,18 +240,20 @@ def analyze_dtos(root: Path) -> dict[str, Any]:
             dto_index[dto_info["class_name"]] = dto_info
 
         for endpoint in api_contract.get("endpoints", []):
-            key = (endpoint["method"], endpoint["path"])
+            path = endpoint_path(endpoint)
+            method = endpoint.get("method", "")
+            key = (method, path)
             dto_name = endpoint_to_dto.get(key)
 
             if not dto_name:
                 # Try alternative key without leading/trailing differences
                 for ep_key, ep_dto in endpoint_to_dto.items():
-                    if ep_key[0] == endpoint["method"] and endpoint["path"].rstrip("/") in ep_key[1].rstrip("/"):
+                    if ep_key[0] == method and path.rstrip("/") in ep_key[1].rstrip("/"):
                         dto_name = ep_dto
                         break
                 if not dto_name:
                     report.setdefault("warnings", []).append(
-                        f"No request DTO mapped for {endpoint['method']} {endpoint['path']} — "
+                        f"No request DTO mapped for {method} {path} — "
                         f"skipping validation gap check"
                     )
                     continue
@@ -255,7 +261,7 @@ def analyze_dtos(root: Path) -> dict[str, Any]:
             dto_info = dto_index.get(dto_name)
             if not dto_info:
                 report.setdefault("warnings", []).append(
-                    f"DTO '{dto_name}' for {endpoint['method']} {endpoint['path']} not found in scanned DTOs"
+                    f"DTO '{dto_name}' for {method} {path} not found in scanned DTOs"
                 )
                 continue
 

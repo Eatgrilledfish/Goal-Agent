@@ -38,7 +38,13 @@ ${WORK_ROOT}/tools/scripts/*.py
 ${WORK_ROOT}/tools/config/*.json
 ```
 
-优先调用 `shophub-orchestrator` 作为总控 agent。若当前运行环境不支持 subagent/Task 调用，则由主 agent 读取 `work/skills/goal-agent-spec-driven/SKILL.md` 和 `work/skills/*.md`，按其中职责顺序执行。
+优先调用 `shophub-orchestrator` 作为总控 agent。若当前运行环境不支持 subagent/Task 调用，则直接运行：
+
+```bash
+python3 ${WORK_ROOT}/tools/scripts/shophub_goal_runner.py --root ${PROJECT_ROOT} auto-run --max-rounds 10
+```
+
+`auto-run` 必须完成确定性闭环产物生成：合同、规则、代码扫描、测试矩阵、issue 队列、repair task、patch prompt、guard/final gate 状态。没有外部 patch agent 时不得停在 `patch_command_required`；应生成 `.agent-work/patch_prompts/*.md` 与 `.agent-work/goal_status.json`，并在报告中说明仍需补丁执行。
 
 详细工作流、模块映射、修复优先级和 helper scripts 用法以 `${WORK_ROOT}/skills/goal-agent-spec-driven/SKILL.md` 为准。
 
@@ -93,6 +99,8 @@ code/**/pom.xml
 
 ```text
 修复报告.md
+.agent-work/goal_status.json
+.agent-work/final_goal_report.json
 ```
 
 最终回答必须包含：
@@ -103,3 +111,9 @@ code/**/pom.xml
 - 验证命令和结果
 - `修复报告.md` 路径
 - 剩余风险
+
+最终 DONE 必须由机器 gate 判定：
+
+```bash
+python3 ${WORK_ROOT}/tools/scripts/final_goal_gate.py --root ${PROJECT_ROOT}
+```

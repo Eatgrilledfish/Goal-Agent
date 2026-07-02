@@ -19,10 +19,11 @@ from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import shophub_goal_runner as runner
+from runtime_paths import script_path
 
 
 FLAKY_PATTERNS = [
-    ("Ordering instability", r"expected.*but was.*(?i)(?:order|sort|sequence)"),
+    ("Ordering instability", r"expected.*but was.*(?:order|sort|sequence)"),
     ("Time dependency", r"(?i)(?:timestamp|datetime|now\(\)|LocalDateTime\.now|Instant\.now)"),
     ("State pollution", r"(?i)(?:already exists|duplicate|unique.*violation)"),
     ("Null pointer intermittent", r"NullPointerException"),
@@ -39,13 +40,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--runs", type=int, default=3, help="Number of consecutive runs (default: 3).")
     parser.add_argument("--timeout", type=int, default=900, help="Timeout per run in seconds.")
     parser.add_argument("--test-filter", default=None, help="Filter tests via -Dtest=...")
+    parser.add_argument("--focused", default=None, help="Alias for --test-filter, accepts Class or Class#method.")
+    parser.add_argument("--shuffle", action="store_true", help="Run public tests with random Surefire order seeds.")
     parser.add_argument("--mode", choices=["public-only", "full-gate"], default="full-gate",
                        help="Verification mode (default: full-gate).")
     parser.add_argument("--output", default=None, help="Output path for JSON report.")
     return parser
 
 
-def run_maven_test(root: Path, timeout: int, test_filter: str | None) -> dict[str, Any]:
+def run_maven_test(root: Path, timeout: int, test_filter: str | None, shuffle_seed: int | None = None) -> dict[str, Any]:
     """Run a single Maven test suite and return results."""
     settings = runner.find_maven_settings(root)
     args = ["-f", "test-cases/pom.xml"]
@@ -53,6 +56,8 @@ def run_maven_test(root: Path, timeout: int, test_filter: str | None) -> dict[st
         args = ["-s", runner.rel(root, settings)] + args
     if test_filter:
         args.append(f"-Dtest={test_filter}")
+    if shuffle_seed is not None:
+        args.extend(["-Dsurefire.runOrder=random", f"-Dsurefire.runOrder.random.seed={shuffle_seed}"])
     args.append("test")
 
     start_time = time.time()
@@ -163,8 +168,8 @@ def run_maven_command(root: Path, args: list[str], timeout: int) -> dict[str, An
 def run_script(root: Path, script_name: str, extra_args: list[str] | None = None,
                timeout: int = 120) -> dict[str, Any]:
     """Run a Python script and return result."""
-    script_path = root / "work" / "tools" / "scripts" / script_name
-    cmd = [sys.executable, str(script_path), "--root", str(root)]
+    resolved_script = script_path(script_name)
+    cmd = [sys.executable, str(resolved_script), "--root", str(root)]
     if extra_args:
         cmd.extend(extra_args)
 
@@ -224,6 +229,8 @@ def run_generated_tests(root: Path, timeout: int) -> dict[str, Any]:
         if not cls_name or not source_file:
             continue
         source_path = Path(source_file)
+        if not source_path.is_absolute():
+            source_path = root / source_path
         if not source_path.exists():
             continue
         try:
@@ -299,7 +306,7 @@ def run_generated_tests(root: Path, timeout: int) -> dict[str, Any]:
         }
 
 
-def run_full_gate_iteration(root: Path, timeout: int, test_filter: str | None) -> dict[str, Any]:
+def run_full_gate_iteration(root: Path, timeout: int, test_filter: str | None, shuffle_seed: int | None = None) -> dict[str, Any]:
     """Run one iteration of the full gate."""
     gate: dict[str, Any] = {}
 
@@ -318,6 +325,8 @@ def run_full_gate_iteration(root: Path, timeout: int, test_filter: str | None) -
     public_test_args = ["-f", "test-cases/pom.xml"]
     if test_filter:
         public_test_args.append(f"-Dtest={test_filter}")
+    if shuffle_seed is not None:
+        public_test_args.extend(["-Dsurefire.runOrder=random", f"-Dsurefire.runOrder.random.seed={shuffle_seed}"])
     public_test_args.append("test")
     public_result = run_maven_command(root, public_test_args, timeout * 2)
     gate["public_tests"] = "PASS" if public_result["passed"] else "FAIL"
@@ -338,7 +347,7 @@ def run_full_gate_iteration(root: Path, timeout: int, test_filter: str | None) -
 
 
 def run_stability(root: Path, runs: int, timeout: int, test_filter: str | None,
-                  mode: str = "full-gate") -> dict[str, Any]:
+                  mode: str = "full-gate", shuffle: bool = False) -> dict[str, Any]:
     """Run stability verification.
 
     FSM-DESIGN §8: Each run outputs test matrix; multi-run matrices compared to
@@ -358,7 +367,7 @@ def run_stability(root: Path, runs: int, timeout: int, test_filter: str | None,
     if mode == "public-only":
         # Simple mode: only run public tests
         for i in range(1, runs + 1):
-            result = run_maven_test(root, timeout, test_filter)
+            result = run_maven_test(root, timeout, test_filter, shuffle_seed=i if shuffle else None)
             result["run_number"] = i
             parsed = parse_test_results(result.get("stdout_snippet", ""))
             result["test_summary"] = parsed
@@ -379,7 +388,7 @@ def run_stability(root: Path, runs: int, timeout: int, test_filter: str | None,
     else:
         # Full-gate mode
         for i in range(1, runs + 1):
-            gate = run_full_gate_iteration(root, timeout, test_filter)
+            gate = run_full_gate_iteration(root, timeout, test_filter, shuffle_seed=i if shuffle else None)
             gate["run"] = i
             gate_results.append(gate)
 
@@ -412,12 +421,14 @@ def run_stability(root: Path, runs: int, timeout: int, test_filter: str | None,
         "all_passed": all_passed,
         "has_intermittent_failures": has_intermittent,
         "mode": mode,
+        "shuffle": shuffle,
         "flaky_findings": flaky_findings,
         "matrix_flaky_count": len(matrix_flaky) if matrix_flaky else 0,
         "gate_results": gate_results,
     }
 
     runner.write_json(paths.work / "stability_report.json", report)
+    runner.write_json(matrix_dir / "stability_report.json", report)
 
     # Summary markdown
     lines = [
@@ -561,7 +572,8 @@ def main() -> int:
     paths = runner.RunnerPaths(root)
     runner.ensure_work_layout(paths)
 
-    report = run_stability(root, args.runs, args.timeout, args.test_filter, mode=args.mode)
+    test_filter = args.focused or args.test_filter
+    report = run_stability(root, args.runs, args.timeout, test_filter, mode=args.mode, shuffle=args.shuffle)
 
     if args.output:
         runner.write_json(Path(args.output), report)

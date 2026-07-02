@@ -27,6 +27,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
+from runtime_paths import checker_path, patch_path, review_path, script_path
+
 
 HTTP_METHODS = ("GET", "POST", "PUT", "DELETE", "PATCH")
 REQUIRED_COMPETITION_PATHS = [
@@ -178,6 +180,10 @@ class RunnerPaths:
     def test_matrix(self) -> Path:
         return self.work / "test_matrix"
 
+    @property
+    def progress(self) -> Path:
+        return self.work / "progress.jsonl"
+
 
 def find_maven_settings(root: Path) -> Path | None:
     env_value = os.environ.get("SHOPHUB_MAVEN_SETTINGS") or os.environ.get("MAVEN_SETTINGS")
@@ -256,6 +262,9 @@ def ensure_work_layout(paths: RunnerPaths) -> None:
         paths.test_results,
         paths.reports,
         paths.work / "snapshots",
+        paths.test_matrix,
+        paths.work / "checker_reports",
+        paths.work / "patch_prompts",
     ]:
         path.mkdir(parents=True, exist_ok=True)
 
@@ -329,6 +338,21 @@ def ensure_empty_runtime_files(paths: RunnerPaths) -> None:
         paths.work / "fix_plan.md": "# Fix Plan\n\nNo issues prioritized yet.\n",
         paths.work / "baseline_tests.md": "# Baseline Test Summary\n\nTests not run yet.\n",
         paths.work / "test_symptoms.jsonl": "",
+        paths.work / "progress.jsonl": "",
+        paths.work / "repair_tasks.jsonl": "",
+        paths.work / "candidate_patches.jsonl": "",
+        paths.work / "candidate_validation.jsonl": "",
+        paths.work / "reviewer_reports.jsonl": "",
+        paths.work / "feature_list.json": json.dumps(
+            {"generated_at": now_iso(), "features": [], "summary": {"total": 0, "p0_total": 0, "p0_passed": 0, "p1_total": 0, "p1_passed": 0}},
+            ensure_ascii=False,
+            indent=2,
+        ) + "\n",
+        paths.work / "goal_status.json": json.dumps(
+            {"done": False, "blocking_reasons": ["not evaluated"], "summary": {}},
+            ensure_ascii=False,
+            indent=2,
+        ) + "\n",
     }
     for path, content in defaults.items():
         if not path.exists():
@@ -1916,6 +1940,78 @@ def append_auto_log(paths: RunnerPaths, message: str) -> None:
         handle.write(f"[{now_iso()}] {message}\n")
 
 
+def append_progress(
+    paths: RunnerPaths,
+    phase: str,
+    action: str,
+    result: str,
+    task_id: str | None = None,
+    evidence: dict[str, Any] | None = None,
+    next_action: str | None = None,
+) -> None:
+    append_jsonl_record(
+        paths.progress,
+        {
+            "round": load_state(paths).get("round", 0),
+            "phase": phase,
+            "task_id": task_id or "",
+            "action": action,
+            "result": result,
+            "evidence": evidence or {},
+            "next_action": next_action or "",
+            "timestamp": now_iso(),
+        },
+    )
+
+
+def run_helper_script(root: Path, helper: Path, extra_args: list[str] | None = None, timeout: int = 300) -> dict[str, Any]:
+    paths = RunnerPaths(root)
+    cmd = [sys.executable, str(helper), "--root", str(root)]
+    if extra_args:
+        cmd.extend(extra_args)
+    log_name = f"helper-{helper.stem}-{stable_hash(' '.join(cmd), 6)}.log"
+    log_path = paths.work / "helper-logs" / log_name
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        completed = subprocess.run(
+            cmd,
+            cwd=root,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+            timeout=timeout,
+        )
+        write_text(log_path, completed.stdout)
+        result = {"command": cmd, "returncode": completed.returncode, "log": rel(root, log_path), "ok": completed.returncode == 0}
+    except subprocess.TimeoutExpired as exc:
+        output = exc.stdout if isinstance(exc.stdout, str) else ""
+        write_text(log_path, output + f"\nTIMEOUT after {timeout}s\n")
+        result = {"command": cmd, "returncode": 124, "log": rel(root, log_path), "ok": False, "timeout": True}
+    append_progress(
+        paths,
+        phase="helper",
+        action=f"run {helper.name}",
+        result="PASS" if result["ok"] else "FAIL",
+        evidence={"returncode": result["returncode"], "log": result["log"]},
+    )
+    return result
+
+
+def run_script_group(root: Path, phase: str, scripts: list[tuple[Path, list[str] | None, int]]) -> list[dict[str, Any]]:
+    paths = RunnerPaths(root)
+    append_progress(paths, phase=phase, action="start", result="PASS")
+    results = [run_helper_script(root, helper, extra_args=args, timeout=timeout) for helper, args, timeout in scripts]
+    append_progress(
+        paths,
+        phase=phase,
+        action="complete",
+        result="PASS" if all(item["ok"] for item in results) else "FAIL",
+        evidence={"failed": [Path(item["command"][1]).name for item in results if not item["ok"]]},
+    )
+    return results
+
+
 def open_issues_by_severity(root: Path) -> dict[str, list[dict[str, Any]]]:
     issues = read_jsonl(RunnerPaths(root).issues)
     open_issues = [issue for issue in issues if issue.get("status", "open") == "open"]
@@ -2293,13 +2389,11 @@ def run_until_done(
     patch_command: str | None,
     patch_timeout: int,
 ) -> None:
-    """Fallback-only continuous runner for runtimes WITHOUT subagent/Task support.
+    """Continuous runner that always builds the deterministic repair loop state.
 
-    The preferred path is the orchestrator's subagent fan-out (see
-    shophub-orchestrator.md). This loop cannot produce semantic issues on its
-    own — ``audit_inconsistencies`` only validates/dedups issues written by
-    subagents — so without an external ``--patch-command`` it stops at
-    ``patch_command_required``. Use only when the runtime has no Task tool.
+    If no external patch command is available, the runner still builds contracts,
+    rules, test matrix, issue queue, repair tasks, patch prompts, and final gate
+    status so a no-subagent runtime can continue from concrete artifacts.
     """
     paths = RunnerPaths(root)
     init_workspace(root)
@@ -2315,11 +2409,28 @@ def run_until_done(
     append_auto_log(paths, "auto-run started")
 
     extract_specs(root)
-    parse_api_baseline(root)
-    map_code(root)
-    run_baseline_tests(root, timeout=timeout, no_tests=no_tests)
+    build_rules_and_contracts(root)
+    scan_code_with_helpers(root)
+    run_deterministic_checkers(root)
+    run_baseline_matrix(root, timeout=timeout, no_tests=no_tests)
+    build_repair_queue(root)
     audit_inconsistencies(root)
     prioritize_issues(root)
+
+    if not patch_command:
+        final_report = run_guard_and_final_gate(root, timeout=timeout, no_tests=no_tests)
+        reason = "completed" if final_report.get("done") else "patch_prompts_ready"
+        append_auto_log(paths, f"stopping: {reason}")
+        save_state(
+            paths,
+            phase="WRITE_REPORT",
+            should_continue=False,
+            stop_reason=reason,
+            auto_run_finished_at=now_iso(),
+        )
+        generate_report(root)
+        append_auto_log(paths, "auto-run finished")
+        return
 
     while True:
         done, reason = done_decision(root, no_tests=no_tests)
@@ -2348,12 +2459,6 @@ def run_until_done(
 
         state = load_state(paths)
         round_no = int(state.get("round", 0))
-        if not patch_command:
-            reason = "patch_command_required"
-            append_auto_log(paths, f"stopping: {reason}")
-            save_state(paths, should_continue=False, stop_reason=reason, auto_run_finished_at=now_iso())
-            break
-
         patch_result = run_patch_command(root, patch_command, round_no, round_path, issue, patch_timeout)
         if patch_result["returncode"] != 0:
             finish_round(
@@ -2368,7 +2473,9 @@ def run_until_done(
             save_state(paths, should_continue=False, stop_reason=reason, auto_run_finished_at=now_iso())
             break
 
-        parse_api_baseline(root)
+        build_rules_and_contracts(root)
+        scan_code_with_helpers(root)
+        run_deterministic_checkers(root)
         state = load_state(paths)
         if not state.get("api_contract_safe", True):
             save_state(paths, consecutive_regressions=int(state.get("consecutive_regressions", 0)) + 1)
@@ -2400,10 +2507,13 @@ def run_until_done(
             save_state(paths, should_continue=False, stop_reason=stop_reason, auto_run_finished_at=now_iso())
             break
 
-        map_code(root)
+        run_helper_script(root, script_path("feature_registry.py"), None, timeout=180)
+        run_helper_script(root, script_path("repair_task_builder.py"), None, timeout=180)
+        run_helper_script(root, patch_path("patch_prompt_emitter.py"), None, timeout=180)
         audit_inconsistencies(root)
         prioritize_issues(root)
 
+    run_guard_and_final_gate(root, timeout=timeout, no_tests=no_tests)
     generate_report(root)
     append_auto_log(paths, "auto-run finished")
 
@@ -2441,6 +2551,102 @@ def _run_unmasking_gate_if_available(
             {"generated_at": now_iso(), "round": round_no, "error": str(exc)},
         )
         return None
+
+
+def build_rules_and_contracts(root: Path) -> None:
+    run_script_group(
+        root,
+        "BUILD_RULES",
+        [
+            (script_path("api_contract_builder.py"), None, 180),
+            (script_path("business_rule_builder.py"), None, 180),
+            (script_path("public_case_rule_builder.py"), None, 180),
+        ],
+    )
+
+
+def scan_code_with_helpers(root: Path) -> None:
+    run_script_group(
+        root,
+        "SCAN_CODE",
+        [
+            (script_path("spring_scanner.py"), None, 240),
+            (script_path("dto_analyzer.py"), None, 240),
+            (script_path("exception_analyzer.py"), None, 240),
+        ],
+    )
+    # Keep the legacy markdown/code_map.jsonl outputs available too.
+    map_code(root)
+
+
+def run_deterministic_checkers(root: Path) -> None:
+    run_script_group(
+        root,
+        "RUN_STATIC_CHECKERS",
+        [
+            (script_path("contract_checker.py"), ["--save-baseline"], 240),
+            (checker_path("money_formula_checker.py"), None, 180),
+            (checker_path("state_machine_checker.py"), None, 180),
+            (checker_path("clock_usage_checker.py"), None, 180),
+            (checker_path("failure_isolation_checker.py"), None, 180),
+            (checker_path("sorting_pagination_checker.py"), None, 180),
+        ],
+    )
+    paths = RunnerPaths(root)
+    consistency = read_json(paths.work / "consistency_report.json", {})
+    summary = consistency.get("summary", {})
+    p0 = int(summary.get("p0_issues", 0) or 0)
+    p1 = int(summary.get("p1_issues", 0) or 0)
+    save_state(paths, phase="RUN_STATIC_CHECKERS", api_contract_safe=p0 == 0)
+    append_progress(paths, "RUN_STATIC_CHECKERS", "contract status", "PASS" if p0 == 0 else "FAIL", evidence={"p0_issues": p0, "p1_issues": p1})
+
+
+def run_baseline_matrix(root: Path, timeout: int, no_tests: bool) -> None:
+    paths = RunnerPaths(root)
+    run_baseline_tests(root, timeout=timeout, no_tests=no_tests)
+    if not no_tests:
+        run_helper_script(root, script_path("blackbox_explorer.py"), ["--mode", "baseline", "--timeout", str(timeout)], timeout=max(timeout * 6, timeout + 60))
+    append_progress(paths, "RUN_BASELINE_MATRIX", "baseline matrix generated", "PASS" if (paths.test_matrix / "current_test_matrix.json").exists() else "FAIL")
+
+
+def build_repair_queue(root: Path) -> None:
+    paths = RunnerPaths(root)
+    run_script_group(
+        root,
+        "BUILD_REPAIR_QUEUE",
+        [
+            (script_path("feature_registry.py"), None, 180),
+            (script_path("rule_issue_builder.py"), None, 180),
+            (script_path("repair_task_builder.py"), None, 180),
+            (patch_path("patch_prompt_emitter.py"), None, 180),
+        ],
+    )
+    repair_tasks = read_jsonl(paths.work / "repair_tasks.jsonl")
+    append_progress(
+        paths,
+        "BUILD_REPAIR_QUEUE",
+        "repair queue ready",
+        "PASS" if repair_tasks else "REQUEUE",
+        evidence={"repair_tasks": len(repair_tasks)},
+        next_action="generate/apply candidate patches" if repair_tasks else "final gate",
+    )
+
+
+def run_guard_and_final_gate(root: Path, timeout: int, no_tests: bool) -> dict[str, Any]:
+    paths = RunnerPaths(root)
+    if not no_tests:
+        run_helper_script(root, script_path("forbidden_change_guard.py"), ["--strict"], timeout=120)
+        run_helper_script(root, review_path("hardcoding_guard.py"), None, timeout=120)
+    final = run_helper_script(root, script_path("final_goal_gate.py"), None, timeout=120)
+    report = read_json(paths.work / "final_goal_report.json", {})
+    append_progress(
+        paths,
+        "FINAL_GOAL_GATE",
+        "evaluate final goal",
+        "PASS" if final["ok"] else "FAIL",
+        evidence={"done": report.get("done"), "blocking_reasons": report.get("blocking_reasons", [])[:10]},
+    )
+    return report
 
 
 def command_status(root: Path) -> None:

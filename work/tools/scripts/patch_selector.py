@@ -46,6 +46,29 @@ def stability_score(stable_result: str | None) -> float:
     return 0.5
 
 
+def hard_filter_reason(candidate: dict[str, Any]) -> str:
+    """Return an elimination reason if the candidate fails non-negotiable gates."""
+    required_pass = {
+        "compile": "PASS",
+        "code_tests": "PASS",
+        "code_install": "PASS",
+        "forbidden_guard": "PASS",
+        "hardcoding_guard": "PASS",
+        "matrix_gate": "PASS",
+    }
+    for field, expected in required_pass.items():
+        value = candidate.get(field)
+        if value != expected:
+            return f"{field}={value or 'MISSING'} (required {expected})"
+    if str(candidate.get("contract_check", "")).startswith("FAIL") or candidate.get("contract_check") == "ERROR":
+        return f"contract_check={candidate.get('contract_check')}"
+    if candidate.get("hard_regression") is True:
+        return "hard_regression=true"
+    if candidate.get("elimination_reason"):
+        return str(candidate.get("elimination_reason"))
+    return ""
+
+
 def compute_score(candidate: dict[str, Any]) -> float:
     """Compute composite score for a candidate.
 
@@ -58,9 +81,10 @@ def compute_score(candidate: dict[str, Any]) -> float:
     """
     score_inputs = candidate.get("score_inputs", {})
 
-    public_rate = float(score_inputs.get("public_test_pass_rate", 0.0))
-    generated_rate = float(score_inputs.get("generated_test_pass_rate", 0.0))
-    contract_pass = float(score_inputs.get("contract_checker_pass", 0.0))
+    public_delta = float(score_inputs.get("public_test_delta", score_inputs.get("public_test_pass_rate", 0.0)))
+    rule_delta = float(score_inputs.get("rule_pass_delta", score_inputs.get("generated_test_pass_rate", 0.0)))
+    contract_score = float(score_inputs.get("contract_score", score_inputs.get("contract_checker_pass", 0.0)))
+    reviewer = float(score_inputs.get("reviewer_score", candidate.get("reviewer_score", 0.5) or 0.5))
     diff_files = int(score_inputs.get("diff_files", 0))
     diff_lines = int(score_inputs.get("diff_lines", 0))
     stable = score_inputs.get("stable")
@@ -69,11 +93,12 @@ def compute_score(candidate: dict[str, Any]) -> float:
     stab_score = stability_score(stable)
 
     return round(
-        0.40 * public_rate
-        + 0.25 * generated_rate
-        + 0.15 * contract_pass
-        + 0.10 * diff_score
-        + 0.10 * stab_score,
+        0.35 * public_delta
+        + 0.20 * rule_delta
+        + 0.15 * contract_score
+        + 0.10 * stab_score
+        + 0.10 * reviewer
+        + 0.10 * diff_score,
         4,
     )
 
@@ -102,8 +127,18 @@ def select_patch(root: Path, validation_file: str | None) -> dict[str, Any]:
             "selected": None,
         }
 
-    # Filter to eligible only
-    eligible = [v for v in validations if v.get("eligible", False)]
+    hard_filtered: list[dict[str, Any]] = []
+    rejected_by_hard_filter: list[dict[str, Any]] = []
+    for validation in validations:
+        reason = hard_filter_reason(validation)
+        if reason:
+            rejected = dict(validation)
+            rejected["hard_filter_reason"] = reason
+            rejected_by_hard_filter.append(rejected)
+            continue
+        hard_filtered.append(validation)
+
+    eligible = [v for v in hard_filtered if v.get("eligible", False) or not v.get("elimination_reason")]
 
     if not eligible:
         return {
@@ -111,6 +146,14 @@ def select_patch(root: Path, validation_file: str | None) -> dict[str, Any]:
             "reason": "No candidates passed validation",
             "selected": None,
             "eliminated_count": len(validations),
+            "hard_filter_rejections": [
+                {
+                    "task_id": r.get("task_id", ""),
+                    "candidate_id": r.get("candidate_id", ""),
+                    "reason": r.get("hard_filter_reason", ""),
+                }
+                for r in rejected_by_hard_filter
+            ],
         }
 
     # Score all eligible candidates
@@ -127,11 +170,18 @@ def select_patch(root: Path, validation_file: str | None) -> dict[str, Any]:
             "public_test_pass_rate": candidate.get("score_inputs", {}).get("public_test_pass_rate", 0),
             "generated_test_pass_rate": candidate.get("score_inputs", {}).get("generated_test_pass_rate", 0),
             "contract_checker_pass": candidate.get("score_inputs", {}).get("contract_checker_pass", 0),
+            "public_test_delta": candidate.get("score_inputs", {}).get("public_test_delta", candidate.get("score_inputs", {}).get("public_test_pass_rate", 0)),
+            "rule_pass_delta": candidate.get("score_inputs", {}).get("rule_pass_delta", candidate.get("score_inputs", {}).get("generated_test_pass_rate", 0)),
+            "reviewer_score": candidate.get("score_inputs", {}).get("reviewer_score", candidate.get("reviewer_score", 0.5)),
             "diff_files": candidate.get("diff_files", 0),
             "diff_lines": candidate.get("diff_lines", 0),
             "compile": candidate.get("compile", "UNKNOWN"),
             "code_tests": candidate.get("code_tests", "UNKNOWN"),
+            "code_install": candidate.get("code_install", "UNKNOWN"),
             "public_tests": candidate.get("public_tests", "UNKNOWN"),
+            "forbidden_guard": candidate.get("forbidden_guard", "UNKNOWN"),
+            "hardcoding_guard": candidate.get("hardcoding_guard", "UNKNOWN"),
+            "matrix_gate": candidate.get("matrix_gate", "UNKNOWN"),
         })
 
     # Sort by score descending
@@ -175,6 +225,14 @@ def select_patch(root: Path, validation_file: str | None) -> dict[str, Any]:
             for fb in fallbacks
         ],
         "selection_details": scored,
+        "hard_filter_rejections": [
+            {
+                "task_id": r.get("task_id", ""),
+                "candidate_id": r.get("candidate_id", ""),
+                "reason": r.get("hard_filter_reason", ""),
+            }
+            for r in rejected_by_hard_filter
+        ],
     }
     if warnings:
         selected["warnings"] = warnings
@@ -197,17 +255,24 @@ def select_patch(root: Path, validation_file: str | None) -> dict[str, Any]:
         "",
         "## All Candidates (ranked)",
         "",
-        "| Rank | Candidate | Score | Public | Generated | Contract | Diff | Compile |",
-        "|------|-----------|-------|--------|-----------|----------|------|---------|",
+        "| Rank | Candidate | Score | Public Delta | Rule Delta | Contract | Diff | Compile | Guards |",
+        "|------|-----------|-------|--------------|------------|----------|------|---------|--------|",
     ]
     for rank, c in enumerate(scored, 1):
         lines.append(
             f"| {rank} | {c['candidate_id']} | {c['score']:.4f} | "
-            f"{c['public_test_pass_rate']:.2f} | {c['generated_test_pass_rate']:.2f} | "
+            f"{c['public_test_delta']:.2f} | {c['rule_pass_delta']:.2f} | "
             f"{c['contract_checker_pass']:.2f} | {c['diff_files']}/{c['diff_lines']} | "
-            f"{c['compile']} |"
+            f"{c['compile']} | forbidden={c.get('forbidden_guard', 'PASS')} hardcoding={c.get('hardcoding_guard', 'UNKNOWN')} |"
         )
     lines.append("")
+
+    if rejected_by_hard_filter:
+        lines.append("## Hard Filter Rejections")
+        lines.append("")
+        for r in rejected_by_hard_filter:
+            lines.append(f"- **{r.get('candidate_id', '')}**: {r.get('hard_filter_reason', '')}")
+        lines.append("")
 
     if fallbacks:
         lines.append("## Fallbacks")

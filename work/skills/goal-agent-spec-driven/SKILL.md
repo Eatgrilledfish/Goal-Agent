@@ -48,10 +48,18 @@ Phase 3: Build Trace Matrix + Static Consistency Check
 Phase 4: Generate Spec-Driven Tests
 Phase 5: Baseline Test Run
 Phase 6: Localize & Prioritize Repair Tasks
-Phase 7: Fix Loop (per task: generate candidates → sandbox → score → apply)
-Phase 8: Stability Gate (3x rerun + contract re-check + forbidden-change guard)
-Phase 9: Report & Deliver
+Phase 7: Spec-Verified Repair Loop (prompt/candidates → sandbox → fresh review → selector → unmasking)
+Phase 8: Stability Loop (3x/5x rerun, focused/shuffle, flaky-to-task)
+Phase 9: Final Goal Gate + Report & Deliver
 ```
+
+In no-subagent runtimes, run:
+
+```bash
+python3 <SUBMISSION_ROOT>/work/tools/scripts/shophub_goal_runner.py --root $PROJECT_ROOT auto-run --max-rounds 10
+```
+
+This must generate `.agent-work/feature_list.json`, `.agent-work/progress.jsonl`, `.agent-work/issues.jsonl`, `.agent-work/repair_tasks.jsonl`, `.agent-work/patch_prompts/*.md`, `.agent-work/goal_status.json`, and `.agent-work/final_goal_report.json` even when no patch command is available.
 
 ## Competition Layout
 
@@ -211,11 +219,12 @@ Each task gets 3-5 candidates:
 For each candidate:
 1. Apply to isolated workspace (git worktree or `.tmp/candidates/TASK-XXX/candidate-N/`)
 2. Run compile check: `mvn -s maven-settings.xml -f code/pom.xml compile`
-3. Run contract checker: `python3 work/tools/scripts/contract_checker.py --root $SANDBOX`
-4. Run forbidden-change guard: `python3 work/tools/scripts/forbidden_change_guard.py --root $SANDBOX`
-5. Run public tests: `mvn -s maven-settings.xml -f test-cases/pom.xml test`
-6. Run generated tests: compile to `src/test/java/generated/`, run, then clean up
-7. Record results in `.agent-work/candidate_patches.jsonl`
+3. Run contract checker from the submission package: `python3 <SUBMISSION_ROOT>/work/tools/scripts/contract_checker.py --root $SANDBOX`
+4. Run forbidden-change guard from the submission package: `python3 <SUBMISSION_ROOT>/work/tools/scripts/forbidden_change_guard.py --root $SANDBOX`
+5. Run hardcoding guard from the submission package: `python3 <SUBMISSION_ROOT>/work/tools/scripts/review/hardcoding_guard.py --root $SANDBOX`
+6. Run public tests: `mvn -s maven-settings.xml -f test-cases/pom.xml test`
+7. Run generated tests: compile to `src/test/java/generated/`, run, then clean up
+8. Record results in `.agent-work/candidate_validation.jsonl`
 
 ### Step 7.3: Score and select best candidate
 Score each candidate:
@@ -266,6 +275,8 @@ python3 work/tools/scripts/shophub_goal_runner.py --root $PROJECT_ROOT finish-ro
 ### Step 8.1: Stability rerun
 ```bash
 python3 work/tools/scripts/stability_runner.py --root $PROJECT_ROOT --runs 3
+python3 work/tools/scripts/stability_runner.py --root $PROJECT_ROOT --runs 5 --shuffle
+python3 work/tools/scripts/stability_runner.py --root $PROJECT_ROOT --focused <Class#method>
 ```
 Requirement: ALL 3 runs must pass.
 
@@ -281,7 +292,13 @@ python3 work/tools/scripts/contract_checker.py --root $PROJECT_ROOT
 ```
 Requirement: ZERO P0 issues.
 
-### Step 8.4: Invoke stability-verifier
+### Step 8.4: Final goal gate
+```bash
+python3 work/tools/scripts/final_goal_gate.py --root $PROJECT_ROOT
+```
+Requirement: returns 0. This is the only machine-accepted DONE signal.
+
+### Step 8.5: Invoke stability-verifier
 Call `stability-verifier` subagent to:
 - Analyze flaky indicators across runs
 - Verify no regression from baseline
@@ -338,13 +355,31 @@ All under `work/tools/scripts/`:
 | `shophub_goal_runner.py` | All | Core runner: init, specs, API, map, tests, audit, prioritize, report |
 | `api_contract_builder.py` | 1 | Extract REST endpoints from markdown |
 | `business_rule_builder.py` | 1 | Extract business rules from design-docs |
+| `public_case_rule_builder.py` | 1 | Convert public symptoms into generalized business rules |
+| `feature_registry.py` | 1-9 | Maintain external feature pass/fail memory |
 | `spring_scanner.py` | 2 | Scan Spring Boot code → repo_map.json |
 | `dto_analyzer.py` | 2 | DTO validation coverage analysis |
 | `exception_analyzer.py` | 2 | ExceptionHandler coverage analysis |
 | `contract_checker.py` | 3 | Deterministic API contract consistency check |
+| `checkers/money_formula_checker.py` | 3 | Money formula risk detection |
+| `checkers/state_machine_checker.py` | 3 | State-machine and state-guard detection |
+| `checkers/clock_usage_checker.py` | 3 | Direct system clock usage detection |
+| `checkers/failure_isolation_checker.py` | 3 | Post-action failure isolation detection |
+| `checkers/sorting_pagination_checker.py` | 3 | Stable ordering and pagination detection |
 | `spec_test_generator.py` | 4 | Generate MockMvc tests from contracts |
+| `blackbox_explorer.py` | 5,7 | Suite/class/method/sweep/focused/shuffle matrix exploration |
+| `rule_issue_builder.py` | 6 | Convert rules/checkers/matrix into issues.jsonl |
+| `repair_task_builder.py` | 6 | Build repair_tasks.json and repair_tasks.jsonl |
+| `patch/patch_prompt_emitter.py` | 7 | Emit patch prompts for no-subagent repair |
+| `candidate_sandbox.py` | 7 | Validate candidate patches in isolated workspaces |
+| `patch_selector.py` | 7 | Hard-filter and score candidate patches |
+| `review/fresh_context_review.py` | 7 | Fresh-context diff review scaffold |
+| `review/hardcoding_guard.py` | 7,8 | Detect public fixture hardcoding risks |
+| `unmasking_gate.py` | 7 | Detect newly exposed failures after patch application |
+| `flaky_to_repair_tasks.py` | 8 | Convert stability findings into repair tasks |
 | `forbidden_change_guard.py` | 7,8 | Forbidden change detection |
 | `stability_runner.py` | 8 | Multi-run stability verification |
+| `final_goal_gate.py` | 9 | Machine-checkable DONE gate |
 | `api_snapshot.py` | util | API snapshot generation |
 | `issue_queue.py` | util | Issue queue management |
 | `round_recorder.py` | util | Round start/finish |
@@ -393,6 +428,8 @@ DONE requires ALL of:
 - `python3 work/tools/scripts/stability_runner.py --runs 3` passes
 - `python3 work/tools/scripts/forbidden_change_guard.py --strict` passes
 - `python3 work/tools/scripts/contract_checker.py` has zero P0 issues
+- `python3 work/tools/scripts/review/hardcoding_guard.py` passes
+- `python3 work/tools/scripts/final_goal_gate.py` returns 0
 - API baseline remains compatible
 - `修复报告.md` exists in PROJECT_ROOT
 - `result/output.md` exists in SUBMISSION_ROOT
