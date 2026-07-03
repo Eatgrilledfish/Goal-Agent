@@ -35,9 +35,9 @@ Your job is to scan the `code/` directory of the target project and produce a co
 ### 1. Run deterministic scanners
 
 ```
-python3 work/tools/scripts/spring_scanner.py --root $PROJECT_ROOT
-python3 work/tools/scripts/dto_analyzer.py --root $PROJECT_ROOT
-python3 work/tools/scripts/exception_analyzer.py --root $PROJECT_ROOT
+python3 <SUBMISSION_ROOT>/work/tools/scripts/spring_scanner.py --root $PROJECT_ROOT
+python3 <SUBMISSION_ROOT>/work/tools/scripts/dto_analyzer.py --root $PROJECT_ROOT
+python3 <SUBMISSION_ROOT>/work/tools/scripts/exception_analyzer.py --root $PROJECT_ROOT
 ```
 
 These scripts produce the JSON artifacts. After running them, read and validate the outputs.

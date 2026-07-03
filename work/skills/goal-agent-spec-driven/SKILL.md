@@ -79,7 +79,7 @@ maven-settings.xml  ← internal Maven mirror config
 
 **Deterministic steps** (run via Bash):
 ```bash
-python3 work/tools/scripts/shophub_goal_runner.py --root $PROJECT_ROOT init
+python3 <SUBMISSION_ROOT>/work/tools/scripts/shophub_goal_runner.py --root $PROJECT_ROOT init
 ```
 
 **Verify**:
@@ -94,8 +94,8 @@ python3 work/tools/scripts/shophub_goal_runner.py --root $PROJECT_ROOT init
 
 ### Step 1.1: Run deterministic extractors
 ```bash
-python3 work/tools/scripts/api_contract_builder.py --root $PROJECT_ROOT
-python3 work/tools/scripts/business_rule_builder.py --root $PROJECT_ROOT
+python3 <SUBMISSION_ROOT>/work/tools/scripts/api_contract_builder.py --root $PROJECT_ROOT
+python3 <SUBMISSION_ROOT>/work/tools/scripts/business_rule_builder.py --root $PROJECT_ROOT
 ```
 
 ### Step 1.2: Invoke contract-builder subagent
@@ -114,9 +114,9 @@ Call `contract-builder` to semantically enrich:
 
 ### Step 2.1: Run deterministic scanners
 ```bash
-python3 work/tools/scripts/spring_scanner.py --root $PROJECT_ROOT
-python3 work/tools/scripts/dto_analyzer.py --root $PROJECT_ROOT
-python3 work/tools/scripts/exception_analyzer.py --root $PROJECT_ROOT
+python3 <SUBMISSION_ROOT>/work/tools/scripts/spring_scanner.py --root $PROJECT_ROOT
+python3 <SUBMISSION_ROOT>/work/tools/scripts/dto_analyzer.py --root $PROJECT_ROOT
+python3 <SUBMISSION_ROOT>/work/tools/scripts/exception_analyzer.py --root $PROJECT_ROOT
 ```
 
 ### Step 2.2: Invoke code-analyzer subagent
@@ -135,7 +135,7 @@ Call `code-analyzer` to enrich:
 
 ### Step 3.1: Run deterministic checker
 ```bash
-python3 work/tools/scripts/contract_checker.py --root $PROJECT_ROOT
+python3 <SUBMISSION_ROOT>/work/tools/scripts/contract_checker.py --root $PROJECT_ROOT
 ```
 
 ### Step 3.2: Invoke consistency-checker subagent
@@ -155,7 +155,7 @@ Call `consistency-checker` to:
 
 ### Step 4.1: Run test generator
 ```bash
-python3 work/tools/scripts/spec_test_generator.py --root $PROJECT_ROOT
+python3 <SUBMISSION_ROOT>/work/tools/scripts/spec_test_generator.py --root $PROJECT_ROOT
 ```
 
 This generates tests covering:
@@ -173,7 +173,7 @@ This generates tests covering:
 **Goal**: Run public black-box tests to establish baseline pass/fail state.
 
 ```bash
-python3 work/tools/scripts/shophub_goal_runner.py --root $PROJECT_ROOT baseline-tests
+python3 <SUBMISSION_ROOT>/work/tools/scripts/shophub_goal_runner.py --root $PROJECT_ROOT baseline-tests
 ```
 
 Or directly:
@@ -196,7 +196,7 @@ Save test symptoms to `.agent-work/test_symptoms.jsonl`.
 - Prioritize: P0 (API contract, validation, error codes) → P1 (pagination, sorting, defaults) → P2 (style, logs)
 
 ```bash
-python3 work/tools/scripts/shophub_goal_runner.py --root $PROJECT_ROOT prioritize
+python3 <SUBMISSION_ROOT>/work/tools/scripts/shophub_goal_runner.py --root $PROJECT_ROOT prioritize
 ```
 
 ## Phase 7: Fix Loop
@@ -244,8 +244,8 @@ Select the candidate with the highest score. If tie, prefer minimal diff.
 Apply the selected patch to the main workspace.
 Run API contract re-check:
 ```bash
-python3 work/tools/scripts/api_contract_builder.py --root $PROJECT_ROOT
-python3 work/tools/scripts/contract_checker.py --root $PROJECT_ROOT
+python3 <SUBMISSION_ROOT>/work/tools/scripts/api_contract_builder.py --root $PROJECT_ROOT
+python3 <SUBMISSION_ROOT>/work/tools/scripts/contract_checker.py --root $PROJECT_ROOT
 ```
 If API contract violated → REJECT and try next-best candidate.
 
@@ -258,7 +258,7 @@ Call `shophub-review-agent` to review the applied patch:
 
 ### Step 7.6: Record round
 ```bash
-python3 work/tools/scripts/shophub_goal_runner.py --root $PROJECT_ROOT finish-round \
+python3 <SUBMISSION_ROOT>/work/tools/scripts/shophub_goal_runner.py --root $PROJECT_ROOT finish-round \
   --round N --result PASS --tests "focused tests passed"
 ```
 
@@ -274,27 +274,27 @@ python3 work/tools/scripts/shophub_goal_runner.py --root $PROJECT_ROOT finish-ro
 
 ### Step 8.1: Stability rerun
 ```bash
-python3 work/tools/scripts/stability_runner.py --root $PROJECT_ROOT --runs 3
-python3 work/tools/scripts/stability_runner.py --root $PROJECT_ROOT --runs 5 --shuffle
-python3 work/tools/scripts/stability_runner.py --root $PROJECT_ROOT --focused <Class#method>
+python3 <SUBMISSION_ROOT>/work/tools/scripts/stability_runner.py --root $PROJECT_ROOT --runs 3
+python3 <SUBMISSION_ROOT>/work/tools/scripts/stability_runner.py --root $PROJECT_ROOT --runs 5 --shuffle
+python3 <SUBMISSION_ROOT>/work/tools/scripts/stability_runner.py --root $PROJECT_ROOT --focused <Class#method>
 ```
 Requirement: ALL 3 runs must pass.
 
 ### Step 8.2: Final forbidden-change guard
 ```bash
-python3 work/tools/scripts/forbidden_change_guard.py --root $PROJECT_ROOT --strict
+python3 <SUBMISSION_ROOT>/work/tools/scripts/forbidden_change_guard.py --root $PROJECT_ROOT --strict
 ```
 Requirement: ZERO blockers, ZERO warnings (in strict mode).
 
 ### Step 8.3: Final contract check
 ```bash
-python3 work/tools/scripts/contract_checker.py --root $PROJECT_ROOT
+python3 <SUBMISSION_ROOT>/work/tools/scripts/contract_checker.py --root $PROJECT_ROOT
 ```
 Requirement: ZERO P0 issues.
 
 ### Step 8.4: Final goal gate
 ```bash
-python3 work/tools/scripts/final_goal_gate.py --root $PROJECT_ROOT
+python3 <SUBMISSION_ROOT>/work/tools/scripts/final_goal_gate.py --root $PROJECT_ROOT
 ```
 Requirement: returns 0. This is the only machine-accepted DONE signal.
 
@@ -308,7 +308,7 @@ Call `stability-verifier` subagent to:
 
 ### Step 9.1: Generate reports
 ```bash
-python3 work/tools/scripts/shophub_goal_runner.py --root $PROJECT_ROOT report
+python3 <SUBMISSION_ROOT>/work/tools/scripts/shophub_goal_runner.py --root $PROJECT_ROOT report
 ```
 
 ### Step 9.2: Invoke shophub-report-writer
@@ -425,11 +425,11 @@ DONE requires ALL of:
 - `mvn -s maven-settings.xml -f code/pom.xml test` passes
 - `mvn -s maven-settings.xml -f code/pom.xml install -DskipTests` passes
 - `mvn -s maven-settings.xml -f test-cases/pom.xml test` passes (or remaining failures documented with design-backed risk)
-- `python3 work/tools/scripts/stability_runner.py --runs 3` passes
-- `python3 work/tools/scripts/forbidden_change_guard.py --strict` passes
-- `python3 work/tools/scripts/contract_checker.py` has zero P0 issues
-- `python3 work/tools/scripts/review/hardcoding_guard.py` passes
-- `python3 work/tools/scripts/final_goal_gate.py` returns 0
+- `python3 <SUBMISSION_ROOT>/work/tools/scripts/stability_runner.py --root $PROJECT_ROOT --runs 3` passes
+- `python3 <SUBMISSION_ROOT>/work/tools/scripts/forbidden_change_guard.py --root $PROJECT_ROOT --strict` passes
+- `python3 <SUBMISSION_ROOT>/work/tools/scripts/contract_checker.py --root $PROJECT_ROOT` has zero P0 issues
+- `python3 <SUBMISSION_ROOT>/work/tools/scripts/review/hardcoding_guard.py --root $PROJECT_ROOT` passes
+- `python3 <SUBMISSION_ROOT>/work/tools/scripts/final_goal_gate.py --root $PROJECT_ROOT` returns 0
 - API baseline remains compatible
 - `修复报告.md` exists in PROJECT_ROOT
 - `result/output.md` exists in SUBMISSION_ROOT

@@ -27,7 +27,7 @@ Your job is to verify that applied patches are correct, stable, and don't violat
 
 - `.agent-work/forbidden_change_report.json` — forbidden-change guard result
 - `.agent-work/stability_report.json` — stability rerun result
-- `.agent-work/validation_results.jsonl` — per-round validation record
+- `.agent-work/candidate_validation.jsonl` — per-candidate validation record
 - `.agent-work/07_forbidden_change_report.md` — human-readable guard report
 - `.agent-work/08_stability_report.md` — human-readable stability report
 
@@ -35,7 +35,7 @@ Your job is to verify that applied patches are correct, stable, and don't violat
 
 ### Gate 1: Forbidden Change Guard (BLOCKER if fail)
 ```bash
-python3 work/tools/scripts/forbidden_change_guard.py --root $PROJECT_ROOT --strict
+python3 <SUBMISSION_ROOT>/work/tools/scripts/forbidden_change_guard.py --root $PROJECT_ROOT --strict
 ```
 **Pass condition**: Zero blockers, zero warnings.
 **If failed**: REJECT the patch immediately. Do not proceed to further gates.
@@ -48,8 +48,8 @@ Common failures and fixes:
 
 ### Gate 2: API Contract Re-Check (BLOCKER if P0 issues)
 ```bash
-python3 work/tools/scripts/api_contract_builder.py --root $PROJECT_ROOT
-python3 work/tools/scripts/contract_checker.py --root $PROJECT_ROOT
+python3 <SUBMISSION_ROOT>/work/tools/scripts/api_contract_builder.py --root $PROJECT_ROOT
+python3 <SUBMISSION_ROOT>/work/tools/scripts/contract_checker.py --root $PROJECT_ROOT
 ```
 **Pass condition**: Zero P0 issues. P1 issues are warnings.
 **If failed**: The patch broke the API contract. Reject and try the next-best candidate.
@@ -87,7 +87,7 @@ If `.tmp/generated-tests/` exists:
 
 ### Gate 5: Stability Rerun (BLOCKER if flaky)
 ```bash
-python3 work/tools/scripts/stability_runner.py --root $PROJECT_ROOT --runs 3
+python3 <SUBMISSION_ROOT>/work/tools/scripts/stability_runner.py --root $PROJECT_ROOT --runs 3
 ```
 **Pass condition**: All 3 runs pass identically. No intermittent failures.
 **If failed**: Analyze for flaky indicators:
@@ -138,7 +138,7 @@ score = 40% * public_test_pass_rate
       + 10% * stability_score (3/3 = 100%, 2/3 = 67%, 1/3 = 33%)
 ```
 
-Record the score in `.agent-work/validation_results.jsonl`.
+Record the score in `.agent-work/candidate_validation.jsonl`.
 
 ## Decision
 

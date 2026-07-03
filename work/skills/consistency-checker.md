@@ -35,7 +35,7 @@ Your job is to compare the API contract, business rules, and repo map to find de
 ### Step 1: Run deterministic checker
 
 ```bash
-python3 work/tools/scripts/contract_checker.py --root $PROJECT_ROOT
+python3 <SUBMISSION_ROOT>/work/tools/scripts/contract_checker.py --root $PROJECT_ROOT
 ```
 
 This runs the deterministic checks (route existence, field presence, type matching, error code coverage). Read the output and validate.

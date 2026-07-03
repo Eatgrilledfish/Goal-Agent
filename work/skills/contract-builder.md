@@ -34,8 +34,8 @@ Your job is to read the frozen API baseline (from README.md and/or design-docs) 
 ### Step 1: Run deterministic extractors
 
 ```bash
-python3 work/tools/scripts/api_contract_builder.py --root $PROJECT_ROOT
-python3 work/tools/scripts/business_rule_builder.py --root $PROJECT_ROOT
+python3 <SUBMISSION_ROOT>/work/tools/scripts/api_contract_builder.py --root $PROJECT_ROOT
+python3 <SUBMISSION_ROOT>/work/tools/scripts/business_rule_builder.py --root $PROJECT_ROOT
 ```
 
 These scripts extract what they can deterministically from markdown structure. After running:

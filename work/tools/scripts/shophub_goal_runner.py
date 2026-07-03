@@ -33,9 +33,9 @@ from runtime_paths import checker_path, patch_path, review_path, script_path
 HTTP_METHODS = ("GET", "POST", "PUT", "DELETE", "PATCH")
 REQUIRED_COMPETITION_PATHS = [
     "README.md",
-    "code",
+    "code/pom.xml",
     "design-docs",
-    "test-cases",
+    "test-cases/pom.xml",
 ]
 AGENT_NAMES = [
     "spec-librarian",
@@ -289,6 +289,30 @@ def git_status(root: Path) -> str:
         return f"git status unavailable: {exc}"
 
 
+def maven_version_status(root: Path) -> dict[str, Any]:
+    try:
+        completed = subprocess.run(
+            ["mvn", "-version"],
+            cwd=root,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+            timeout=30,
+        )
+        return {
+            "available": completed.returncode == 0,
+            "returncode": completed.returncode,
+            "output": completed.stdout.strip()[:4000],
+        }
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {
+            "available": False,
+            "returncode": 127,
+            "output": f"mvn -version unavailable: {exc}",
+        }
+
+
 def init_workspace(root: Path) -> dict[str, Any]:
     paths = RunnerPaths(root)
     ensure_work_layout(paths)
@@ -301,6 +325,7 @@ def init_workspace(root: Path) -> dict[str, Any]:
             "phase": "INIT",
             "missing_required_paths": missing,
             "git_status_at_init": git_status(root),
+            "maven_version_at_init": maven_version_status(root),
             "should_continue": True,
             "stop_reason": "missing_competition_inputs" if missing else None,
             "updated_at": now_iso(),
@@ -1749,7 +1774,15 @@ def generate_report(root: Path) -> Path:
     write_text(report_path, report)
     write_text(work_report_path, report)
     write_text(source_path, report)
-    save_state(paths, phase="DONE", should_continue=False, stop_reason=state.get("stop_reason") or "report_generated")
+    final_report = read_json(paths.work / "final_goal_report.json", {})
+    goal_status = read_json(paths.work / "goal_status.json", {})
+    is_done = final_report.get("done") is True or goal_status.get("done") is True
+    save_state(
+        paths,
+        phase="DONE" if is_done else "WRITE_REPORT",
+        should_continue=False,
+        stop_reason=state.get("stop_reason") or ("completed_all_gates_passed" if is_done else "report_generated"),
+    )
     return report_path
 
 
@@ -2396,17 +2429,32 @@ def run_until_done(
     status so a no-subagent runtime can continue from concrete artifacts.
     """
     paths = RunnerPaths(root)
-    init_workspace(root)
+    initial_state = init_workspace(root)
+    missing_inputs = list(initial_state.get("missing_required_paths") or [])
     save_state(
         paths,
         phase="INIT",
         max_rounds=max_rounds,
         should_continue=True,
-        stop_reason=None,
+        stop_reason="missing_competition_inputs" if missing_inputs else None,
         auto_run_started_at=now_iso(),
         auto_run_finished_at=None,
     )
     append_auto_log(paths, "auto-run started")
+
+    if missing_inputs:
+        append_auto_log(paths, "stopping: missing_competition_inputs")
+        save_state(
+            paths,
+            phase="WRITE_REPORT",
+            should_continue=False,
+            stop_reason="missing_competition_inputs",
+            auto_run_finished_at=now_iso(),
+        )
+        generate_report(root)
+        run_final_goal_gate(root)
+        append_auto_log(paths, "auto-run finished")
+        return
 
     extract_specs(root)
     build_rules_and_contracts(root)
@@ -2632,13 +2680,18 @@ def build_repair_queue(root: Path) -> None:
     )
 
 
-def run_guard_and_final_gate(root: Path, timeout: int, no_tests: bool) -> dict[str, Any]:
+def run_final_goal_gate(root: Path) -> dict[str, Any]:
     paths = RunnerPaths(root)
-    if not no_tests:
-        run_helper_script(root, script_path("forbidden_change_guard.py"), ["--strict"], timeout=120)
-        run_helper_script(root, review_path("hardcoding_guard.py"), None, timeout=120)
     final = run_helper_script(root, script_path("final_goal_gate.py"), None, timeout=120)
     report = read_json(paths.work / "final_goal_report.json", {})
+    state = load_state(paths)
+    is_done = report.get("done") is True
+    save_state(
+        paths,
+        phase="DONE" if is_done else "WRITE_REPORT",
+        should_continue=False,
+        stop_reason=state.get("stop_reason") or ("completed_all_gates_passed" if is_done else "final_goal_gate_failed"),
+    )
     append_progress(
         paths,
         "FINAL_GOAL_GATE",
@@ -2647,6 +2700,17 @@ def run_guard_and_final_gate(root: Path, timeout: int, no_tests: bool) -> dict[s
         evidence={"done": report.get("done"), "blocking_reasons": report.get("blocking_reasons", [])[:10]},
     )
     return report
+
+
+def run_guard_and_final_gate(root: Path, timeout: int, no_tests: bool) -> dict[str, Any]:
+    if not no_tests:
+        run_helper_script(root, script_path("forbidden_change_guard.py"), ["--strict"], timeout=120)
+        run_helper_script(root, review_path("hardcoding_guard.py"), None, timeout=120)
+    # final_goal_gate.py validates that 修复报告.md already exists. Generate the
+    # report before the machine gate so final_goal_report.json reflects the
+    # actual deliverable set, not a transient pre-report state.
+    generate_report(root)
+    return run_final_goal_gate(root)
 
 
 def command_status(root: Path) -> None:
