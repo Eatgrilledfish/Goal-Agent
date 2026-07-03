@@ -1,6 +1,6 @@
 ---
 name: goal-agent-spec-driven
-description: Spec-driven design-implementation consistency repair. Builds API contracts from frozen baseline, scans Spring Boot code, builds trace matrix, runs static checks, generates tests, produces multi-candidate patches with sandbox validation, enforces forbidden-change guard, and verifies stability.
+description: Spec-driven design-implementation consistency repair. Builds API contracts from frozen baseline, scans Spring Boot code, builds trace matrix, runs static checks, generates tests, coordinates minimal patch-agent repairs with focused validation, enforces forbidden-change guard, and verifies stability.
 ---
 
 # Goal Agent — Spec-Driven Pipeline
@@ -38,6 +38,23 @@ The frozen API baseline is identified semantically from:
 
 Use the target repository files listed above as the complete required competition inputs.
 
+## Runtime Assumption
+
+The competition platform and local validation environment both support subagent/Task invocation.
+
+Therefore, the primary and only supported competition execution model is:
+
+```text
+INSTRUCTION.md
+  -> goal-agent-spec-driven/SKILL.md
+  -> shophub-orchestrator
+  -> shophub-* subagents
+  -> deterministic helper scripts
+  -> final_goal_gate.py
+```
+
+Do not delegate the repair loop to `shophub_goal_runner.py`. The runner is a helper toolkit, not an autonomous repair actor.
+
 ## Pipeline Overview
 
 ```text
@@ -48,18 +65,10 @@ Phase 3: Build Trace Matrix + Static Consistency Check
 Phase 4: Generate Spec-Driven Tests
 Phase 5: Baseline Test Run
 Phase 6: Localize & Prioritize Repair Tasks
-Phase 7: Spec-Verified Repair Loop (prompt/candidates → sandbox → fresh review → selector → unmasking)
+Phase 7: Spec-Verified Repair Loop (patch-agent minimal fix → focused verification → review → public matrix → optional sandbox/selector → unmasking)
 Phase 8: Stability Loop (3x/5x rerun, focused/shuffle, flaky-to-task)
 Phase 9: Final Goal Gate + Report & Deliver
 ```
-
-In no-subagent runtimes, run:
-
-```bash
-python3 <SUBMISSION_ROOT>/work/tools/scripts/shophub_goal_runner.py --root $PROJECT_ROOT auto-run --max-rounds 10
-```
-
-This must generate `.agent-work/feature_list.json`, `.agent-work/progress.jsonl`, `.agent-work/issues.jsonl`, `.agent-work/repair_tasks.jsonl`, `.agent-work/patch_prompts/*.md`, `.agent-work/goal_status.json`, and `.agent-work/final_goal_report.json` even when no patch command is available.
 
 ## Competition Layout
 
@@ -201,62 +210,33 @@ python3 <SUBMISSION_ROOT>/work/tools/scripts/shophub_goal_runner.py --root $PROJ
 
 ## Phase 7: Fix Loop
 
-**Goal**: Repair one issue at a time, with multi-candidate generation and sandbox validation.
+**Goal**: Repair one issue at a time with minimal, design-backed code changes.
 
-### For each P0 repair task (then P1, then P2):
+### Default path
 
-### Step 7.1: Generate candidate patches
-Invoke `patch-generator` subagent for the current task.
+For each P0/P1 repair task:
 
-Each task gets 3-5 candidates:
-- **candidate-1**: Minimal DTO/annotation fix (preferred for validation issues)
-- **candidate-2**: Service-layer explicit validation
-- **candidate-3**: Controller + ExceptionHandler fix
-- **candidate-4**: Repository/query logic fix
-- **candidate-5**: Comprehensive fix (diff budget ≤ 50 lines)
+1. Invoke `shophub-patch-agent`.
+2. The patch agent restates the issue summary, design/API evidence, exact code location, API safety boundary, and expected verification.
+3. Apply the smallest necessary edit under `code/**`.
+4. Run focused verification when feasible.
+5. Run contract checker and forbidden-change guard.
+6. Invoke `shophub-review-agent`.
+7. Run public black-box matrix when the focused fix is accepted.
+8. Convert newly exposed failures into repair tasks.
 
-### Step 7.2: Sandbox validate each candidate
-For each candidate:
-1. Apply to isolated workspace (git worktree or `.tmp/candidates/TASK-XXX/candidate-N/`)
-2. Run compile check: `mvn -s maven-settings.xml -f code/pom.xml compile`
-3. Run contract checker from the submission package: `python3 <SUBMISSION_ROOT>/work/tools/scripts/contract_checker.py --root $SANDBOX`
-4. Run forbidden-change guard from the submission package: `python3 <SUBMISSION_ROOT>/work/tools/scripts/forbidden_change_guard.py --root $SANDBOX`
-5. Run hardcoding guard from the submission package: `python3 <SUBMISSION_ROOT>/work/tools/scripts/review/hardcoding_guard.py --root $SANDBOX`
-6. Run public tests: `mvn -s maven-settings.xml -f test-cases/pom.xml test`
-7. Run generated tests: compile to `src/test/java/generated/`, run, then clean up
-8. Record results in `.agent-work/candidate_validation.jsonl`
+### Optional candidate path
 
-### Step 7.3: Score and select best candidate
-Score each candidate:
-```text
-score = 40% * public_test_pass_rate
-      + 25% * generated_test_pass_rate
-      + 15% * contract_checker_pass (1 or 0)
-      + 10% * diff_minimization (fewer files/lines = higher)
-      + 10% * stability (consistent pass = higher)
-```
+Use `candidate_sandbox.py` and `patch_selector.py` only when:
 
-**Direct elimination**: modifies design-docs, API baseline, test code, swallows exceptions, returns 200 universally, hardcodes test data, fails to compile.
+- the issue is P0;
+- the first minimal patch fails;
+- there are multiple plausible repair strategies;
+- API compatibility risk is high.
 
-Select the candidate with the highest score. If tie, prefer minimal diff.
+The default competition path is one minimal patch per issue.
 
-### Step 7.4: Apply best candidate
-Apply the selected patch to the main workspace.
-Run API contract re-check:
-```bash
-python3 <SUBMISSION_ROOT>/work/tools/scripts/api_contract_builder.py --root $PROJECT_ROOT
-python3 <SUBMISSION_ROOT>/work/tools/scripts/contract_checker.py --root $PROJECT_ROOT
-```
-If API contract violated → REJECT and try next-best candidate.
-
-### Step 7.5: Invoke review
-Call `shophub-review-agent` to review the applied patch:
-- Does it follow the repair strategy?
-- Is it minimal?
-- Any side effects?
-- Risk assessment
-
-### Step 7.6: Record round
+### Record round
 ```bash
 python3 <SUBMISSION_ROOT>/work/tools/scripts/shophub_goal_runner.py --root $PROJECT_ROOT finish-round \
   --round N --result PASS --tests "focused tests passed"
@@ -331,7 +311,7 @@ Ensure `result/output.md` contains:
 - `contract-builder` — API contract + business rule extraction
 - `code-analyzer` — Spring Boot code scanning
 - `consistency-checker` — Static check + trace matrix
-- `patch-generator` — Multi-candidate patch generation
+- `patch-generator` — Optional candidate generation for high-risk repairs
 - `stability-verifier` — Validation + guard + stability
 
 ### Legacy (existing, preserved)
@@ -342,7 +322,7 @@ Ensure `result/output.md` contains:
 - `shophub-test-diagnoser` — test diagnosis
 - `shophub-module-auditor` — per-module audit
 - `shophub-cross-cut-auditor` — cross-module audit
-- `shophub-patch-agent` — single-issue patch execution (used as fallback)
+- `shophub-patch-agent` — primary code-editing actor; applies one minimal design-backed fix per issue
 - `shophub-review-agent` — patch review
 - `shophub-report-writer` — report generation
 
@@ -370,9 +350,8 @@ All under `work/tools/scripts/`:
 | `blackbox_explorer.py` | 5,7 | Suite/class/method/sweep/focused/shuffle matrix exploration |
 | `rule_issue_builder.py` | 6 | Convert rules/checkers/matrix into issues.jsonl |
 | `repair_task_builder.py` | 6 | Build repair_tasks.json and repair_tasks.jsonl |
-| `patch/patch_prompt_emitter.py` | 7 | Emit patch prompts for no-subagent repair |
-| `candidate_sandbox.py` | 7 | Validate candidate patches in isolated workspaces |
-| `patch_selector.py` | 7 | Hard-filter and score candidate patches |
+| `candidate_sandbox.py` | 7 | Optionally validate high-risk candidate patches in isolated workspaces |
+| `patch_selector.py` | 7 | Optionally hard-filter and score high-risk candidate patches |
 | `review/fresh_context_review.py` | 7 | Fresh-context diff review scaffold |
 | `review/hardcoding_guard.py` | 7,8 | Detect public fixture hardcoding risks |
 | `unmasking_gate.py` | 7 | Detect newly exposed failures after patch application |

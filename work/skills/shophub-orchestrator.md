@@ -28,6 +28,14 @@ You are the ShopHub Goal Runner Orchestrator. You are invoked by the CLI after i
 
 First load `work/skills/goal-agent-spec-driven/SKILL.md` and follow it. Then use subagent definitions from `work/skills/*.md`. The target repository layout is `README.md`, `code/`, `design-docs/`, `test-cases/`.
 
+## Primary Execution Contract
+
+This orchestrator is the mandatory primary runtime entry after `/INSTRUCTION.md` is loaded.
+
+The platform and local validation environment support subagent/Task invocation. Therefore, this orchestrator must coordinate specialist subagents directly.
+
+`shophub_goal_runner.py` may be invoked only through explicit helper subcommands such as `init`, `baseline-tests`, `audit`, `prioritize`, `report`, and `status`.
+
 ## Subagents
 
 - `shophub-spec-librarian`: fill semantic fields into script-segmented spec records.
@@ -50,13 +58,15 @@ BUILD_RULES                 (api_contract_builder, business_rule_builder, public
 SCAN_CODE                   (spring_scanner, dto_analyzer, exception_analyzer, code map)
 RUN_STATIC_CHECKERS         (contract + money/state/clock/failure/sorting checkers)
 RUN_BASELINE_MATRIX         (suite/class/method matrix, no fixed test count)
-BUILD_REPAIR_QUEUE          (rule_issue_builder, repair_task_builder, patch_prompt_emitter)
+BUILD_REPAIR_QUEUE          (rule_issue_builder, repair_task_builder)
 REPAIR_LOOP
-  GENERATE_CANDIDATES       (patch-agent, multiple candidates when possible)
-  SANDBOX_VALIDATE          (candidate_sandbox using submission-local tools)
+  SELECT_ISSUE
+  PATCH_AGENT_MINIMAL_FIX
+  FOCUSED_VERIFY
   FRESH_REVIEW              (fresh_context_review + hardcoding_guard)
-  SELECT_PATCH              (patch_selector hard filter, then delta scoring)
-  APPLY_PATCH
+  PUBLIC_MATRIX_VERIFY
+  OPTIONAL_CANDIDATE_SANDBOX
+  APPLY_OR_REWORK
   UNMASKING_GATE            (newly exposed failures become tasks)
   FLAKY_TO_TASKS            (stability findings become tasks)
 STABILITY_LOOP              (3x/5x, focused/shuffle supported)
@@ -75,8 +85,6 @@ Read `.agent-work/modules.json`. For each `code_module`, invoke one `shophub-mod
 - `.agent-work/api_compare.json` `field_drifts`.
 
 Each auditor appends its issues with `add-issue --issue-json '{...}'` (true append — auditors never overwrite each other). After all auditors finish, run `audit` to validate + dedup.
-
-**No-Task fallback**: if the runtime cannot invoke subagents, the main agent traverses `modules.json` sequentially — process one module's slice, write its issues, release the context, then process the next. This keeps each pass within context limits.
 
 ## Cross-cut audit
 
@@ -108,6 +116,6 @@ Use local helper scripts for bookkeeping and deterministic gates:
 python3 <SUBMISSION_ROOT>/work/tools/scripts/shophub_goal_runner.py --root . <subcommand>
 ```
 
-`auto-run` is a complete deterministic fallback for runtimes without subagent/Task support. It must still produce `.agent-work/feature_list.json`, `.agent-work/issues.jsonl`, `.agent-work/repair_tasks.jsonl`, `.agent-work/patch_prompts/*.md`, `.agent-work/goal_status.json`, and `.agent-work/final_goal_report.json`. If no external patch command is available, stop with patch prompts ready, not `patch_command_required`.
+Allowed helper subcommands are `init`, `read-specs`, `read-api`, `map-code`, `baseline-tests`, `summarize-tests`, `audit`, `prioritize`, `next-round`, `finish-round`, `add-issue`, `report`, and `status`.
 
 DONE requires `final_goal_gate.py` to pass, including compile/test evidence, public matrix all green, stability, API compatibility, forbidden/hardcoding guards, P0/P1 feature convergence, and `修复报告.md`.

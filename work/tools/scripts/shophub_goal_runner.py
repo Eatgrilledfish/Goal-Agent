@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
-"""Local Goal Runner for design-implementation consistency repair.
+"""Local helper toolkit for design-implementation consistency repair.
 
 The runner implements the deterministic parts of the workflow described in
 design-document.md: workspace initialization, spec/API/code indexing, Maven
-test execution, issue queue maintenance, round recording, continuous orchestration,
-and final reporting.
+test execution, issue queue maintenance, round recording, and final reporting.
 
-It does not hard-code business fixes. In auto-run mode, repairs are delegated to
-an external patch command such as Codex CLI, opencode, or another local agent.
+It does not hard-code business fixes or act as the autonomous repair actor.
 """
 
 from __future__ import annotations
@@ -27,7 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-from runtime_paths import checker_path, patch_path, review_path, script_path
+from runtime_paths import checker_path, script_path
 
 
 HTTP_METHODS = ("GET", "POST", "PUT", "DELETE", "PATCH")
@@ -217,7 +215,6 @@ def default_state() -> dict[str, Any]:
     return {
         "phase": "INIT",
         "round": 0,
-        "max_rounds": 20,
         "fixed_count": 0,
         "reverted_count": 0,
         "high_priority_open": 0,
@@ -231,10 +228,6 @@ def default_state() -> dict[str, Any]:
         "last_score": None,
         "should_continue": True,
         "stop_reason": None,
-        "auto_run_started_at": None,
-        "auto_run_finished_at": None,
-        "last_patch_command": None,
-        "last_patch_exit_code": None,
         "missing_required_paths": [],
         "updated_at": now_iso(),
     }
@@ -264,7 +257,6 @@ def ensure_work_layout(paths: RunnerPaths) -> None:
         paths.work / "snapshots",
         paths.test_matrix,
         paths.work / "checker_reports",
-        paths.work / "patch_prompts",
     ]:
         path.mkdir(parents=True, exist_ok=True)
 
@@ -1233,80 +1225,6 @@ def run_baseline_tests(root: Path, timeout: int = 900, no_tests: bool = False, t
     return {"results": results, "summary": summary, "baseline_matrix": baseline_matrix}
 
 
-def run_verification_tests(root: Path, label: str, timeout: int = 900, no_tests: bool = False, test_filter: str | None = None) -> dict[str, Any]:
-    paths = RunnerPaths(root)
-    ensure_work_layout(paths)
-    blackbox_args = ["-f", "test-cases/pom.xml"]
-    if test_filter:
-        blackbox_args.append(f"-Dtest={test_filter}")
-    blackbox_args.append("test")
-    commands = [
-        (f"{label}-code-test.log", "code/pom.xml", maven_command(root, ["-f", "code/pom.xml", "test"])),
-        (f"{label}-code-install.log", "code/pom.xml", maven_command(root, ["-f", "code/pom.xml", "install", "-DskipTests"])),
-        (f"{label}-blackbox.log", "test-cases/pom.xml", maven_command(root, blackbox_args)),
-    ]
-    results: list[dict[str, Any]] = []
-    for log_name, pom_rel, command in commands:
-        log_path = paths.test_results / log_name
-        pom_path = root / pom_rel
-        if no_tests:
-            write_text(log_path, f"SKIPPED by --no-tests: {command_text(command)}\n")
-            results.append({"command": command, "log": rel(root, log_path), "returncode": None, "skipped": True})
-            continue
-        if not pom_path.exists():
-            write_text(log_path, f"SKIPPED missing {pom_rel}: {command_text(command)}\n")
-            results.append({"command": command, "log": rel(root, log_path), "returncode": None, "skipped": True})
-            continue
-        try:
-            completed = subprocess.run(
-                command,
-                cwd=root,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                check=False,
-                timeout=timeout,
-            )
-            write_text(log_path, completed.stdout)
-            results.append({"command": command, "log": rel(root, log_path), "returncode": completed.returncode, "skipped": False})
-        except subprocess.TimeoutExpired as exc:
-            output = exc.stdout if isinstance(exc.stdout, str) else ""
-            write_text(log_path, output + f"\nTIMEOUT after {timeout}s\n")
-            results.append({"command": command, "log": rel(root, log_path), "returncode": 124, "skipped": False, "timeout": True})
-
-    skipped_count = sum(1 for item in results if item.get("skipped"))
-    executed = [item for item in results if not item.get("skipped")]
-    if skipped_count == len(results):
-        status = "skipped"
-    elif any(item.get("returncode") not in (0, None) for item in executed):
-        status = "failed"
-    elif skipped_count:
-        status = "partial_skipped"
-    else:
-        status = "passed"
-    summarize_test_logs(root)
-
-    # --- NEW: Collect current test matrix from Surefire XML ---
-    current_matrix: dict[str, Any] = {"matrix": [], "summary": {}}
-    try:
-        from test_outcome_collector import build_test_outcome_matrix, save_matrix
-        matrix_dir = paths.test_matrix
-        matrix_dir.mkdir(parents=True, exist_ok=True)
-        current_matrix = build_test_outcome_matrix(
-            root,
-            suite_filter="blackbox-public",
-            discover_sources=True,
-            run_id=label,
-            log_paths=[str(paths.test_results / r["log"]) for r in results if r.get("log")],
-        )
-        save_matrix(current_matrix, matrix_dir / "current_test_matrix.json")
-    except ImportError:
-        pass
-
-    save_state(paths, phase="RUN_FULL_TESTS", last_full_test=status)
-    return {"status": status, "results": results, "current_matrix": current_matrix}
-
-
 def summarize_test_logs(root: Path) -> dict[str, Any]:
     paths = RunnerPaths(root)
     module_names = load_scanned_module_names(root)
@@ -1946,33 +1864,6 @@ def escape_table(value: str) -> str:
     return value.replace("|", "\\|").replace("\n", " ")
 
 
-def run_full_workflow(root: Path, no_tests: bool, timeout: int) -> None:
-    paths = RunnerPaths(root)
-    init_workspace(root)
-    extract_specs(root)
-    parse_api_baseline(root)
-    map_code(root)
-    run_baseline_tests(root, timeout=timeout, no_tests=no_tests)
-    audit_inconsistencies(root)
-    prioritized = prioritize_issues(root)
-    open_issues = [issue for issue in prioritized if issue.get("status", "open") == "open"]
-    missing = check_competition_layout(root)
-    if missing:
-        save_state(paths, phase="WRITE_REPORT", should_continue=False, stop_reason="missing_competition_inputs")
-    elif open_issues:
-        start_next_round(root)
-    else:
-        save_state(paths, phase="WRITE_REPORT", should_continue=False, stop_reason="no_open_issues")
-    generate_report(root)
-
-
-def append_auto_log(paths: RunnerPaths, message: str) -> None:
-    path = paths.work / "auto-run.log"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(f"[{now_iso()}] {message}\n")
-
-
 def append_progress(
     paths: RunnerPaths,
     phase: str,
@@ -2045,141 +1936,6 @@ def run_script_group(root: Path, phase: str, scripts: list[tuple[Path, list[str]
     return results
 
 
-def open_issues_by_severity(root: Path) -> dict[str, list[dict[str, Any]]]:
-    issues = read_jsonl(RunnerPaths(root).issues)
-    open_issues = [issue for issue in issues if issue.get("status", "open") == "open"]
-    return {
-        "high": [issue for issue in open_issues if issue.get("severity") == "high"],
-        "medium": [issue for issue in open_issues if issue.get("severity") == "medium"],
-        "low": [issue for issue in open_issues if issue.get("severity") == "low"],
-        "all": open_issues,
-    }
-
-
-def done_decision(root: Path, no_tests: bool = False) -> tuple[bool, str | None]:
-    """Decide whether the runner is DONE.
-
-    ``no_tests`` is accepted for backward compatibility but no longer grants a
-    done path — a real run requires ``last_full_test == passed`` (per SKILL.md:
-    "Do not use no-tests in a real competition run"). Tests failing with no
-    open issue also does not auto-stop: it returns to the orchestrator so
-    auditors can be fanned out again (the queue may be empty because auditors
-    have not yet covered the failing behavior).
-
-    **FSM-DESIGN §12**: DONE now requires:
-      1. code tests passed
-      2. code install passed
-      3. public black-box suite passed
-      4. Test outcome matrix ALL-GREEN (no FAILURE/ERROR/TIMEOUT/unexpected SKIPPED/NOT_RUN)
-      5. Unmasking Gate passed (checked in run_until_done)
-      6. Stability Gate passed
-      7. Contract Gate passed (api_contract_safe)
-      8. Forbidden Guard passed
-      9. Issue Queue converged (no open P0/P1)
-      10. Report completed
-    """
-    paths = RunnerPaths(root)
-    state = load_state(paths)
-    missing = check_competition_layout(root)
-    buckets = open_issues_by_severity(root)
-    high_medium_open = len(buckets["high"]) + len(buckets["medium"])
-    last_full_test = state.get("last_full_test")
-    _ = no_tests  # accepted for compatibility; no-tests is not a done path
-
-    if missing:
-        return True, "missing_competition_inputs"
-    if not state.get("api_contract_safe", True):
-        return True, "api_contract_violation"
-    if int(state.get("round", 0)) >= int(state.get("max_rounds", 20)):
-        return True, "max_rounds_reached"
-    if int(state.get("consecutive_no_progress", 0)) >= 3:
-        return True, "consecutive_no_progress"
-    if int(state.get("consecutive_regressions", 0)) >= 2:
-        return True, "consecutive_regressions"
-
-    # --- NEW: Check test outcome matrix for all-green ---
-    matrix_all_green = _check_matrix_all_green(root)
-    if last_full_test == "passed" and not matrix_all_green:
-        # Maven returned 0 but matrix shows issues — don't stop
-        pass
-    if not matrix_all_green:
-        # Matrix is not all-green — more work needed
-        if high_medium_open == 0:
-            return False, "matrix_not_all_green_no_open_issues"
-        return False, None
-
-    if high_medium_open == 0 and last_full_test == "passed" and matrix_all_green:
-        if not _stability_gate_passed(root):
-            return False, "stability_gate_not_passed"
-        if not _forbidden_guard_passed(root):
-            return False, "forbidden_guard_not_passed"
-        return True, "completed_all_gates_passed"
-    return False, None
-
-
-def _stability_gate_passed(root: Path) -> bool:
-    report = read_json(RunnerPaths(root).work / "stability_report.json", {})
-    return report.get("stable") is True
-
-
-def _forbidden_guard_passed(root: Path) -> bool:
-    paths = RunnerPaths(root)
-    for report_path in (
-        paths.work / "forbidden_change_guard.json",
-        paths.work / "forbidden_change_report.json",
-    ):
-        if not report_path.exists():
-            continue
-        report = read_json(report_path, {})
-        if "passed" in report:
-            return report.get("passed") is True
-        if report.get("status") in ("PASS", "passed"):
-            return True
-        if int(report.get("blocker_count", report.get("summary", {}).get("blockers", 1)) or 0) == 0:
-            return True
-    return False
-
-
-def _should_run_final_gates(root: Path, no_tests: bool) -> bool:
-    if no_tests:
-        return False
-    state = load_state(RunnerPaths(root))
-    if state.get("last_full_test") != "passed" or not state.get("api_contract_safe", True):
-        return False
-    buckets = open_issues_by_severity(root)
-    if len(buckets["high"]) + len(buckets["medium"]) > 0:
-        return False
-    return not (_check_matrix_all_green(root) and _stability_gate_passed(root) and _forbidden_guard_passed(root))
-
-
-def _run_final_gates(root: Path, timeout: int) -> None:
-    paths = RunnerPaths(root)
-    if not _check_matrix_all_green(root):
-        return
-    scripts_dir = Path(__file__).resolve().parent
-    try:
-        subprocess.run(
-            [sys.executable, str(scripts_dir / "forbidden_change_guard.py"), "--root", str(root), "--strict"],
-            cwd=root,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            check=False,
-            timeout=120,
-        )
-        subprocess.run(
-            [sys.executable, str(scripts_dir / "stability_runner.py"), "--root", str(root), "--runs", "3", "--timeout", str(timeout)],
-            cwd=root,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            check=False,
-            timeout=max(timeout * 4, 120),
-        )
-    except (OSError, subprocess.SubprocessError, subprocess.TimeoutExpired) as exc:
-        write_json(paths.work / "final_gate_error.json", {"generated_at": now_iso(), "error": str(exc)})
-
-
 def _check_matrix_all_green(root: Path) -> bool:
     """Check whether the current test outcome matrix is all-green.
 
@@ -2204,401 +1960,6 @@ def _check_matrix_all_green(root: Path) -> bool:
         )
     except Exception:
         return False
-
-
-def _load_current_matrix(root: Path) -> dict[str, Any]:
-    """Load the current test outcome matrix, or an empty default."""
-    paths = RunnerPaths(root)
-    current_matrix_path = paths.test_matrix / "current_test_matrix.json"
-    if not current_matrix_path.exists():
-        return {"matrix": [], "summary": {}}
-    return read_json(current_matrix_path, {"matrix": [], "summary": {}})
-
-
-def _matrix_has_blocking_issues(root: Path) -> tuple[bool, list[str]]:
-    """Check if the current matrix has blocking issues."""
-    paths = RunnerPaths(root)
-    current_matrix_path = paths.test_matrix / "current_test_matrix.json"
-    if not current_matrix_path.exists():
-        return False, []
-
-    try:
-        matrix = read_json(current_matrix_path, {})
-        summary = matrix.get("summary", {})
-        reasons: list[str] = []
-        if summary.get("failure", 0) > 0:
-            reasons.append(f"{summary['failure']} FAILURE(s)")
-        if summary.get("error", 0) > 0:
-            reasons.append(f"{summary['error']} ERROR(s)")
-        if summary.get("timeout", 0) > 0:
-            reasons.append(f"{summary['timeout']} TIMEOUT(s)")
-        if summary.get("not_run", 0) > 0:
-            reasons.append(f"{summary['not_run']} NOT_RUN")
-        return bool(reasons), reasons
-    except Exception:
-        return False, []
-
-
-def format_patch_command(command_template: str, root: Path, round_no: int, round_path: Path, issue: dict[str, Any]) -> str:
-    paths = RunnerPaths(root)
-    issue_path = paths.rounds / f"round-{round_no:03d}-issue.json"
-    write_json(issue_path, issue)
-    values = {
-        "root": shlex.quote(root.as_posix()),
-        "round": str(round_no),
-        "round_file": shlex.quote(round_path.as_posix()),
-        "issue_id": shlex.quote(str(issue.get("issue_id", ""))),
-        "issue_json": shlex.quote(issue_path.as_posix()),
-    }
-    return command_template.format(**values)
-
-
-def run_patch_command(
-    root: Path,
-    command_template: str,
-    round_no: int,
-    round_path: Path,
-    issue: dict[str, Any],
-    timeout: int,
-) -> dict[str, Any]:
-    paths = RunnerPaths(root)
-    command = format_patch_command(command_template, root, round_no, round_path, issue)
-    log_path = paths.rounds / f"round-{round_no:03d}-patch-command.log"
-    env = os.environ.copy()
-    env.update(
-        {
-            "SHOPHUB_ROOT": root.as_posix(),
-            "SHOPHUB_ROUND": str(round_no),
-            "SHOPHUB_ROUND_FILE": round_path.as_posix(),
-            "SHOPHUB_ISSUE_ID": str(issue.get("issue_id", "")),
-        }
-    )
-    append_auto_log(paths, f"round {round_no:03d}: running patch command for {issue.get('issue_id')}")
-    try:
-        completed = subprocess.run(
-            command,
-            cwd=root,
-            shell=True,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            check=False,
-            timeout=timeout,
-            env=env,
-        )
-        write_text(log_path, completed.stdout)
-        save_state(paths, last_patch_command=command, last_patch_exit_code=completed.returncode)
-        return {"returncode": completed.returncode, "log": rel(root, log_path), "timeout": False}
-    except subprocess.TimeoutExpired as exc:
-        output = exc.stdout if isinstance(exc.stdout, str) else ""
-        write_text(log_path, output + f"\nTIMEOUT after {timeout}s\n")
-        save_state(paths, last_patch_command=command, last_patch_exit_code=124)
-        return {"returncode": 124, "log": rel(root, log_path), "timeout": True}
-
-
-def verification_command_summary(verification: dict[str, Any]) -> str:
-    parts = []
-    for item in verification.get("results", []):
-        command = " ".join(item.get("command", []))
-        status = "SKIPPED" if item.get("skipped") else str(item.get("returncode"))
-        parts.append(f"{command} => {status} ({item.get('log')})")
-    return "; ".join(parts)
-
-
-def _append_new_matrix_tasks(paths: RunnerPaths, new_tasks: list[dict[str, Any]]) -> int:
-    existing = read_jsonl(paths.issues)
-    existing_ids = {issue.get("issue_id") for issue in existing}
-    existing_keys = {
-        (
-            issue.get("matrix_context", {}).get("class_name"),
-            issue.get("matrix_context", {}).get("method_name"),
-            issue.get("type"),
-        )
-        for issue in existing
-    }
-    appended = 0
-    for task in new_tasks:
-        key = (
-            task.get("matrix_context", {}).get("class_name"),
-            task.get("matrix_context", {}).get("method_name"),
-            task.get("type"),
-        )
-        if task.get("issue_id") in existing_ids or key in existing_keys:
-            continue
-        append_jsonl_record(paths.issues, task)
-        existing_ids.add(task.get("issue_id"))
-        existing_keys.add(key)
-        appended += 1
-    return appended
-
-
-def _handle_post_patch_verification(
-    root: Path,
-    round_no: int,
-    verification: dict[str, Any],
-    tests_summary: str,
-    timeout: int,
-    no_tests: bool,
-) -> tuple[str, str | None]:
-    """Run matrix-based post-patch decision regardless of coarse Maven status."""
-    paths = RunnerPaths(root)
-
-    if no_tests:
-        finish_round(
-            root,
-            round_no,
-            "REWORK_REQUIRED",
-            tests=f"{tests_summary}; no-tests mode cannot satisfy matrix gate",
-            risk="Tests skipped; matrix gate unavailable.",
-        )
-        return "REWORK_CONTINUE", None
-
-    unmask_result = _run_unmasking_gate_if_available(root, round_no, timeout, no_tests)
-    if not unmask_result:
-        if verification["status"] == "passed":
-            finish_round(root, round_no, "PASS", tests=tests_summary, risk="Matrix gate unavailable.")
-            return "PASS_CONTINUE", None
-
-        finish_round(
-            root,
-            round_no,
-            "REWORK_REQUIRED",
-            tests=tests_summary,
-            risk="Verification failed and matrix gate unavailable.",
-        )
-        return "REWORK_CONTINUE", None
-
-    verdict = unmask_result.get("verdict")
-    reason = unmask_result.get("verdict_reason", "")
-
-    if verdict == "REJECT_AND_REVERT":
-        state = load_state(paths)
-        save_state(paths, consecutive_regressions=int(state.get("consecutive_regressions", 0)) + 1)
-        finish_round(
-            root,
-            round_no,
-            "REJECT_AND_REVERT",
-            tests=f"{tests_summary}; Unmasking Gate: REJECT_AND_REVERT — {reason}",
-            risk="Patch introduced regression. Rollback required.",
-        )
-        return "REJECT_STOP", "unmasking_gate_reject_and_revert"
-
-    if verdict == "REQUEUE":
-        appended = _append_new_matrix_tasks(paths, unmask_result.get("new_tasks", []))
-        finish_round(
-            root,
-            round_no,
-            "PASS",
-            tests=f"{tests_summary}; Unmasking Gate: REQUEUE — {appended} new tasks queued",
-            risk=f"Unmasked {unmask_result.get('new_issue_count', 0)} hidden failure(s); continue repair.",
-        )
-        return "REQUEUE_CONTINUE", None
-
-    if verdict == "PASS" and verification["status"] == "passed":
-        finish_round(
-            root,
-            round_no,
-            "PASS",
-            tests=f"{tests_summary}; Unmasking Gate: PASS",
-            risk="None recorded.",
-        )
-        return "PASS_CONTINUE", None
-
-    finish_round(
-        root,
-        round_no,
-        "REWORK_REQUIRED",
-        tests=f"{tests_summary}; Unmasking Gate: {verdict} — {reason}",
-        risk="Verification did not converge; continue repair.",
-    )
-    return "REWORK_CONTINUE", None
-
-
-def run_until_done(
-    root: Path,
-    no_tests: bool,
-    timeout: int,
-    max_rounds: int,
-    patch_command: str | None,
-    patch_timeout: int,
-) -> None:
-    """Continuous runner that always builds the deterministic repair loop state.
-
-    If no external patch command is available, the runner still builds contracts,
-    rules, test matrix, issue queue, repair tasks, patch prompts, and final gate
-    status so a no-subagent runtime can continue from concrete artifacts.
-    """
-    paths = RunnerPaths(root)
-    initial_state = init_workspace(root)
-    missing_inputs = list(initial_state.get("missing_required_paths") or [])
-    save_state(
-        paths,
-        phase="INIT",
-        max_rounds=max_rounds,
-        should_continue=True,
-        stop_reason="missing_competition_inputs" if missing_inputs else None,
-        auto_run_started_at=now_iso(),
-        auto_run_finished_at=None,
-    )
-    append_auto_log(paths, "auto-run started")
-
-    if missing_inputs:
-        append_auto_log(paths, "stopping: missing_competition_inputs")
-        save_state(
-            paths,
-            phase="WRITE_REPORT",
-            should_continue=False,
-            stop_reason="missing_competition_inputs",
-            auto_run_finished_at=now_iso(),
-        )
-        generate_report(root)
-        run_final_goal_gate(root)
-        append_auto_log(paths, "auto-run finished")
-        return
-
-    extract_specs(root)
-    build_rules_and_contracts(root)
-    scan_code_with_helpers(root)
-    run_deterministic_checkers(root)
-    run_baseline_matrix(root, timeout=timeout, no_tests=no_tests)
-    build_repair_queue(root)
-    audit_inconsistencies(root)
-    prioritize_issues(root)
-
-    if not patch_command:
-        final_report = run_guard_and_final_gate(root, timeout=timeout, no_tests=no_tests)
-        reason = "completed" if final_report.get("done") else "patch_prompts_ready"
-        append_auto_log(paths, f"stopping: {reason}")
-        save_state(
-            paths,
-            phase="WRITE_REPORT",
-            should_continue=False,
-            stop_reason=reason,
-            auto_run_finished_at=now_iso(),
-        )
-        generate_report(root)
-        append_auto_log(paths, "auto-run finished")
-        return
-
-    while True:
-        done, reason = done_decision(root, no_tests=no_tests)
-        if not done and _should_run_final_gates(root, no_tests):
-            append_auto_log(paths, "running final matrix/stability/forbidden gates")
-            _run_final_gates(root, timeout)
-            done, reason = done_decision(root, no_tests=no_tests)
-        if done:
-            append_auto_log(paths, f"stopping: {reason}")
-            save_state(paths, phase="WRITE_REPORT", should_continue=False, stop_reason=reason, auto_run_finished_at=now_iso())
-            break
-
-        issue = select_next_issue(root)
-        if not issue:
-            reason = "no_open_issue_available"
-            append_auto_log(paths, f"stopping: {reason}")
-            save_state(paths, phase="WRITE_REPORT", should_continue=False, stop_reason=reason, auto_run_finished_at=now_iso())
-            break
-
-        round_path = start_next_round(root)
-        if not round_path:
-            reason = "unable_to_start_round"
-            append_auto_log(paths, f"stopping: {reason}")
-            save_state(paths, phase="WRITE_REPORT", should_continue=False, stop_reason=reason, auto_run_finished_at=now_iso())
-            break
-
-        state = load_state(paths)
-        round_no = int(state.get("round", 0))
-        patch_result = run_patch_command(root, patch_command, round_no, round_path, issue, patch_timeout)
-        if patch_result["returncode"] != 0:
-            finish_round(
-                root,
-                round_no,
-                "FAILED",
-                tests=f"patch command failed: {patch_result['log']}",
-                risk="Patch command did not complete successfully.",
-            )
-            reason = "patch_command_failed"
-            append_auto_log(paths, f"stopping: {reason}")
-            save_state(paths, should_continue=False, stop_reason=reason, auto_run_finished_at=now_iso())
-            break
-
-        build_rules_and_contracts(root)
-        scan_code_with_helpers(root)
-        run_deterministic_checkers(root)
-        state = load_state(paths)
-        if not state.get("api_contract_safe", True):
-            save_state(paths, consecutive_regressions=int(state.get("consecutive_regressions", 0)) + 1)
-            finish_round(
-                root,
-                round_no,
-                "REJECT_AND_REVERT",
-                tests="API snapshot comparison failed.",
-                risk="Patch changed frozen API contract. Manual rollback or repair is required.",
-            )
-            reason = "api_contract_violation_after_round"
-            append_auto_log(paths, f"stopping: {reason}")
-            save_state(paths, should_continue=False, stop_reason=reason, auto_run_finished_at=now_iso())
-            break
-
-        verification = run_verification_tests(root, f"round-{round_no:03d}", timeout=timeout, no_tests=no_tests)
-        tests_summary = verification_command_summary(verification)
-        action, stop_reason = _handle_post_patch_verification(
-            root=root,
-            round_no=round_no,
-            verification=verification,
-            tests_summary=tests_summary,
-            timeout=timeout,
-            no_tests=no_tests,
-        )
-
-        if action == "REJECT_STOP":
-            append_auto_log(paths, f"stopping: {stop_reason}")
-            save_state(paths, should_continue=False, stop_reason=stop_reason, auto_run_finished_at=now_iso())
-            break
-
-        run_helper_script(root, script_path("feature_registry.py"), None, timeout=180)
-        run_helper_script(root, script_path("repair_task_builder.py"), None, timeout=180)
-        run_helper_script(root, patch_path("patch_prompt_emitter.py"), None, timeout=180)
-        audit_inconsistencies(root)
-        prioritize_issues(root)
-
-    run_guard_and_final_gate(root, timeout=timeout, no_tests=no_tests)
-    generate_report(root)
-    append_auto_log(paths, "auto-run finished")
-
-
-def _run_unmasking_gate_if_available(
-    root: Path, round_no: int, timeout: int, no_tests: bool
-) -> dict[str, Any] | None:
-    """Run the Unmasking Gate if the script is available.
-
-    Returns the gate report dict, or None if unmasking_gate is unavailable or
-    tests were skipped (no_tests mode).
-    """
-    if no_tests:
-        return None
-    try:
-        from unmasking_gate import run_unmasking_gate
-        paths = RunnerPaths(root)
-        previous_matrix_path = paths.test_matrix / "previous_test_matrix.json"
-        if not previous_matrix_path.exists():
-            return None
-        previous = read_json(previous_matrix_path, {"matrix": [], "run_id": "unknown"})
-        current_diff = run_git_diff(root)
-        return run_unmasking_gate(
-            root,
-            previous_matrix=previous,
-            round_no=round_no,
-            timeout=timeout,
-            current_diff=current_diff,
-        )
-    except ImportError:
-        return None
-    except Exception as exc:
-        write_json(
-            RunnerPaths(root).test_matrix / "unmasking_gate_error.json",
-            {"generated_at": now_iso(), "round": round_no, "error": str(exc)},
-        )
-        return None
 
 
 def build_rules_and_contracts(root: Path) -> None:
@@ -2666,7 +2027,6 @@ def build_repair_queue(root: Path) -> None:
             (script_path("feature_registry.py"), None, 180),
             (script_path("rule_issue_builder.py"), None, 180),
             (script_path("repair_task_builder.py"), None, 180),
-            (patch_path("patch_prompt_emitter.py"), None, 180),
         ],
     )
     repair_tasks = read_jsonl(paths.work / "repair_tasks.jsonl")
@@ -2676,7 +2036,7 @@ def build_repair_queue(root: Path) -> None:
         "repair queue ready",
         "PASS" if repair_tasks else "REQUEUE",
         evidence={"repair_tasks": len(repair_tasks)},
-        next_action="generate/apply candidate patches" if repair_tasks else "final gate",
+        next_action="invoke shophub-patch-agent" if repair_tasks else "final gate",
     )
 
 
@@ -2700,17 +2060,6 @@ def run_final_goal_gate(root: Path) -> dict[str, Any]:
         evidence={"done": report.get("done"), "blocking_reasons": report.get("blocking_reasons", [])[:10]},
     )
     return report
-
-
-def run_guard_and_final_gate(root: Path, timeout: int, no_tests: bool) -> dict[str, Any]:
-    if not no_tests:
-        run_helper_script(root, script_path("forbidden_change_guard.py"), ["--strict"], timeout=120)
-        run_helper_script(root, review_path("hardcoding_guard.py"), None, timeout=120)
-    # final_goal_gate.py validates that 修复报告.md already exists. Generate the
-    # report before the machine gate so final_goal_report.json reflects the
-    # actual deliverable set, not a transient pre-report state.
-    generate_report(root)
-    return run_final_goal_gate(root)
 
 
 def command_status(root: Path) -> None:
@@ -2741,22 +2090,6 @@ def build_parser() -> argparse.ArgumentParser:
     finish.add_argument("--result", required=True, choices=["PASS", "REWORK_REQUIRED", "REJECT_AND_REVERT", "FAILED"])
     finish.add_argument("--tests")
     finish.add_argument("--risk")
-    run = sub.add_parser("run", help="Run deterministic workflow through report generation.")
-    run.add_argument("--timeout", type=int, default=900)
-    run.add_argument("--no-tests", action="store_true", help="Skip Maven execution and write skipped logs.")
-    auto_run = sub.add_parser("auto-run", help="Continuously run the Goal Runner until DONE or a safety stop condition.")
-    auto_run.add_argument("--timeout", type=int, default=900, help="Timeout in seconds for each Maven verification command.")
-    auto_run.add_argument("--patch-timeout", type=int, default=1800, help="Timeout in seconds for each external patch command.")
-    auto_run.add_argument("--max-rounds", type=int, default=20, help="Maximum repair rounds before stopping.")
-    auto_run.add_argument("--no-tests", action="store_true", help="Skip Maven execution. Use only for dry runs.")
-    auto_run.add_argument(
-        "--patch-command",
-        default=os.environ.get("SHOPHUB_PATCH_COMMAND"),
-        help=(
-            "External command that repairs one round. Placeholders: {root}, {round}, "
-            "{round_file}, {issue_id}, {issue_json}. Can also be set with SHOPHUB_PATCH_COMMAND."
-        ),
-    )
     add_issue = sub.add_parser("add-issue", help="Append one validated issue to issues.jsonl (for fan-out auditors).")
     add_issue.add_argument("--issue-json", required=True, help="JSON string of the issue.")
     sub.add_parser("report", help="Generate 修复报告.md.")
@@ -2791,17 +2124,6 @@ def main(argv: list[str] | None = None) -> int:
     elif args.command == "finish-round":
         round_path = finish_round(root, args.round, args.result, args.tests, args.risk)
         print(round_path)
-    elif args.command == "run":
-        run_full_workflow(root, no_tests=args.no_tests, timeout=args.timeout)
-    elif args.command == "auto-run":
-        run_until_done(
-            root,
-            no_tests=args.no_tests,
-            timeout=args.timeout,
-            max_rounds=args.max_rounds,
-            patch_command=args.patch_command,
-            patch_timeout=args.patch_timeout,
-        )
     elif args.command == "add-issue":
         issue = json.loads(args.issue_json)
         errors = validate_issue(issue)
