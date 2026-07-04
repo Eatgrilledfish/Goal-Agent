@@ -118,4 +118,18 @@ python3 <SUBMISSION_ROOT>/work/tools/scripts/shophub_goal_runner.py --root . <su
 
 Allowed helper subcommands are `init`, `read-specs`, `read-api`, `map-code`, `baseline-tests`, `summarize-tests`, `audit`, `prioritize`, `next-round`, `finish-round`, `add-issue`, `report`, and `status`.
 
+`shophub_goal_runner.py` exposes only stateful/common helper subcommands. Other deterministic helpers are standalone scripts and should be invoked directly when their specific signal is needed:
+
+- `public_case_rule_builder.py`
+- `feature_registry.py`
+- `rule_issue_builder.py`
+- `repair_task_builder.py`
+- `final_goal_gate.py`
+- `checkers/money_formula_checker.py`
+- `checkers/state_machine_checker.py`
+- `checkers/clock_usage_checker.py`
+- `checkers/failure_isolation_checker.py`
+- `checkers/sorting_pagination_checker.py`
+- `review/hardcoding_guard.py`
+
 DONE requires `final_goal_gate.py` to pass, including compile/test evidence, public matrix all green, stability, API compatibility, forbidden/hardcoding guards, P0/P1 feature convergence, and `修复报告.md`.
