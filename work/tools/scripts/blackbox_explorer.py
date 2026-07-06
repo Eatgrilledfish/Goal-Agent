@@ -1,21 +1,24 @@
 #!/usr/bin/env python3
-"""Blackbox Explorer — suite/class/method-level black-box test exploration.
+"""Blackbox Explorer — public smoke plus local black-box test exploration.
 
-Runs black-box tests at multiple granularities to discover masked/hidden failures
-that a simple `mvn test` would not reveal because earlier tests abort the run.
+In competition-final mode this script only runs public smoke.  The exploratory
+baseline/sweep/class/method behavior is reserved for local-public-debug mode.
 
 Modes:
-  suite   — mvn -f test-cases/pom.xml test (full suite)
-  class   — mvn -f test-cases/pom.xml -Dtest=ClassName test (per class)
-  method  — mvn -f test-cases/pom.xml -Dtest=ClassName#methodName test (per method)
-  replay  — targeted replay of NOT_RUN / newly-ERROR tests
+  smoke    — mvn -f test-cases/pom.xml test (public smoke)
+  baseline — suite + class exploration (local-public-debug only)
+  sweep    — targeted replay of NOT_RUN / failing tests (local-public-debug only)
+  focused  — single class/method run (local-public-debug only)
+  shuffle  — randomized public order checks (local-public-debug only)
 
 Outputs:
+  .agent-work/public_smoke_report.json              — smoke result
   .agent-work/test_matrix/blackbox_explorer_runs.jsonl  — raw run records
   .agent-work/test_matrix/current_test_matrix.json        — merged test matrix
-  .agent-work/test_matrix/unmasked_failures.jsonl         — newly discovered failures
+  .agent-work/test_matrix/unmasked_failures.jsonl         — debug-only newly discovered failures
 
 Usage:
+  python3 blackbox_explorer.py --root . --mode smoke
   python3 blackbox_explorer.py --root . --mode baseline
   python3 blackbox_explorer.py --root . --mode sweep --previous-matrix .agent-work/test_matrix/previous_test_matrix.json
 """
@@ -34,6 +37,7 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import pipeline_mode
 import shophub_goal_runner as runner
 import test_outcome_collector as collector
 
@@ -484,6 +488,55 @@ def run_focused_exploration(root: Path, timeout: int, focused: str) -> dict[str,
     return {"runs": [result], "matrix": matrix, "unmasked_failures": []}
 
 
+def run_smoke_exploration(root: Path, timeout: int) -> dict[str, Any]:
+    """Run public black-box tests as final smoke, not as a repair oracle."""
+    paths = runner.RunnerPaths(root)
+    matrix_dir = paths.work / "test_matrix"
+    result = run_maven_test(root, timeout=timeout, label="public-smoke")
+    snapshot = snapshot_surefire_reports(root, "public-smoke")
+    matrix = merge_run_matrices(
+        root,
+        [build_matrix_from_snapshot(root, snapshot, "public-smoke")],
+        run_id="public-smoke",
+    )
+    save_matrix(matrix_dir / "current_test_matrix.json", matrix)
+    runner.append_jsonl(matrix_dir / "blackbox_explorer_runs.jsonl", [result])
+
+    summary = matrix.get("summary", {})
+    blockers = sum(int(summary.get(key, 0) or 0) for key in ("failure", "error", "timeout", "not_run"))
+    if summary.get("has_unexpected_skipped"):
+        blockers += int(summary.get("skipped", 0) or 0)
+    passed = result.get("passed") is True and blockers == 0
+    failures = [
+        {
+            "test_id": f"{record.get('class_name', '')}#{record.get('method_name', '')}",
+            "outcome": record.get("outcome", ""),
+            "message": record.get("message", ""),
+            "source_file": record.get("source_file", ""),
+            "mapping_status": "unmapped_public_symptom",
+        }
+        for record in matrix.get("matrix", [])
+        if record.get("outcome") in ("FAILURE", "ERROR", "TIMEOUT", "NOT_RUN", "SKIPPED")
+    ]
+    report = {
+        "generated_at": runner.now_iso(),
+        "mode": pipeline_mode.current_mode(),
+        "role": "public_smoke",
+        "passed": passed,
+        "summary": summary,
+        "maven": {
+            "returncode": result.get("returncode"),
+            "elapsed_seconds": result.get("elapsed_seconds"),
+            "timeout": result.get("timeout", False),
+        },
+        "matrix_path": runner.rel(root, matrix_dir / "current_test_matrix.json"),
+        "failures": failures,
+        "policy": "public failures are diagnostic symptoms until mapped to README/design-docs/API contract",
+    }
+    runner.write_json(paths.work / "public_smoke_report.json", report)
+    return {"runs": [result], "matrix": matrix, "unmasked_failures": [], "public_smoke_report": report}
+
+
 def _find_unmasked_failures(
     matrix: dict[str, Any],
     class_results: list[dict[str, Any]],
@@ -577,9 +630,9 @@ def build_parser() -> argparse.ArgumentParser:
         description="Explore black-box tests at suite/class/method granularity."
     )
     parser.add_argument("--root", default=".", help="Project root.")
-    parser.add_argument("--mode", default="baseline",
-                        choices=["baseline", "sweep", "shuffle", "focused"],
-                        help="Exploration mode (default: baseline).")
+    parser.add_argument("--mode", default="smoke",
+                        choices=["baseline", "sweep", "shuffle", "focused", "smoke"],
+                        help="Exploration mode (default: smoke).")
     parser.add_argument("--timeout", type=int, default=600,
                         help="Timeout per Maven run in seconds.")
     parser.add_argument("--previous-matrix", default=None,
@@ -603,11 +656,21 @@ def main() -> int:
     matrix_dir = paths.work / "test_matrix"
     matrix_dir.mkdir(parents=True, exist_ok=True)
 
+    if pipeline_mode.is_competition_final() and args.mode != "smoke":
+        print(
+            "ERROR: competition-final mode only permits --mode smoke; "
+            "public black-box exploration is diagnostic smoke only.",
+            file=sys.stderr,
+        )
+        return 2
+
     previous = None
     if args.previous_matrix:
         previous = runner.read_json(Path(args.previous_matrix), {})
 
-    if args.mode == "baseline":
+    if args.mode == "smoke":
+        result = run_smoke_exploration(root, timeout=args.timeout)
+    elif args.mode == "baseline":
         result = run_baseline_exploration(root, timeout=args.timeout)
     elif args.mode == "sweep":
         result = run_sweep_exploration(root, timeout=args.timeout, previous_matrix=previous)
@@ -634,6 +697,9 @@ def main() -> int:
             print(f"    - {uf.get('class_name')}#{uf.get('method_name', '')}: "
                   f"{uf.get('previous_outcome')} → {uf.get('current_outcome')}")
 
+    if args.mode == "smoke":
+        smoke_report = result.get("public_smoke_report", {})
+        return 0 if smoke_report.get("passed") is True else 1
     return 0 if summary.get("all_green", False) else 1
 
 

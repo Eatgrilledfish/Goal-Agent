@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import pipeline_mode
 import shophub_goal_runner as runner
 
 
@@ -42,6 +43,7 @@ def generate_tasks_from_matrix(
     matrix: dict[str, Any],
     diff: dict[str, Any] | None = None,
     prefix: str = "MATRIX",
+    public_can_feed_requirements: bool | None = None,
 ) -> list[dict[str, Any]]:
     """Generate repair/diagnosis tasks from a test outcome matrix.
 
@@ -54,6 +56,11 @@ def generate_tasks_from_matrix(
     Returns:
         List of repair task dicts following the unified schema.
     """
+    if public_can_feed_requirements is None:
+        public_can_feed_requirements = pipeline_mode.allows_public_derived_requirements()
+    if not public_can_feed_requirements:
+        return []
+
     tasks: list[dict[str, Any]] = []
     records = matrix.get("matrix", [])
     run_id = matrix.get("run_id", "unknown")
@@ -274,9 +281,35 @@ def generate_legacy_issues_from_matrix(
     matrix: dict[str, Any],
     diff: dict[str, Any] | None = None,
     prefix: str = "MATRIX",
+    public_can_feed_requirements: bool | None = None,
 ) -> list[dict[str, Any]]:
-    tasks = generate_tasks_from_matrix(root, matrix, diff, prefix)
+    tasks = generate_tasks_from_matrix(root, matrix, diff, prefix, public_can_feed_requirements)
     return [matrix_task_to_legacy_issue(task) for task in tasks]
+
+
+def public_diagnostics_from_matrix(matrix: dict[str, Any], diff: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    diff_lookup: dict[tuple[str, str], str] = {}
+    if diff:
+        for change in diff.get("changes", []):
+            diff_lookup[(change.get("class_name", ""), change.get("method_name", ""))] = change.get("change", "")
+    diagnostics: list[dict[str, Any]] = []
+    for record in matrix.get("matrix", []):
+        if record.get("outcome") in ("PASS", "EXPECTED_SKIPPED"):
+            continue
+        class_name = record.get("class_name", "")
+        method_name = record.get("method_name", "")
+        diagnostics.append(
+            {
+                "test_id": f"{class_name}#{method_name}",
+                "outcome": record.get("outcome", ""),
+                "message": record.get("message", ""),
+                "source_file": record.get("source_file", ""),
+                "diff_change": diff_lookup.get((class_name, method_name), ""),
+                "status": "diagnostic_only_unmapped",
+                "required_next_step": "map to README/design-docs/API contract before creating a repair issue",
+            }
+        )
+    return diagnostics
 
 
 # ---------------------------------------------------------------------------
@@ -363,8 +396,35 @@ def main() -> int:
         if diff_path.exists():
             diff = runner.read_json(diff_path, {})
 
-    # Generate legacy issues for downstream issue queue compatibility.
-    issues = generate_legacy_issues_from_matrix(root, matrix, diff, prefix=args.prefix)
+    public_can_feed_requirements = pipeline_mode.allows_public_derived_requirements()
+    # Generate legacy issues for downstream issue queue compatibility only in
+    # local-public-debug mode. In competition-final, matrix output is diagnostic.
+    issues = generate_legacy_issues_from_matrix(
+        root,
+        matrix,
+        diff,
+        prefix=args.prefix,
+        public_can_feed_requirements=public_can_feed_requirements,
+    )
+
+    if not public_can_feed_requirements:
+        diagnostics = public_diagnostics_from_matrix(matrix, diff)
+        output_path = Path(args.output) if args.output else matrix_dir / "matrix_public_diagnostics.json"
+        runner.write_json(
+            output_path,
+            {
+                "generated_at": runner.now_iso(),
+                "mode": pipeline_mode.current_mode(),
+                "source_matrix": str(matrix_path),
+                "diagnostic_count": len(diagnostics),
+                "diagnostics": diagnostics,
+                "policy": "public matrix symptoms are not repair issues until mapped to README/design-docs/API contract",
+            },
+        )
+        if args.merge:
+            print("competition-final: --merge ignored; public matrix is diagnostic-only.")
+        print(f"Wrote {len(diagnostics)} public diagnostic record(s): {output_path}")
+        return 0
 
     if not issues:
         print("No repair tasks generated — matrix is all green or has no actionable issues.")

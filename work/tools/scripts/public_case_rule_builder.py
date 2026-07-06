@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Build generalized business rules from public symptoms and written specs.
+"""Build public diagnostics, with optional local-public-debug rule output.
 
-The output intentionally records semantic rule clusters, not public fixture
-values.  Test names and assertions are used as evidence only.
+In competition-final mode the output is diagnostic-only and cannot feed
+business_rules, feature_list, or repair_tasks.
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import pipeline_mode
 import shophub_goal_runner as runner
 
 
@@ -72,7 +73,7 @@ RULE_CLUSTERS: list[dict[str, Any]] = [
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Build generalized public-case rules.")
+    parser = argparse.ArgumentParser(description="Build public diagnostics or local public-case rules.")
     parser.add_argument("--root", default=".", help="Project root.")
     parser.add_argument("--output", default=None, help="Output path.")
     return parser
@@ -158,15 +159,32 @@ def build_public_case_rules(root: Path) -> dict[str, Any]:
 
     report = {
         "generated_at": runner.now_iso(),
+        "mode": pipeline_mode.current_mode(),
+        "role": pipeline_mode.public_role(),
         "rules": rules,
         "summary": {
             "total": len(rules),
             "p0": sum(1 for rule in rules if rule["severity"] == "P0"),
             "p1": sum(1 for rule in rules if rule["severity"] == "P1"),
         },
+        "policy": {
+            "public_tests_are_oracle": pipeline_mode.allows_public_derived_requirements(),
+            "competition_final_effect": (
+                "diagnostic_only; public rules must not feed business_rules, feature_list, or repair_tasks"
+            ),
+        },
     }
-    output = paths.work / "public_case_rules.json"
-    runner.write_json(output, report)
+    if pipeline_mode.allows_public_derived_requirements():
+        output = paths.work / "public_case_rules.json"
+        runner.write_json(output, report)
+    else:
+        diagnostic = dict(report)
+        diagnostic["diagnostic_rule_candidates"] = diagnostic.pop("rules")
+        output = paths.work / "public_diagnostics.json"
+        runner.write_json(output, diagnostic)
+        stale_rules = paths.work / "public_case_rules.json"
+        if stale_rules.exists():
+            stale_rules.unlink()
     return report
 
 
@@ -175,7 +193,12 @@ def main() -> int:
     root = Path(args.root).resolve()
     report = build_public_case_rules(root)
     if args.output:
-        runner.write_json(Path(args.output), report)
+        if pipeline_mode.allows_public_derived_requirements():
+            runner.write_json(Path(args.output), report)
+        else:
+            diagnostic = dict(report)
+            diagnostic["diagnostic_rule_candidates"] = diagnostic.pop("rules")
+            runner.write_json(Path(args.output), diagnostic)
     else:
         print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0

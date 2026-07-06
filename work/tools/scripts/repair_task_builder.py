@@ -17,6 +17,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import pipeline_mode
 import shophub_goal_runner as runner
 
 
@@ -120,6 +121,25 @@ def task_priority(issue_type: str) -> str:
     return "P2"
 
 
+def _api_spec_id(method: str, path: str) -> str:
+    raw = f"{method} {path}".strip()
+    return f"API-{runner.slug(raw, 'ENDPOINT')}" if raw else ""
+
+
+def _first_design_source(evidence: list[dict[str, Any]] | None, fallback: str) -> str:
+    for item in evidence or []:
+        source = item.get("source") or item.get("report") or ""
+        if source:
+            line = item.get("line")
+            return f"{source}:{line}" if line else str(source)
+    return fallback
+
+
+def _is_public_symptom_source(value: str) -> bool:
+    lowered = str(value or "").lower()
+    return any(token in lowered for token in ("public", "blackbox", "matrix", "test_symptom", "public_case_rules"))
+
+
 def tasks_from_consistency_report(consistency: dict[str, Any]) -> list[dict[str, Any]]:
     """Convert consistency_report issues into repair tasks."""
     tasks: list[dict[str, Any]] = []
@@ -129,12 +149,15 @@ def tasks_from_consistency_report(consistency: dict[str, Any]) -> list[dict[str,
 
         method = issue.get("method", "")
         path = issue.get("path", "")
+        spec_id = issue.get("spec_id") or issue.get("endpoint_id") or _api_spec_id(method, path)
 
         task: dict[str, Any] = {
             "type": task_type,
             "priority": priority,
             "source": "consistency_report",
             "source_issue": issue.get("type", ""),
+            "spec_id": spec_id,
+            "design_source": issue.get("design_source") or "README.md/design-docs frozen API contract",
             "related_api": f"{method} {path}" if method else "",
             "requirement_id": issue.get("endpoint_id", ""),
             "symptom": issue.get("detail", ""),
@@ -174,6 +197,8 @@ def tasks_from_dto_validation(root: Path, report: dict[str, Any]) -> list[dict[s
                 "priority": priority,
                 "source": "dto_validation_report",
                 "source_issue": gap_type,
+                "spec_id": gap.get("spec_id") or _api_spec_id("", endpoint) or f"DTO-{runner.slug(dto or field, 'FIELD')}",
+                "design_source": gap.get("design_source") or "README.md/design-docs validation contract",
                 "related_api": endpoint,
                 "related_field": field,
                 "related_dto": dto,
@@ -231,6 +256,8 @@ def tasks_from_exception_coverage(coverage: dict[str, Any]) -> list[dict[str, An
             "priority": "P0",
             "source": "exception_coverage",
             "source_issue": f"missing_handler_{ex_type}",
+            "spec_id": gap.get("spec_id") or f"ERR-{runner.slug(ex_type, 'EXCEPTION')}",
+            "design_source": gap.get("design_source") or "README.md/design-docs error contract",
             "related_api": "",
             "symptom": gap.get("impact", f"Missing handler for {ex_type}"),
             "suspected_files": [gap.get("handler_file", "GlobalExceptionHandler.java")],
@@ -274,12 +301,19 @@ def tasks_from_test_symptoms(symptoms_path: Path) -> list[dict[str, Any]]:
     return tasks
 
 
-def tasks_from_issue_queue(issues_path: Path) -> list[dict[str, Any]]:
+def tasks_from_issue_queue(issues_path: Path, public_can_feed_requirements: bool) -> list[dict[str, Any]]:
     """Convert legacy issues.jsonl records into v2 repair task seeds."""
     issues = runner.read_jsonl(issues_path) if issues_path.exists() else []
     tasks: list[dict[str, Any]] = []
     for issue in issues:
         if issue.get("status", "open") not in ("open", "reopen", "queued"):
+            continue
+        public_symptom_only = (
+            _is_public_symptom_source(issue.get("type", ""))
+            or _is_public_symptom_source(issue.get("design_basis", ""))
+            or _is_public_symptom_source(issue.get("source", ""))
+        )
+        if public_symptom_only and not public_can_feed_requirements:
             continue
         severity = {"high": "P0", "medium": "P1", "low": "P2"}.get(str(issue.get("severity", "")).lower(), "P1")
         task_type = issue_to_task_type(issue.get("type", "business_rule"))
@@ -289,6 +323,8 @@ def tasks_from_issue_queue(issues_path: Path) -> list[dict[str, Any]]:
                 "priority": severity,
                 "source": "issues_jsonl",
                 "source_issue": issue.get("issue_id", ""),
+                "spec_id": issue.get("spec_id") or issue.get("requirement_id") or issue.get("design_basis", ""),
+                "design_source": issue.get("design_source") or issue.get("design_basis", ""),
                 "related_api": issue.get("related_api", ""),
                 "symptom": issue.get("actual_behavior") or issue.get("design_behavior") or issue.get("fix_suggestion", ""),
                 "suspected_files": issue.get("suspected_files", []),
@@ -301,7 +337,7 @@ def tasks_from_issue_queue(issues_path: Path) -> list[dict[str, Any]]:
 
 
 def tasks_from_public_case_rules(report: dict[str, Any]) -> list[dict[str, Any]]:
-    """Convert public-case semantic rules into repair task seeds."""
+    """Convert local-public-debug public-case rules into repair task seeds."""
     tasks: list[dict[str, Any]] = []
     for rule in report.get("rules", []):
         tasks.append(
@@ -310,6 +346,8 @@ def tasks_from_public_case_rules(report: dict[str, Any]) -> list[dict[str, Any]]
                 "priority": rule.get("severity", "P1"),
                 "source": "public_case_rules",
                 "source_issue": rule.get("id", ""),
+                "spec_id": rule.get("id", ""),
+                "design_source": "public diagnostics only",
                 "related_api": "",
                 "symptom": rule.get("description", ""),
                 "suspected_files": [],
@@ -336,6 +374,8 @@ def tasks_from_checker_reports(paths: runner.RunnerPaths) -> list[dict[str, Any]
                     "priority": issue.get("severity", "P1"),
                     "source": f"checker:{report.get('checker', report_path.stem)}",
                     "source_issue": issue.get("issue_id", ""),
+                    "spec_id": issue.get("spec_id") or issue.get("rule_id") or issue.get("issue_id", ""),
+                    "design_source": issue.get("design_source") or f"checker:{report.get('checker', report_path.stem)}",
                     "related_api": "",
                     "symptom": issue.get("summary") or issue.get("detail", ""),
                     "suspected_files": issue.get("suspected_files", []),
@@ -347,18 +387,26 @@ def tasks_from_checker_reports(paths: runner.RunnerPaths) -> list[dict[str, Any]
     return tasks
 
 
-def tasks_from_feature_list(feature_list: dict[str, Any]) -> list[dict[str, Any]]:
+def tasks_from_feature_list(feature_list: dict[str, Any], public_can_feed_requirements: bool) -> list[dict[str, Any]]:
     """Convert failing P0/P1 features into repair task seeds."""
     tasks: list[dict[str, Any]] = []
     for feature in feature_list.get("features", []):
         if feature.get("passes") is True or feature.get("severity") not in ("P0", "P1"):
             continue
+        if feature.get("source") == "public-test" and not public_can_feed_requirements:
+            continue
+        design_source = _first_design_source(
+            feature.get("evidence", []),
+            "README.md/design-docs" if feature.get("source") != "public-test" else "public diagnostics only",
+        )
         tasks.append(
             {
                 "type": feature.get("category", "business_rule"),
                 "priority": feature.get("severity", "P1"),
                 "source": "feature_list",
                 "source_issue": feature.get("id", ""),
+                "spec_id": feature.get("spec_id") or feature.get("id", ""),
+                "design_source": design_source,
                 "related_api": "",
                 "symptom": feature.get("description", ""),
                 "suspected_files": feature.get("related_files", []),
@@ -371,22 +419,31 @@ def tasks_from_feature_list(feature_list: dict[str, Any]) -> list[dict[str, Any]
 
 
 def dedup_tasks(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Deduplicate repair tasks by (related_api, field, type)."""
+    """Deduplicate repair tasks by (spec_id, category, primary code symbol)."""
     seen: set[tuple[str, str, str]] = set()
     deduped: list[dict[str, Any]] = []
     task_id = 0
     for task in tasks:
-        related_api = task.get("related_api", "")
-        related_field = task.get("related_field", "")
+        suspected_files = task.get("suspected_files", [])
+        primary_code_symbol = task.get("primary_code_symbol", "")
+        if not primary_code_symbol and suspected_files:
+            primary_code_symbol = str(suspected_files[0])
+        if not primary_code_symbol:
+            primary_code_symbol = task.get("related_dto") or task.get("related_field") or ""
+        spec_id = task.get("spec_id") or task.get("requirement_id") or task.get("related_api") or task.get("source_issue", "")
         task_type = task.get("type", "")
+        category = task.get("category") or task_type
 
-        dedup_key = (related_api, related_field, task_type)
+        dedup_key = (str(spec_id), str(category), str(primary_code_symbol))
         if dedup_key in seen:
             continue
         seen.add(dedup_key)
 
         task_id += 1
         task["id"] = f"TASK-{task_id:03d}"
+        task.setdefault("spec_id", spec_id)
+        task.setdefault("design_source", "")
+        task.setdefault("primary_code_symbol", primary_code_symbol)
         task.setdefault("task_id", task["id"])
         task.setdefault("severity", task.get("priority", "P2"))
         task.setdefault("category", task.get("type", "business_rule"))
@@ -398,7 +455,7 @@ def dedup_tasks(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
             [
                 "code/pom.xml compile pass",
                 "code tests pass",
-                "public test matrix has no hard regression",
+                "public smoke has no hard regression and remains diagnostic-only",
                 "contract checker has no new P0/P1 issue",
                 "forbidden and hardcoding guards pass",
             ],
@@ -427,6 +484,8 @@ def sort_tasks(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def build_repair_tasks(root: Path) -> dict[str, Any]:
     """Build the complete repair task list from all analysis outputs."""
     paths = runner.RunnerPaths(root)
+    mode = pipeline_mode.current_mode()
+    public_can_feed_requirements = pipeline_mode.allows_public_derived_requirements()
 
     # Load all inputs
     api_contract = runner.read_json(paths.work / "api_contract.json", {})
@@ -454,11 +513,13 @@ def build_repair_tasks(root: Path) -> dict[str, Any]:
     all_tasks.extend(tasks_from_consistency_report(consistency))
     all_tasks.extend(tasks_from_dto_validation(root, dto_report))
     all_tasks.extend(tasks_from_exception_coverage(exception_coverage))
-    all_tasks.extend(tasks_from_test_symptoms(paths.work / "test_symptoms.jsonl"))
-    all_tasks.extend(tasks_from_issue_queue(paths.issues))
-    all_tasks.extend(tasks_from_public_case_rules(public_case_rules))
+    if public_can_feed_requirements:
+        all_tasks.extend(tasks_from_test_symptoms(paths.work / "test_symptoms.jsonl"))
+    all_tasks.extend(tasks_from_issue_queue(paths.issues, public_can_feed_requirements))
+    if public_can_feed_requirements:
+        all_tasks.extend(tasks_from_public_case_rules(public_case_rules))
     all_tasks.extend(tasks_from_checker_reports(paths))
-    all_tasks.extend(tasks_from_feature_list(feature_list))
+    all_tasks.extend(tasks_from_feature_list(feature_list, public_can_feed_requirements))
 
     # Deduplicate and sort
     tasks = dedup_tasks(all_tasks)
@@ -467,6 +528,8 @@ def build_repair_tasks(root: Path) -> dict[str, Any]:
     # Build output
     report: dict[str, Any] = {
         "generated_at": runner.now_iso(),
+        "mode": mode,
+        "public_input_role": pipeline_mode.public_role(),
         "tasks": tasks,
         "summary": {
             "total": len(tasks),
@@ -476,6 +539,7 @@ def build_repair_tasks(root: Path) -> dict[str, Any]:
             "by_type": {},
         },
         "warnings": warnings,
+        "ignored_sources": [] if public_can_feed_requirements else ["test_symptoms", "public_case_rules", "public_matrix_symptom_issues"],
     }
 
     for task in tasks:
@@ -523,6 +587,8 @@ def build_repair_tasks(root: Path) -> dict[str, Any]:
                 f"### [{task['priority']}] {task['id']} — {task['type']}"
             )
             lines.append(f"- **API**: {task.get('related_api', 'N/A')}")
+            lines.append(f"- **Spec**: {task.get('spec_id', '')}")
+            lines.append(f"- **Design Source**: {task.get('design_source', '')}")
             lines.append(f"- **Symptom**: {task.get('symptom', '')}")
             lines.append(f"- **Expected Fix**: {task.get('expected_fix', '')}")
             lines.append(f"- **Suspected Files**: {', '.join(task.get('suspected_files', [])) or 'N/A'}")

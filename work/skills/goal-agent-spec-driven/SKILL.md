@@ -65,7 +65,7 @@ Phase 3: Build Trace Matrix + Static Consistency Check
 Phase 4: Generate Spec-Driven Tests
 Phase 5: Baseline Test Run
 Phase 6: Localize & Prioritize Repair Tasks
-Phase 7: Spec-Verified Repair Loop (patch-agent minimal fix → focused verification → review → public matrix → optional sandbox/selector → unmasking)
+Phase 7: Spec-Verified Repair Loop (patch-agent minimal fix → focused spec verification → review → public smoke → optional sandbox/selector → unmasking diagnostics)
 Phase 8: Stability Loop (3x/5x rerun, focused/shuffle, flaky-to-task)
 Phase 9: Final Goal Gate + Report & Deliver
 ```
@@ -335,7 +335,7 @@ All under `work/tools/scripts/`:
 | `shophub_goal_runner.py` | All | Core runner: init, specs, API, map, tests, audit, prioritize, report |
 | `api_contract_builder.py` | 1 | Extract REST endpoints from markdown |
 | `business_rule_builder.py` | 1 | Extract business rules from design-docs |
-| `public_case_rule_builder.py` | 1 | Convert public symptoms into generalized business rules |
+| `public_case_rule_builder.py` | 1 | competition-final: write public diagnostics only; local-public-debug: derive public-case rules |
 | `feature_registry.py` | 1-9 | Maintain external feature pass/fail memory |
 | `spring_scanner.py` | 2 | Scan Spring Boot code → repo_map.json |
 | `dto_analyzer.py` | 2 | DTO validation coverage analysis |
@@ -347,7 +347,7 @@ All under `work/tools/scripts/`:
 | `checkers/failure_isolation_checker.py` | 3 | Post-action failure isolation detection |
 | `checkers/sorting_pagination_checker.py` | 3 | Stable ordering and pagination detection |
 | `spec_test_generator.py` | 4 | Generate MockMvc tests from contracts |
-| `blackbox_explorer.py` | 5,7 | Suite/class/method/sweep/focused/shuffle matrix exploration |
+| `blackbox_explorer.py` | 5,7 | competition-final public smoke; local-public-debug suite/class/method/sweep/focused/shuffle exploration |
 | `rule_issue_builder.py` | 6 | Convert rules/checkers/matrix into issues.jsonl |
 | `repair_task_builder.py` | 6 | Build repair_tasks.json and repair_tasks.jsonl |
 | `candidate_sandbox.py` | 7 | Optionally validate high-risk candidate patches in isolated workspaces |

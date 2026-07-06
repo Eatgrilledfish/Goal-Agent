@@ -2,15 +2,16 @@
 """Unmasking Gate — post-patch enforcement gate that detects newly-exposed hidden failures.
 
 Runs after every patch acceptance.  The gate:
-  1. Runs blackbox_explorer in sweep mode to re-test the current workspace.
+  1. Runs public smoke in competition-final, or sweep mode in local-public-debug.
   2. Collects the current test outcome matrix.
   3. Computes the diff against the previous matrix.
-  4. Determines whether new issues are regressions (patch caused them) or unmasked
+  4. Determines whether public symptoms are regressions (patch caused them) or unmasked
      (pre-existing but now visible because prior failures were fixed).
   5. Returns one of three verdicts:
      - PASS:             No new issues. Matrix is all-green. Safe to proceed.
-     - REQUEUE:          New unmasked issues found but patch didn't cause regressions.
-                         Patch is kept; new issues are added to repair queue.
+     - REQUEUE:          New unmasked symptoms found but patch didn't cause regressions.
+                         In competition-final they are diagnostics; in local-public-debug
+                         they may be added to the repair queue.
      - REJECT_AND_REVERT: Patch introduced regressions. Roll back.
 
 Outputs:
@@ -33,6 +34,7 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import pipeline_mode
 import shophub_goal_runner as runner
 import test_outcome_collector as collector
 import matrix_diff as md
@@ -69,12 +71,16 @@ def run_unmasking_gate(
 
     start_time = time.time()
 
-    # Step 1: Run sweep exploration
-    print("Unmasking Gate — Step 1: Running sweep exploration...")
-    sweep_result = explorer.run_sweep_exploration(
-        root, timeout=timeout, previous_matrix=previous_matrix,
-    )
-    current_matrix = sweep_result["matrix"]
+    # Step 1: Run public smoke in competition-final; keep sweep only for local debug.
+    if pipeline_mode.is_competition_final():
+        print("Unmasking Gate — Step 1: Running public smoke...")
+        explorer_result = explorer.run_smoke_exploration(root, timeout=timeout)
+    else:
+        print("Unmasking Gate — Step 1: Running sweep exploration...")
+        explorer_result = explorer.run_sweep_exploration(
+            root, timeout=timeout, previous_matrix=previous_matrix,
+        )
+    current_matrix = explorer_result["matrix"]
 
     # Step 2: Save current matrix
     collector.save_matrix(current_matrix, matrix_dir / "current_test_matrix.json")
@@ -125,8 +131,16 @@ def run_unmasking_gate(
 
     # Step 8: Generate repair tasks for new issues
     new_tasks: list[dict[str, Any]] = []
-    if new_issues:
-        tasks = m2t.generate_legacy_issues_from_matrix(root, current_matrix, diff, prefix="UNMASK")
+    public_can_feed_requirements = pipeline_mode.allows_public_derived_requirements()
+    public_diagnostics: list[dict[str, Any]] = []
+    if new_issues and public_can_feed_requirements:
+        tasks = m2t.generate_legacy_issues_from_matrix(
+            root,
+            current_matrix,
+            diff,
+            prefix="UNMASK",
+            public_can_feed_requirements=public_can_feed_requirements,
+        )
         new_tasks = [t for t in tasks if t.get("matrix_context", {}).get("diff_change") in
                      ("NEW", "REGRESSED", "UNMASKED", "FAILURE_TYPE_CHANGED")]
         # Persist tasks
@@ -138,6 +152,16 @@ def run_unmasking_gate(
                 "task_count": len(new_tasks),
                 "tasks": new_tasks,
             })
+    elif new_issues:
+        public_diagnostics = m2t.public_diagnostics_from_matrix(current_matrix, diff)
+        runner.write_json(matrix_dir / "unmasking_public_diagnostics.json", {
+            "generated_at": runner.now_iso(),
+            "mode": pipeline_mode.current_mode(),
+            "round": round_no,
+            "diagnostic_count": len(public_diagnostics),
+            "diagnostics": public_diagnostics,
+            "policy": "public failures are symptoms only until mapped to README/design-docs/API contract",
+        })
 
     elapsed = time.time() - start_time
 
@@ -161,6 +185,10 @@ def run_unmasking_gate(
         "heuristic_related_to_diff": heuristic_related_to_diff,
         "new_tasks_count": len(new_tasks),
         "new_tasks": new_tasks,
+        "public_diagnostics_count": len(public_diagnostics),
+        "public_diagnostics": public_diagnostics,
+        "mode": pipeline_mode.current_mode(),
+        "public_input_role": pipeline_mode.public_role(),
         "matrix_paths": {
             "previous": str(prev_archive),
             "current": str(matrix_dir / "current_test_matrix.json"),

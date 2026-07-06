@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import pipeline_mode
 import shophub_goal_runner as runner
 
 
@@ -88,7 +89,9 @@ def load_checker_issues(paths: runner.RunnerPaths) -> list[dict[str, Any]]:
 def build_issues(root: Path, append: bool = False) -> dict[str, Any]:
     paths = runner.RunnerPaths(root)
     paths.work.mkdir(parents=True, exist_ok=True)
+    public_can_feed_requirements = pipeline_mode.allows_public_derived_requirements()
     generated: list[dict[str, Any]] = []
+    public_diagnostic_risks: list[dict[str, Any]] = []
 
     consistency = runner.read_json(paths.work / "consistency_report.json", {})
     for item in consistency.get("issues", []):
@@ -113,6 +116,17 @@ def build_issues(root: Path, append: bool = False) -> dict[str, Any]:
             continue
         if feature.get("severity") not in ("P0", "P1"):
             continue
+        if feature.get("source") == "public-test" and not public_can_feed_requirements:
+            public_diagnostic_risks.append(
+                {
+                    "source": "feature_list",
+                    "feature_id": feature.get("id", ""),
+                    "public_symptom": feature.get("description", ""),
+                    "related_tests": feature.get("related_tests", []),
+                    "status": "diagnostic_only_unmapped",
+                }
+            )
+            continue
         generated.append(
             issue_record(
                 issue_id=f"ISSUE-{feature.get('id')}",
@@ -133,6 +147,19 @@ def build_issues(root: Path, append: bool = False) -> dict[str, Any]:
         if record.get("outcome") not in ("FAILURE", "ERROR", "TIMEOUT", "NOT_RUN"):
             continue
         test_id = f"{record.get('class_name', '')}#{record.get('method_name', '')}"
+        if not public_can_feed_requirements:
+            public_diagnostic_risks.append(
+                {
+                    "source": "public_matrix",
+                    "test_id": test_id,
+                    "outcome": record.get("outcome", ""),
+                    "public_symptom": record.get("message", ""),
+                    "source_file": record.get("source_file", ""),
+                    "status": "diagnostic_only_unmapped",
+                    "required_next_step": "map to README/design-docs/API contract before creating a P0/P1 issue",
+                }
+            )
+            continue
         generated.append(
             issue_record(
                 issue_id=f"ISSUE-MATRIX-{runner.stable_hash(test_id + record.get('outcome', '')).upper()}",
@@ -155,11 +182,24 @@ def build_issues(root: Path, append: bool = False) -> dict[str, Any]:
     runner.append_jsonl(paths.issues, issues)
     report = {
         "generated_at": runner.now_iso(),
+        "mode": pipeline_mode.current_mode(),
+        "public_input_role": pipeline_mode.public_role(),
         "generated_count": len(generated),
         "total_count": len(issues),
         "issues_path": runner.rel(root, paths.issues),
+        "public_diagnostic_risk_count": len(public_diagnostic_risks),
     }
     runner.write_json(paths.work / "rule_issue_builder_report.json", report)
+    if not public_can_feed_requirements:
+        runner.write_json(
+            paths.work / "public_diagnostic_risks.json",
+            {
+                "generated_at": runner.now_iso(),
+                "mode": pipeline_mode.current_mode(),
+                "risks": public_diagnostic_risks,
+                "policy": "public failures are symptoms only until mapped to README/design-docs/API contract",
+            },
+        )
     return report
 
 

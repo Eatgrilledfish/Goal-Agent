@@ -66,7 +66,13 @@ The collector produces `.agent-work/test_matrix/current_test_matrix.json` with *
 
 ### Use the Blackbox Explorer
 
-When you suspect hidden/masked failures, run the explorer:
+In competition-final mode, run public tests as smoke/canary only:
+
+```bash
+python3 <SUBMISSION_ROOT>/work/tools/scripts/blackbox_explorer.py --root . --mode smoke
+```
+
+Only in `GOAL_AGENT_MODE=local-public-debug`, when you need local public-test investigation, run exploratory modes:
 
 ```bash
 python3 <SUBMISSION_ROOT>/work/tools/scripts/blackbox_explorer.py --root . --mode baseline
@@ -98,13 +104,15 @@ If method-level is NOT available (may fail with some Maven/Surefire versions), f
 mvn -s maven-settings.xml -f test-cases/pom.xml -Dtest=TestClass test
 ```
 
-### Generate repair tasks from matrix
+### Record matrix diagnostics
 
-When errors/skipped/not-run are found, convert them to structured tasks:
+In competition-final mode, public matrix outcomes are symptoms only. Record diagnostics and map each symptom back to README/design-docs/API contract before creating any P0/P1 issue:
 
 ```bash
-python3 <SUBMISSION_ROOT>/work/tools/scripts/matrix_to_repair_tasks.py --root . --matrix current --merge
+python3 <SUBMISSION_ROOT>/work/tools/scripts/matrix_to_repair_tasks.py --root . --matrix current
 ```
+
+Use `--merge` only in `GOAL_AGENT_MODE=local-public-debug`; competition-final ignores `--merge`.
 
 If Maven is unavailable, return BLOCKED with the exact environment failure. Do not switch to another runtime path or fabricate issue findings from missing test output.
 

@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import pipeline_mode
 import shophub_goal_runner as runner
 
 
@@ -57,10 +58,12 @@ def endpoint_key(ep: dict[str, Any]) -> tuple[str, str]:
 
 def build_feature_registry(root: Path) -> dict[str, Any]:
     paths = runner.RunnerPaths(root)
+    mode = pipeline_mode.current_mode()
+    public_can_feed_requirements = pipeline_mode.allows_public_derived_requirements()
     consistency = runner.read_json(paths.work / "consistency_report.json", {})
     contract = runner.read_json(paths.work / "api_contract.json", {})
     business_rules = runner.read_json(paths.work / "business_rules.json", {})
-    public_rules = runner.read_json(paths.work / "public_case_rules.json", {})
+    public_rules = runner.read_json(paths.work / "public_case_rules.json", {}) if public_can_feed_requirements else {}
     matrix = runner.read_json(paths.test_matrix / "current_test_matrix.json", {})
 
     issue_by_endpoint = {
@@ -109,11 +112,17 @@ def build_feature_registry(root: Path) -> dict[str, Any]:
     for rule in business_rules.get("rules", []):
         severity = normalize_severity(rule.get("priority"), "P2")
         category = rule.get("type", "business_rule")
-        design_passes = severity == "P2" or (
-            matrix_all_green
-            and category not in checker_categories_with_issues
-            and not issue_by_endpoint
-        )
+        if public_can_feed_requirements:
+            design_passes = severity == "P2" or (
+                matrix_all_green
+                and category not in checker_categories_with_issues
+                and not issue_by_endpoint
+            )
+        else:
+            design_passes = severity == "P2" or (
+                category not in checker_categories_with_issues
+                and not issue_by_endpoint
+            )
         features.append(
             {
                 "id": feature_id("RULE-SPEC", rule.get("id", ""), rule.get("target_domain", "")),
@@ -130,30 +139,31 @@ def build_feature_registry(root: Path) -> dict[str, Any]:
             }
         )
 
-    for rule in public_rules.get("rules", []):
-        related_tests = [
-            test_id for test_id in outcomes
-            if any(token.lower() in test_id.lower() for token in rule.get("matched_keywords", [])[:6])
-        ]
-        if related_tests:
-            passes = all(outcomes[test_id] in ("PASS", "EXPECTED_SKIPPED") for test_id in related_tests)
-        else:
-            passes = matrix_all_green and rule.get("category") not in checker_categories_with_issues
-        features.append(
-            {
-                "id": rule.get("id") or feature_id("PUBRULE", rule.get("category", "")),
-                "source": "public-test",
-                "category": rule.get("category", "business_rule"),
-                "severity": normalize_severity(rule.get("severity"), "P1"),
-                "description": rule.get("description", ""),
-                "related_modules": [],
-                "related_files": [],
-                "related_tests": related_tests,
-                "passes": passes,
-                "evidence": rule.get("evidence", []),
-                "last_checked_at": runner.now_iso(),
-            }
-        )
+    if public_can_feed_requirements:
+        for rule in public_rules.get("rules", []):
+            related_tests = [
+                test_id for test_id in outcomes
+                if any(token.lower() in test_id.lower() for token in rule.get("matched_keywords", [])[:6])
+            ]
+            if related_tests:
+                passes = all(outcomes[test_id] in ("PASS", "EXPECTED_SKIPPED") for test_id in related_tests)
+            else:
+                passes = matrix_all_green and rule.get("category") not in checker_categories_with_issues
+            features.append(
+                {
+                    "id": rule.get("id") or feature_id("PUBRULE", rule.get("category", "")),
+                    "source": "public-test",
+                    "category": rule.get("category", "business_rule"),
+                    "severity": normalize_severity(rule.get("severity"), "P1"),
+                    "description": rule.get("description", ""),
+                    "related_modules": [],
+                    "related_files": [],
+                    "related_tests": related_tests,
+                    "passes": passes,
+                    "evidence": rule.get("evidence", []),
+                    "last_checked_at": runner.now_iso(),
+                }
+            )
 
     for report_path in sorted((paths.work / "checker_reports").glob("*.json")) if (paths.work / "checker_reports").exists() else []:
         report = runner.read_json(report_path, {})
@@ -174,25 +184,26 @@ def build_feature_registry(root: Path) -> dict[str, Any]:
                 }
             )
 
-    for record in matrix.get("matrix", []):
-        if record.get("outcome") not in ("FAILURE", "ERROR", "TIMEOUT", "NOT_RUN"):
-            continue
-        test_id = f"{record.get('class_name', '')}#{record.get('method_name', '')}"
-        features.append(
-            {
-                "id": feature_id("RULE-TEST", test_id),
-                "source": "public-test",
-                "category": "public_matrix",
-                "severity": "P0" if record.get("outcome") in ("FAILURE", "ERROR") else "P1",
-                "description": f"Public matrix item {test_id} must pass without masking",
-                "related_modules": [record.get("related_module", "")] if record.get("related_module") else [],
-                "related_files": [record.get("source_file", "")] if record.get("source_file") else [],
-                "related_tests": [test_id],
-                "passes": False,
-                "evidence": [{"kind": "matrix", "outcome": record.get("outcome"), "message": record.get("message", "")}],
-                "last_checked_at": runner.now_iso(),
-            }
-        )
+    if public_can_feed_requirements:
+        for record in matrix.get("matrix", []):
+            if record.get("outcome") not in ("FAILURE", "ERROR", "TIMEOUT", "NOT_RUN"):
+                continue
+            test_id = f"{record.get('class_name', '')}#{record.get('method_name', '')}"
+            features.append(
+                {
+                    "id": feature_id("RULE-TEST", test_id),
+                    "source": "public-test",
+                    "category": "public_matrix",
+                    "severity": "P0" if record.get("outcome") in ("FAILURE", "ERROR") else "P1",
+                    "description": f"Public matrix item {test_id} must pass without masking",
+                    "related_modules": [record.get("related_module", "")] if record.get("related_module") else [],
+                    "related_files": [record.get("source_file", "")] if record.get("source_file") else [],
+                    "related_tests": [test_id],
+                    "passes": False,
+                    "evidence": [{"kind": "matrix", "outcome": record.get("outcome"), "message": record.get("message", "")}],
+                    "last_checked_at": runner.now_iso(),
+                }
+            )
 
     deduped: dict[str, dict[str, Any]] = {}
     for feature in features:
@@ -217,7 +228,14 @@ def build_feature_registry(root: Path) -> dict[str, Any]:
         "p2_total": sum(1 for f in ordered if f["severity"] == "P2"),
         "p2_passed": sum(1 for f in ordered if f["severity"] == "P2" and f.get("passes") is True),
     }
-    report = {"generated_at": runner.now_iso(), "features": ordered, "summary": summary}
+    report = {
+        "generated_at": runner.now_iso(),
+        "mode": mode,
+        "public_input_role": pipeline_mode.public_role(),
+        "features": ordered,
+        "summary": summary,
+        "ignored_sources": [] if public_can_feed_requirements else ["public_case_rules", "public_matrix_failures"],
+    }
     runner.write_json(paths.work / "feature_list.json", report)
     return report
 

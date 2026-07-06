@@ -155,7 +155,7 @@ class CandidateSandboxGateTest(unittest.TestCase):
 
         self.assertFalse(result["eligible"])
         self.assertEqual(result["matrix_gate"], "FAIL")
-        self.assertIn("Public black-box matrix gate failed", result["elimination_reason"])
+        self.assertIn("Public smoke gate failed", result["elimination_reason"])
 
     def test_local_gate_allows_existing_public_failure_without_hard_regression(self):
         result = self._validate(

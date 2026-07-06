@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
+import pipeline_mode
 from runtime_paths import checker_path, script_path
 
 
@@ -1963,14 +1964,16 @@ def _check_matrix_all_green(root: Path) -> bool:
 
 
 def build_rules_and_contracts(root: Path) -> None:
+    scripts: list[tuple[Path, list[str] | None, int]] = [
+        (script_path("api_contract_builder.py"), None, 180),
+        (script_path("business_rule_builder.py"), None, 180),
+    ]
+    if pipeline_mode.allows_public_derived_requirements():
+        scripts.append((script_path("public_case_rule_builder.py"), None, 180))
     run_script_group(
         root,
         "BUILD_RULES",
-        [
-            (script_path("api_contract_builder.py"), None, 180),
-            (script_path("business_rule_builder.py"), None, 180),
-            (script_path("public_case_rule_builder.py"), None, 180),
-        ],
+        scripts,
     )
 
 
@@ -2014,8 +2017,38 @@ def run_baseline_matrix(root: Path, timeout: int, no_tests: bool) -> None:
     paths = RunnerPaths(root)
     run_baseline_tests(root, timeout=timeout, no_tests=no_tests)
     if not no_tests:
-        run_helper_script(root, script_path("blackbox_explorer.py"), ["--mode", "baseline", "--timeout", str(timeout)], timeout=max(timeout * 6, timeout + 60))
-    append_progress(paths, "RUN_BASELINE_MATRIX", "baseline matrix generated", "PASS" if (paths.test_matrix / "current_test_matrix.json").exists() else "FAIL")
+        explorer_mode = "baseline" if pipeline_mode.allows_public_derived_requirements() else "smoke"
+        run_helper_script(
+            root,
+            script_path("blackbox_explorer.py"),
+            ["--mode", explorer_mode, "--timeout", str(timeout)],
+            timeout=max(timeout * 6, timeout + 60),
+        )
+    public_report = paths.work / "public_smoke_report.json"
+    matrix_exists = (paths.test_matrix / "current_test_matrix.json").exists()
+    action = "public smoke generated" if public_report.exists() else "baseline matrix generated"
+    append_progress(paths, "RUN_BASELINE_MATRIX", action, "PASS" if matrix_exists else "FAIL")
+
+
+def run_public_smoke(root: Path, timeout: int, no_tests: bool) -> None:
+    paths = RunnerPaths(root)
+    if no_tests:
+        append_progress(paths, "PUBLIC_SMOKE", "public smoke skipped", "FAIL", evidence={"reason": "--no-tests"})
+        return
+    run_helper_script(
+        root,
+        script_path("blackbox_explorer.py"),
+        ["--mode", "smoke", "--timeout", str(timeout)],
+        timeout=max(timeout * 6, timeout + 60),
+    )
+    report = read_json(paths.work / "public_smoke_report.json", {})
+    append_progress(
+        paths,
+        "PUBLIC_SMOKE",
+        "public smoke",
+        "PASS" if report.get("passed") is True else "FAIL",
+        evidence={"summary": report.get("summary", {}), "failure_count": len(report.get("failures", []))},
+    )
 
 
 def build_repair_queue(root: Path) -> None:

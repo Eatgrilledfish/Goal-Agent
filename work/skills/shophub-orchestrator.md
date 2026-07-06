@@ -54,7 +54,7 @@ The platform and local validation environment support subagent/Task invocation. 
 ```text
 INIT
 BUILD_EXTERNAL_MEMORY       (feature_registry/progress/goal_status)
-BUILD_RULES                 (api_contract_builder, business_rule_builder, public_case_rule_builder)
+BUILD_RULES                 (api_contract_builder, business_rule_builder; public_case_rule_builder diagnostic-only/local-public-debug)
 SCAN_CODE                   (spring_scanner, dto_analyzer, exception_analyzer, code map)
 RUN_STATIC_CHECKERS         (contract + money/state/clock/failure/sorting checkers)
 RUN_BASELINE_MATRIX         (suite/class/method matrix, no fixed test count)
@@ -64,10 +64,10 @@ REPAIR_LOOP
   PATCH_AGENT_MINIMAL_FIX
   FOCUSED_VERIFY
   FRESH_REVIEW              (fresh_context_review + hardcoding_guard)
-  PUBLIC_MATRIX_VERIFY
+  PUBLIC_SMOKE_VERIFY       (smoke/canary only; not a repair oracle)
   OPTIONAL_CANDIDATE_SANDBOX
   APPLY_OR_REWORK
-  UNMASKING_GATE            (newly exposed failures become tasks)
+  UNMASKING_GATE            (competition-final records public diagnostics; local-public-debug may create tasks)
   FLAKY_TO_TASKS            (stability findings become tasks)
 STABILITY_LOOP              (3x/5x, focused/shuffle supported)
 FINAL_GOAL_GATE             (final_goal_gate.py decides DONE)
@@ -120,7 +120,7 @@ Allowed helper subcommands are `init`, `read-specs`, `read-api`, `map-code`, `ba
 
 `shophub_goal_runner.py` exposes only stateful/common helper subcommands. Other deterministic helpers are standalone scripts and should be invoked directly when their specific signal is needed:
 
-- `public_case_rule_builder.py`
+- `public_case_rule_builder.py` (competition-final writes diagnostics only)
 - `feature_registry.py`
 - `rule_issue_builder.py`
 - `repair_task_builder.py`
@@ -132,4 +132,4 @@ Allowed helper subcommands are `init`, `read-specs`, `read-api`, `map-code`, `ba
 - `checkers/sorting_pagination_checker.py`
 - `review/hardcoding_guard.py`
 
-DONE requires `final_goal_gate.py` to pass, including compile/test evidence, public matrix all green, stability, API compatibility, forbidden/hardcoding guards, P0/P1 feature convergence, and `修复报告.md`.
+DONE requires `final_goal_gate.py` to pass, including input integrity, spec IR, trace coverage, static consistency, generated spec tests, compile/install evidence, public smoke, stability, API compatibility, forbidden/hardcoding guards, and `修复报告.md`. Public smoke is a canary, not a source of P0/P1 repair tasks.

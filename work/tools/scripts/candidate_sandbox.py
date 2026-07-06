@@ -533,8 +533,8 @@ def validate_candidate(
                     passed_count / total_tests if total_tests > 0 else 0.0
                 )
 
-            # --- FSM-DESIGN §11: local gate only blocks hard regressions;
-            # final gate requires full public matrix convergence.
+            # Local gate only blocks hard regressions; final mode treats public
+            # results as smoke convergence, not as a repair-task oracle.
             if gate_mode == "final":
                 matrix_blocked, matrix_reasons = _check_sandbox_final_matrix(sandbox_root)
             else:
@@ -542,7 +542,7 @@ def validate_candidate(
             result["matrix_gate"] = "FAIL" if matrix_blocked else "PASS"
             if matrix_blocked and not result.get("elimination_reason"):
                 result["elimination_reason"] = (
-                    f"Public black-box matrix gate failed: {'; '.join(matrix_reasons)}"
+                    f"Public smoke gate failed: {'; '.join(matrix_reasons)}"
                 )
                 result["errors"].append(result["elimination_reason"])
                 result["public_tests"] = "FAIL"
@@ -687,7 +687,7 @@ def _load_baseline_p0_count(root: Path) -> int:
 
 
 def _check_sandbox_final_matrix(sandbox_root: Path) -> tuple[bool, list[str]]:
-    """Final gate: public black-box matrix must be all-green."""
+    """Final gate: public smoke matrix must be all-green."""
     try:
         import test_outcome_collector
     except ImportError:
