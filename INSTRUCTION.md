@@ -1,6 +1,6 @@
 # ShopHub Goal Runner 入口说明
 
-本文件是比赛作品入口。评分平台加载本 Markdown 后，请按这里定位目标仓库、加载 `work/` 运行资产，并在符合题目结构的目标仓库中完成修复与验证。目标仓库名称不固定，不应依赖仓库目录名。
+本文件是比赛作品入口。评分平台加载本 Markdown 后，请按这里定位赛事提供的 ShopHub 项目、加载 `work/` 运行资产，并在目标项目的 `code/` 中完成修复与验证。
 
 不需要安装插件，不需要复制文件到目标仓库，也不需要额外命令入口。
 
@@ -9,7 +9,15 @@
 先确定两个目录：
 
 - `SUBMISSION_ROOT`：本提交包根目录，包含 `INSTRUCTION.md` 和 `work/`。
-- `PROJECT_ROOT`：待修复的 ShopHub 题目仓库根目录，必须包含：
+- `PROJECT_ROOT`：待修复的 ShopHub 题目仓库根目录。
+
+比赛评测环境中，`PROJECT_ROOT` 固定为：
+
+```text
+/app/code/judge-assets/02_04_design_implementation_consistency/
+```
+
+该目录由平台提供，结构为：
 
 ```text
 README.md
@@ -18,7 +26,7 @@ design-docs/
 test-cases/pom.xml
 ```
 
-如果当前工作目录就是上述结构，则它就是 `PROJECT_ROOT`。否则请在当前目录、父目录和兄弟目录中查找满足该结构的目录。
+执行时应优先使用上述固定路径作为比赛入口。仅当本地调试环境不存在该固定路径时，才可在当前目录、父目录和兄弟目录中查找同时包含 `README.md`、`code/pom.xml`、`design-docs/`、`test-cases/pom.xml` 的目录作为 `PROJECT_ROOT`。
 
 `WORK_ROOT` 固定为：
 
@@ -62,7 +70,7 @@ status
 
 详细工作流、模块映射、修复优先级和 helper scripts 用法以 `${WORK_ROOT}/skills/goal-agent-spec-driven/SKILL.md` 为准。
 
-## 3. 目标
+## 3. 目标与修复依据
 
 对照 `PROJECT_ROOT/design-docs/` 和冻结 API 基线，修复 `PROJECT_ROOT/code/**` 中的设计实现不一致，直到公开验证通过，或剩余问题被明确记录为设计依据不足、环境阻塞或安全停止。
 
@@ -74,6 +82,24 @@ ${PROJECT_ROOT}/design-docs/ 中语义上承载 REST API 参考的文档
 ```
 
 由 `shophub-api-guardian` 负责语义识别，不依赖固定文件名。公开黑盒测试是诊断信号，不是唯一需求依据。修复必须回到设计文档和 API 基线确认。
+
+标准修复流程为：
+
+```text
+设计文档/API 契约分析
+↓
+代码一致性检查
+↓
+修复 code/
+↓
+运行构建验证和公开黑盒测试
+↓
+根据测试结果继续修复
+↓
+稳定后输出结果
+```
+
+其中 `design-docs/` 和 `README.md` 是问题判定依据，`test-cases/` 用于验证修复效果。黑盒测试结果不能替代设计文档和 API 契约作为修复依据。
 
 ## 4. 验证命令
 
@@ -90,9 +116,9 @@ mvn -s maven-settings.xml -f test-cases/pom.xml test
 禁止修改：
 
 ```text
+README.md
 design-docs/**
-README.md 中的比赛说明和 API 基线
-test-cases/**（除非仅为本地诊断，提交修复不得依赖测试改动）
+test-cases/**
 ```
 
 不得改变冻结 `/api/v1/` REST 契约，包括 URL、HTTP Method、请求头语义、请求体字段名或类型、已文档化响应字段名或类型、成功状态码、公开错误码语义。
@@ -109,7 +135,9 @@ code/**/pom.xml
 
 ## 6. 完成输出
 
-完成时必须在 `PROJECT_ROOT` 生成：
+最终修复结果以 `PROJECT_ROOT/code/` 中的代码为准。评测系统获取修复结果时，不依赖内部状态文件或内部 gate 的完成判定。
+
+稳定后应尽量在 `PROJECT_ROOT` 生成以下运行记录，便于人工复盘和问题追踪：
 
 ```text
 修复报告.md
@@ -117,17 +145,18 @@ code/**/pom.xml
 .agent-work/final_goal_report.json
 ```
 
-最终回答必须包含：
+最终回答建议包含：
 
-- 状态：`DONE`、`BLOCKED` 或 `STOPPED_BY_SAFETY`
 - issue 发现/修复/剩余数量
 - API 契约状态
 - 验证命令和结果
 - `修复报告.md` 路径
 - 剩余风险
 
-最终 DONE 必须由机器 gate 判定：
+`final_goal_gate.py` 保留为内部质量检查工具，可在稳定后运行：
 
 ```bash
 python3 ${WORK_ROOT}/tools/scripts/final_goal_gate.py --root ${PROJECT_ROOT}
 ```
+
+`.agent-work/goal_status.json`、`.agent-work/final_goal_report.json` 和 `final_goal_gate.py` 不作为评测系统获取 `PROJECT_ROOT/code/` 修复结果的前置条件。
