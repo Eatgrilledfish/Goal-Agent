@@ -71,6 +71,8 @@ def check_issue(issue: dict) -> list[str]:
         problems.append(f"{issue.get('issue_id','?')}: missing opencode agent_review source")
     if not isinstance(review, dict) or not review.get("generalization_rationale"):
         problems.append(f"{issue.get('issue_id','?')}: missing agent generalization rationale")
+    if not isinstance(review, dict) or not review.get("tool_trace"):
+        problems.append(f"{issue.get('issue_id','?')}: missing agent tool_trace")
     return problems
 
 
@@ -90,6 +92,36 @@ def check_issues_jsonl(path: Path, issues: list[dict]) -> list[str]:
     if json_ids != jsonl_ids:
         problems.append("issues.jsonl issue_id order does not match issues.json")
     return problems
+
+
+def append_run_ledger(work: Path, event: dict) -> None:
+    path = work / "agent_run_ledger.jsonl"
+    rc.ensure_dir(path.parent)
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"recorded_at": rc.now_iso(), **event}, ensure_ascii=False) + "\n")
+
+
+def update_loop_state(work: Path, passed: bool, kept: int, problems: list[str]) -> None:
+    state_path = work / "agent_loop_state.json"
+    if not state_path.exists():
+        return
+    try:
+        state = rc.load_json(state_path)
+    except json.JSONDecodeError:
+        return
+    state["updated_at"] = rc.now_iso()
+    state["current_phase"] = "complete" if passed else "needs_opencode_iteration"
+    state.setdefault("progress_metrics", {})["final_confirmed"] = kept
+    state["stop_reason"] = (
+        "final_gate_passed"
+        if passed else
+        "final_gate_failed: " + "; ".join(problems[:5])
+    )
+    state["next_todos"] = [] if passed else [
+        "Resume opencode semantic review from agent_review_queue.json and agent_run_ledger.jsonl.",
+        "Fix evidence gaps reported by final_detection_gate.json, then rerun review/report/gate.",
+    ]
+    rc.save_json(state_path, state)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -167,6 +199,24 @@ def main(argv: list[str] | None = None) -> int:
         "problems": problems,
     }
     rc.save_json(log_root / "final_detection_gate.json", verdict)
+    work = rc.agent_work_dir(Path(args.code_root))
+    update_loop_state(work, passed, len(kept), problems)
+    append_run_ledger(work, {
+        "event": "final_gate",
+        "actor": "helper",
+        "summary": "Evaluated final result artifacts against detection gate.",
+        "status": "passed" if passed else "failed",
+        "metrics": {
+            "issues_kept": len(kept),
+            "min_required": MIN_ISSUES,
+            "problem_count": len(problems),
+        },
+        "stop_reason": "final_gate_passed" if passed else "final_gate_failed",
+        "next_todos": [] if passed else [
+            "Inspect /logs/trace/final_detection_gate.json.",
+            "Resume opencode review for missing evidence, tool_trace, or confirmed count shortfall.",
+        ],
+    })
     print(f"[gate] passed={passed} kept={len(kept)}/{MIN_ISSUES} problems={len(problems)}")
     return 0 if passed else 1
 

@@ -8,6 +8,9 @@
 
 ```text
 ${AGENT_WORK}/agent_review_queue.json
+${AGENT_WORK}/agent_loop_contract.json
+${AGENT_WORK}/agent_loop_state.json
+${AGENT_WORK}/agent_run_ledger.jsonl
 ${AGENT_WORK}/agent-review/*.json
 ${AGENT_WORK}/candidate_issues.json
 ${AGENT_WORK}/rfc_requirements.json
@@ -16,6 +19,8 @@ ${AGENT_WORK}/code_index.json
 ```
 
 `AGENT_WORK` 以 `agent_review_queue.json` 中的 `agent_work` 字段为准。读取 bundle 时优先使用每个 item 的 `bundle_abs_path`，不要假设 opencode 当前目录就是 `CODE_ROOT` 的父目录。
+
+`agent_review_queue.json` 内嵌 `session`、`agent_loop_contract`、`handoffs`、`guardrails`、`approval_flows` 和 `tracing`。这些字段是执行 contract：你必须按 session 恢复策略读取既有 verdict 和 ledger，按 handoff 交付 JSONL verdict，遵守只读 guardrails，并为 confirmed verdict 写非空 `tool_trace`。
 
 还必须按需读取：
 
@@ -42,6 +47,7 @@ ${CODE_ROOT}/**
 3. 用 `rg` 搜索关键术语、函数名、宏名、错误路径、配置开关、替代实现。
 4. 需要时读调用者或被调函数，确认该实现是否可达。
 5. 做反向误报检查：测试文件/死代码/配置禁用/已有替代逻辑/设计 quote 不支持候选 claim 等。
+6. 把关键工具步骤写入 verdict 的 `tool_trace`，并把阶段进展追加到 `${AGENT_WORK}/agent_run_ledger.jsonl`。
 
 推荐命令：
 
@@ -108,6 +114,14 @@ ${AGENT_WORK}/agent_review_verdicts.jsonl
   "false_positive_controls": ["reverse checks performed"],
   "related_files": ["repo-relative files"],
   "agent_notes": "concise reasoning and tool trail",
+  "tool_trace": [
+    {
+      "tool": "rg/read_file/shell/analysis",
+      "target": "file, symbol, command, or design section inspected",
+      "purpose": "why this step was needed",
+      "result": "short observation used in the verdict"
+    }
+  ],
   "generalization_rationale": "why this is not project-specific hardcoding"
 }
 ```
@@ -144,9 +158,18 @@ python3 ${WORK_ROOT}/tools/scripts/rfc_goal_runner.py \
 
 `review` 只消费你写的 verdict 并做 schema/evidence 校验。缺少 verdict 时会失败，这是预期行为。
 
+同时更新 `${AGENT_WORK}/agent_run_ledger.jsonl`，记录：
+
+- 本轮假设和优先审阅的设计/代码区域。
+- confirmed/probable/rejected 数量。
+- 证据不足或误报样本。
+- 下一轮待办。
+- 停止原因，例如 queue exhausted、budget nearing limit、ready for validation。
+
 ## 约束
 
 - 不修改目标代码和设计文档。
 - 不把 helper 的 regex、权重、候选标题、`semantic_detection` 当最终判断。
 - 不硬编码公开项目、已知 RFC issue、文件名或 gold answer。
 - 证据不足时写 `probable` 或 `rejected`。
+- confirmed verdict 不得缺少 `tool_trace`；缺失会被 validator/gate 拒绝。

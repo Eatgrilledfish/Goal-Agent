@@ -34,6 +34,24 @@ def load_candidates(work: Path) -> dict[str, dict]:
     }
 
 
+def load_queue_metadata(work: Path) -> dict:
+    path = work / "agent_review_queue.json"
+    if not path.exists():
+        return {}
+    try:
+        doc = rc.load_json(path)
+    except json.JSONDecodeError:
+        return {}
+    return doc if isinstance(doc, dict) else {}
+
+
+def append_run_ledger(work: Path, event: dict) -> None:
+    path = work / "agent_run_ledger.jsonl"
+    rc.ensure_dir(path.parent)
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"recorded_at": rc.now_iso(), **event}, ensure_ascii=False) + "\n")
+
+
 def load_agent_verdicts(work: Path) -> tuple[list[dict], list[str]]:
     """Load opencode verdicts.
 
@@ -130,6 +148,14 @@ def normalize_string_list(value: Any) -> list[str]:
     return [str(value)]
 
 
+def normalize_tool_trace(value: Any) -> list[Any]:
+    if not value:
+        return []
+    if isinstance(value, list):
+        return value
+    return [{"note": str(value)}]
+
+
 def evidence_errors(issue: dict) -> list[str]:
     errors: list[str] = []
     de = issue.get("design_evidence", {})
@@ -160,6 +186,10 @@ def evidence_errors(issue: dict) -> list[str]:
         errors.append("confirmed issue missing opencode agent review source")
     if issue.get("status") == "confirmed" and not review.get("generalization_rationale"):
         errors.append("confirmed issue missing generalization_rationale")
+    if issue.get("status") == "confirmed":
+        tool_trace = review.get("tool_trace")
+        if not isinstance(tool_trace, list) or not tool_trace:
+            errors.append("confirmed issue missing non-empty agent_review.tool_trace")
     return errors
 
 
@@ -241,7 +271,7 @@ def merge_verdict(candidate: dict | None, verdict: dict) -> dict:
                 default="",
             ),
             "generalization_rationale": verdict.get("generalization_rationale", ""),
-            "tool_trace": verdict.get("tool_trace", verdict.get("tools_used", [])),
+            "tool_trace": normalize_tool_trace(verdict.get("tool_trace", verdict.get("tools_used", []))),
         },
     }
 
@@ -289,6 +319,9 @@ def main(argv: list[str] | None = None) -> int:
 
     work = rc.agent_work_dir(Path(args.code_root))
     candidates = load_candidates(work)
+    queue_meta = load_queue_metadata(work)
+    session_meta = queue_meta.get("session", {}) if isinstance(queue_meta, dict) else {}
+    loop_contract = queue_meta.get("agent_loop_contract", {}) if isinstance(queue_meta, dict) else {}
     verdicts, load_errors = load_agent_verdicts(work)
     trace_root = rc.ensure_dir(Path(args.log_root) / "trace")
 
@@ -310,6 +343,26 @@ def main(argv: list[str] | None = None) -> int:
             "agent_review_present": False,
             "errors": load_errors,
             "candidate_count": len(candidates),
+            "session": session_meta,
+            "loop_contract_version": loop_contract.get("contract_version"),
+            "execution_model": loop_contract.get("execution_model"),
+        })
+        append_run_ledger(work, {
+            "event": "review_validation",
+            "actor": "helper",
+            "summary": "Review validation stopped because opencode verdict JSONL is missing.",
+            "status": "blocked_missing_agent_verdicts",
+            "metrics": {
+                "candidate_count": len(candidates),
+                "confirmed": 0,
+                "probable": 0,
+                "rejected": len(issues),
+            },
+            "errors": load_errors,
+            "next_todos": [
+                "Run opencode semantic review from agent_review_queue.json.",
+                "Append verdicts with design_evidence, code_evidence, false_positive_controls, and tool_trace.",
+            ],
         })
         print("[validator] opencode verdicts missing; review cannot promote candidates", file=sys.stderr)
         return 2
@@ -335,6 +388,8 @@ def main(argv: list[str] | None = None) -> int:
             issues.append(issue)
 
     rejected = [i for i in issues if i["status"] == "rejected"]
+    confirmed = [i for i in issues if i["status"] == "confirmed"]
+    probable = [i for i in issues if i["status"] == "probable"]
     (trace_root / "rejected_candidates.jsonl").write_text(
         "\n".join(json.dumps(i, ensure_ascii=False) for i in rejected)
         + ("\n" if rejected else ""),
@@ -347,6 +402,12 @@ def main(argv: list[str] | None = None) -> int:
         "candidate_count": len(candidates),
         "missing_candidate_verdicts": sorted(set(candidates) - seen),
         "load_errors": load_errors,
+        "session": session_meta,
+        "loop_contract_version": loop_contract.get("contract_version"),
+        "execution_model": loop_contract.get("execution_model"),
+        "confirmed_with_tool_trace": sum(
+            1 for i in confirmed if i.get("agent_review", {}).get("tool_trace")
+        ),
     })
     rc.save_json(work / "validated_issues.json", {
         "validated_at": rc.now_iso(),
@@ -354,14 +415,51 @@ def main(argv: list[str] | None = None) -> int:
         "agent_review_present": True,
         "load_errors": load_errors,
         "total": len(issues),
-        "confirmed": sum(1 for i in issues if i["status"] == "confirmed"),
-        "probable": sum(1 for i in issues if i["status"] == "probable"),
-        "rejected": sum(1 for i in issues if i["status"] == "rejected"),
+        "confirmed": len(confirmed),
+        "probable": len(probable),
+        "rejected": len(rejected),
         "issues": issues,
     })
-    print(f"[validator] confirmed={sum(1 for i in issues if i['status']=='confirmed')} "
-          f"probable={sum(1 for i in issues if i['status']=='probable')} "
-          f"rejected={sum(1 for i in issues if i['status']=='rejected')}")
+    state_path = work / "agent_loop_state.json"
+    if state_path.exists():
+        try:
+            state = rc.load_json(state_path)
+            state["updated_at"] = rc.now_iso()
+            state["current_phase"] = "validated_agent_verdicts"
+            state.setdefault("progress_metrics", {}).update({
+                "confirmed": len(confirmed),
+                "probable": len(probable),
+                "rejected": len(rejected),
+                "verdict_count": len(verdicts),
+            })
+            state.setdefault("resume_cursors", {})["reviewed_candidate_ids"] = sorted(seen)
+            state["next_todos"] = [
+                "Run issue_ranker/report/final_detection_gate.",
+                "If confirmed count or evidence quality is insufficient, resume opencode review from queue and ledger.",
+            ]
+            rc.save_json(state_path, state)
+        except json.JSONDecodeError:
+            pass
+    append_run_ledger(work, {
+        "event": "review_validation",
+        "actor": "helper",
+        "summary": "Consumed opencode verdicts and validated evidence shape.",
+        "status": "complete" if not load_errors else "complete_with_load_errors",
+        "metrics": {
+            "verdict_count": len(verdicts),
+            "candidate_count": len(candidates),
+            "confirmed": len(confirmed),
+            "probable": len(probable),
+            "rejected": len(rejected),
+            "confirmed_with_tool_trace": sum(
+                1 for i in confirmed if i.get("agent_review", {}).get("tool_trace")
+            ),
+        },
+        "errors": load_errors,
+    })
+    print(f"[validator] confirmed={len(confirmed)} "
+          f"probable={len(probable)} "
+          f"rejected={len(rejected)}")
     return 0 if not load_errors else 1
 
 

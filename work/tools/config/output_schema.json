@@ -80,13 +80,13 @@
         "report_path": {"type": "string"},
         "agent_review": {
           "type": "object",
-          "required": ["source", "agent_notes", "generalization_rationale"],
+          "required": ["source", "agent_notes", "generalization_rationale", "tool_trace"],
           "properties": {
             "source": {"type": "string", "const": "opencode"},
             "candidate_id": {"type": "string"},
             "agent_notes": {"type": "string"},
             "generalization_rationale": {"type": "string"},
-            "tool_trace": {"type": "array"}
+            "tool_trace": {"type": "array", "minItems": 1}
           }
         }
       }

@@ -14,6 +14,7 @@ that regex or score thresholds are semantic agent review.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -637,6 +638,7 @@ def review_contract() -> dict:
             "code_evidence has at least one concrete file, line range, and snippet",
             "inconsistency explains the semantic contradiction or missing behavior",
             "false_positive_controls records at least one reverse check",
+            "tool_trace records at least one concrete opencode search/read/inspection step",
             "generalization_rationale explains why the issue is not project-name hardcoding",
         ],
         "jsonl_record_shape": {
@@ -665,9 +667,224 @@ def review_contract() -> dict:
             "false_positive_controls": ["reverse checks performed"],
             "related_files": ["repo-relative files"],
             "agent_notes": "concise reasoning and tool trail",
+            "tool_trace": [
+                {
+                    "tool": "rg|read_file|shell|analysis",
+                    "target": "file, symbol, command, or design section inspected",
+                    "purpose": "why this step was needed",
+                    "result": "short observation used in the verdict",
+                }
+            ],
             "generalization_rationale": "why this would be detectable in another project",
         },
     }
+
+
+def build_session_id(code_root: Path, design_root: Path, benchmark: Path, prepared_at: str) -> str:
+    raw = "\n".join([str(code_root), str(design_root), str(benchmark), prepared_at])
+    return "opencode-" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def agent_loop_contract(code_root: Path, design_root: Path, benchmark: Path,
+                        work: Path, log_root: Path, prepared_at: str) -> dict:
+    """Machine-readable contract for the opencode-managed semantic loop."""
+    session_id = build_session_id(code_root, design_root, benchmark, prepared_at)
+    return {
+        "contract_version": 1,
+        "execution_model": "model_driven_opencode_loop",
+        "prepared_at": prepared_at,
+        "session": {
+            "session_id": session_id,
+            "agent": "opencode",
+            "state_path": str(work / "agent_loop_state.json"),
+            "ledger_path": str(work / "agent_run_ledger.jsonl"),
+            "queue_path": str(work / "agent_review_queue.json"),
+            "verdict_output": str(work / "agent_review_verdicts.jsonl"),
+            "resume_policy": (
+                "Read state_path and existing verdict_output, skip already-reviewed candidate_id values, "
+                "append new verdicts, and append progress events to ledger_path."
+            ),
+            "max_wall_clock_seconds": 6 * 60 * 60,
+        },
+        "loop_phases": [
+            {
+                "phase_id": "initialize_context",
+                "actor": "opencode",
+                "goal": "Read INSTRUCTION.md, skill docs, queue, loop state, and input roots.",
+                "completion_signal": "agent_run_ledger records the selected CODE_ROOT, DESIGN_ROOT, and benchmark.",
+            },
+            {
+                "phase_id": "domain_first_investigation",
+                "actor": "opencode",
+                "goal": "Review protocol/design-domain bundles before trusting candidate recall.",
+                "completion_signal": "High-priority domain items have verdicts or ledger notes explaining why evidence is insufficient.",
+            },
+            {
+                "phase_id": "candidate_semantic_review",
+                "actor": "opencode",
+                "goal": "Confirm, reject, or downgrade queued candidates after just-in-time code/design exploration.",
+                "completion_signal": "Reviewed candidate_id values appear in verdict_output or are listed as deferred in the ledger.",
+            },
+            {
+                "phase_id": "agent_discovery",
+                "actor": "opencode",
+                "goal": "Search design requirements not represented by candidates and add AGENT-DISCOVERED verdicts when evidence is complete.",
+                "completion_signal": "Ledger records searched design areas and any discovered issue ids.",
+            },
+            {
+                "phase_id": "validation_handoff",
+                "actor": "helper_pipeline",
+                "goal": "Run review/report/gate after opencode writes verdict_output.",
+                "completion_signal": "agent_review_consumption.json and final_detection_gate.json exist.",
+            },
+        ],
+        "handoffs": [
+            {
+                "from": "deterministic_recall_pipeline",
+                "to": "opencode_semantic_review",
+                "artifact": str(work / "agent_review_queue.json"),
+                "acceptance_criteria": [
+                    "queue.review_required is true",
+                    "items contain absolute bundle paths",
+                    "review_contract forbids helper scores as final evidence",
+                ],
+            },
+            {
+                "from": "opencode_semantic_review",
+                "to": "evidence_validator",
+                "artifact": str(work / "agent_review_verdicts.jsonl"),
+                "acceptance_criteria": [
+                    "JSONL is append-only and resumable",
+                    "confirmed verdicts include design/code evidence, false_positive_controls, tool_trace, and generalization_rationale",
+                    "probable/rejected verdicts explain evidence gaps or false-positive controls",
+                ],
+            },
+            {
+                "from": "evidence_validator",
+                "to": "rank_report_gate",
+                "artifact": str(work / "validated_issues.json"),
+                "acceptance_criteria": [
+                    "confirmed issues are only opencode-sourced",
+                    "probable issues are queued for human/agent review, not final output",
+                    "final gate records pass/fail and stop reason",
+                ],
+            },
+        ],
+        "guardrails": {
+            "read_only_targets": [str(code_root), str(design_root), str(benchmark)],
+            "forbidden_actions": [
+                "modify, delete, or format files under CODE_ROOT or DESIGN_ROOT",
+                "hardcode public F-Stack issue titles, file paths, RFC ids, or gold answers as detector logic",
+                "promote regex hits, weights, detector labels, or queue priority directly to confirmed",
+                "write confirmed without concrete design evidence, code evidence, false_positive_controls, and tool_trace",
+            ],
+            "confirmed_issue_policy": "Final confirmed status is a model judgement by opencode, then schema/guardrail validation.",
+            "genericity_policy": (
+                "Every finding must explain the design/code semantic contradiction in project-neutral terms; "
+                "public fixture knowledge may be used only by the optional local regression evaluator."
+            ),
+        },
+        "approval_flows": {
+            "default_policy": "read_only_auto_approved",
+            "auto_approved_tools": [
+                "read INSTRUCTION.md and work assets",
+                "read target code and design documents",
+                "rg/search, nl/sed/head/tail, lightweight file inspection",
+                "run Goal-Agent helper scripts that write only /result, /logs, or .agent-work",
+            ],
+            "requires_approval_or_must_be_skipped": [
+                "any write under CODE_ROOT or DESIGN_ROOT",
+                "destructive shell commands",
+                "network actions not needed for fetching referenced public RFC/design sources",
+                "long target-project builds or tests unrelated to evidence gathering",
+            ],
+        },
+        "tracing": {
+            "per_verdict_required": [
+                "tool_trace entries for searches/files/commands used to support or reject the issue",
+                "agent_notes summarizing reasoning",
+                "false_positive_controls documenting reverse checks",
+            ],
+            "global_artifacts": [
+                str(work / "agent_loop_state.json"),
+                str(work / "agent_run_ledger.jsonl"),
+                str(log_root / "trace" / "agent_review_queue_summary.json"),
+                str(log_root / "trace" / "agent_review_consumption.json"),
+                str(log_root / "trace" / "final_detection_gate.json"),
+            ],
+            "ledger_event_schema": {
+                "recorded_at": "UTC timestamp",
+                "event": "phase/progress/handoff/final_gate",
+                "actor": "opencode|helper",
+                "summary": "what changed",
+                "metrics": "optional counts",
+                "next_todos": "optional follow-up list",
+            },
+        },
+        "stop_conditions": [
+            "All high-priority domain bundles and queued candidates are reviewed or explicitly deferred with evidence gaps.",
+            "At least 4 confirmed issues exist and remaining high-priority areas have been sampled for false negatives.",
+            "The 6 hour wall-clock budget is near exhaustion and ledger records unreviewed areas plus stop reason.",
+            "No confirmed issue may be fabricated solely to satisfy the minimum count.",
+        ],
+        "review_contract": review_contract(),
+    }
+
+
+def build_agent_loop_state(contract: dict, items: list[dict], candidates: list[dict],
+                           protocol_focus: list[dict]) -> dict:
+    session = contract["session"]
+    return {
+        "state_version": 1,
+        "session_id": session["session_id"],
+        "updated_at": contract["prepared_at"],
+        "current_phase": "awaiting_opencode_semantic_review",
+        "objective": (
+            "Identify generic design/code implementation inconsistencies with opencode semantic review; "
+            "helper artifacts are recall and context only."
+        ),
+        "run_hypotheses": [
+            "The candidate queue may miss issues; domain-first design/code investigation is required.",
+            "Regex or mapper hits are weak recall signals until opencode confirms a semantic contradiction.",
+            "Feature gaps and SHOULD/MAY behavior can be valid only with concrete code-side absence evidence and reverse checks.",
+        ],
+        "strategy_changes": [],
+        "progress_metrics": {
+            "candidate_count": len(candidates),
+            "queued_count": len(items),
+            "protocol_domain_queued_count": sum(1 for i in items if i.get("item_type") == "protocol_domain_review"),
+            "candidate_queued_count": sum(1 for i in items if i.get("item_type") == "candidate_review"),
+            "protocol_focus_count": len(protocol_focus),
+            "confirmed": 0,
+            "probable": 0,
+            "rejected": 0,
+        },
+        "resume_cursors": {
+            "next_queue_index": 0,
+            "verdict_output": session["verdict_output"],
+            "append_only_ledger": session["ledger_path"],
+            "reviewed_candidate_ids": [],
+        },
+        "pending_handoffs": contract["handoffs"],
+        "guardrails": contract["guardrails"],
+        "approval_flows": contract["approval_flows"],
+        "trace_obligations": contract["tracing"],
+        "failure_samples": [],
+        "next_todos": [
+            "Read agent_review_queue.json and this loop state.",
+            "Review protocol_domain_review bundles before candidate_review bundles.",
+            "Append verdict JSONL records with non-empty tool_trace.",
+            "Run review/report/gate after verdicts are written.",
+        ],
+        "stop_reason": None,
+    }
+
+
+def append_run_ledger(ledger_path: Path, event: dict) -> None:
+    rc.ensure_dir(ledger_path.parent)
+    record = {"recorded_at": rc.now_iso(), **event}
+    with open(ledger_path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
 def semantic_review_checklist() -> list[dict]:
@@ -790,6 +1007,8 @@ def build_bundle(candidate: dict, requirements: list[dict], code_index: dict,
             "context. Write the final semantic verdict to the queue.verdict_output "
             "JSONL file."
         ),
+        "agent_loop_contract_ref": "queue.agent_loop_contract",
+        "session_ref": "queue.session",
         "candidate": candidate,
         "code_contexts": code_contexts(candidate, code_root, symbol_lookup),
         "related_requirements": related_requirements(candidate, requirements),
@@ -813,6 +1032,8 @@ def build_protocol_focus_bundle(focus: dict, code_root: Path, design_root: Path,
             "design/code inconsistencies and write AGENT-DISCOVERED verdicts to "
             "queue.verdict_output when evidence is complete."
         ),
+        "agent_loop_contract_ref": "queue.agent_loop_contract",
+        "session_ref": "queue.session",
         "code_root": str(code_root),
         "design_root": str(design_root),
         "protocol_focus": focus,
@@ -850,6 +1071,7 @@ def main(argv: list[str] | None = None) -> int:
     candidates = load_json_if_exists(work / "candidate_issues.json", {}).get("candidates", [])
     requirements = load_json_if_exists(work / "rfc_requirements.json", {}).get("requirements", [])
     code_index = load_json_if_exists(work / "code_index.json", {"files": []})
+    prepared_at = rc.now_iso()
     protocol_focus = prioritize_protocol_focus(
         build_protocol_domain_focus(work, code_root, code_index),
         candidates,
@@ -898,8 +1120,11 @@ def main(argv: list[str] | None = None) -> int:
             "status": "pending_opencode_review",
         })
 
+    log_root = Path(args.log_root)
+    loop_contract = agent_loop_contract(code_root, design_root, benchmark, work, log_root, prepared_at)
+    loop_state = build_agent_loop_state(loop_contract, items, candidates, protocol_focus)
     queue = {
-        "prepared_at": rc.now_iso(),
+        "prepared_at": prepared_at,
         "review_required": True,
         "agent": "opencode",
         "code_root": str(code_root),
@@ -913,6 +1138,14 @@ def main(argv: list[str] | None = None) -> int:
             "work/agents/rfc-evidence-reviewer.md",
         ],
         "verdict_output": str(work / "agent_review_verdicts.jsonl"),
+        "session": loop_contract["session"],
+        "agent_loop_contract": loop_contract,
+        "handoffs": loop_contract["handoffs"],
+        "guardrails": loop_contract["guardrails"],
+        "approval_flows": loop_contract["approval_flows"],
+        "tracing": loop_contract["tracing"],
+        "run_ledger_path": loop_contract["session"]["ledger_path"],
+        "loop_state_path": loop_contract["session"]["state_path"],
         "review_contract": review_contract(),
         "semantic_review_checklist": semantic_review_checklist(),
         "protocol_domain_focus": protocol_focus,
@@ -937,15 +1170,33 @@ def main(argv: list[str] | None = None) -> int:
         "items": items,
     }
 
+    rc.save_json(work / "agent_loop_contract.json", loop_contract)
+    rc.save_json(work / "agent_loop_state.json", loop_state)
+    append_run_ledger(work / "agent_run_ledger.jsonl", {
+        "event": "prepare_review_handoff",
+        "actor": "helper",
+        "summary": "Prepared opencode semantic review queue, bundles, loop contract, and resumable session state.",
+        "metrics": {
+            "candidate_count": len(candidates),
+            "candidate_queued_count": len(ordered),
+            "protocol_domain_queued_count": len(domain_items),
+            "queued_count": len(items),
+        },
+        "next_todos": loop_state["next_todos"],
+    })
     rc.save_json(work / "agent_review_queue.json", queue)
     rc.save_json(trace_root / "agent_review_queue_summary.json", {
         "prepared_at": queue["prepared_at"],
+        "session_id": queue["session"]["session_id"],
+        "execution_model": queue["agent_loop_contract"]["execution_model"],
         "candidate_count": len(candidates),
         "candidate_queued_count": len(ordered),
         "protocol_domain_queued_count": len(domain_items),
         "queued_count": len(items),
         "review_required": True,
         "verdict_output": queue["verdict_output"],
+        "loop_state_path": queue["loop_state_path"],
+        "run_ledger_path": queue["run_ledger_path"],
     })
     print(f"[agent-review-bundles] queued_items={len(items)}; "
           f"verdicts required at {queue['verdict_output']}")

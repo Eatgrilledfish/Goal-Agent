@@ -56,7 +56,14 @@ def _issue(status: str, seq: int) -> dict:
             "candidate_id": f"ISSUE-{seq}",
             "agent_notes": "opencode reviewed the evidence chain",
             "generalization_rationale": "The finding is based on design/code behavior rather than a project-specific answer.",
-            "tool_trace": [],
+            "tool_trace": [
+                {
+                    "tool": "read_file",
+                    "target": "freebsd/netinet6/nd6.c",
+                    "purpose": "inspect implementation evidence",
+                    "result": "code path differs from the design evidence",
+                }
+            ],
         },
     }
 
@@ -129,6 +136,14 @@ def _verdict(candidate_id: str, status: str = "confirmed") -> dict:
         "false_positive_controls": ["Checked the implementation path and no alternate branch implements the design behavior."],
         "related_files": ["freebsd/netinet6/nd6.c"],
         "agent_notes": "opencode reviewed design quote and code context",
+        "tool_trace": [
+            {
+                "tool": "rg",
+                "target": "nd6_options",
+                "purpose": "find implementation and callers",
+                "result": "reviewed the live option processing path",
+            }
+        ],
         "generalization_rationale": "The finding is based on design/code behavior, not a project-specific filename.",
     }
 
@@ -160,6 +175,14 @@ def _agent_discovered_verdict(seq: int) -> dict:
         "false_positive_controls": ["Checked related files and no alternate implementation exists."],
         "related_files": [f"src/module_{seq}.c"],
         "agent_notes": "opencode inspected design and code evidence.",
+        "tool_trace": [
+            {
+                "tool": "read_file",
+                "target": f"src/module_{seq}.c",
+                "purpose": "inspect implementation for the design-required behavior",
+                "result": "the implementation omits the documented behavior",
+            }
+        ],
         "generalization_rationale": "The issue is based on a design requirement and implementation evidence.",
     }
 
@@ -373,12 +396,22 @@ def test_validator_consumes_opencode_confirmed_verdict(tmp_path):
     )
 
     validated = json.loads((work / "validated_issues.json").read_text(encoding="utf-8"))
+    consumption = json.loads((log_root / "trace" / "agent_review_consumption.json").read_text(encoding="utf-8"))
+    ledger_lines = [
+        json.loads(line)
+        for line in (work / "agent_run_ledger.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
     issue = validated["issues"][0]
     assert rc == 0
     assert validated["confirmed"] == 1
     assert issue["status"] == "confirmed"
     assert issue["confidence"] == 0.91
     assert issue["agent_review"]["source"] == "opencode"
+    assert issue["agent_review"]["tool_trace"]
+    assert consumption["confirmed_with_tool_trace"] == 1
+    assert ledger_lines[-1]["event"] == "review_validation"
+    assert ledger_lines[-1]["metrics"]["confirmed_with_tool_trace"] == 1
 
 
 def test_validator_rejects_confirmed_verdict_without_agent_evidence(tmp_path):
@@ -415,6 +448,34 @@ def test_validator_rejects_confirmed_verdict_without_agent_evidence(tmp_path):
     assert "missing design_evidence.quote" in issue["fp_note"]
 
 
+def test_validator_rejects_confirmed_verdict_without_tool_trace(tmp_path):
+    code_root = tmp_path / "f-stack"
+    work = tmp_path / ".agent-work"
+    log_root = tmp_path / "logs"
+    code_root.mkdir()
+    candidate = _candidate("wrong_control_flow")
+    verdict = _verdict(candidate["candidate_id"], "confirmed")
+    verdict.pop("tool_trace")
+    _write(work / "candidate_issues.json", json.dumps({"candidates": [candidate]}))
+    _write(work / "agent_review_verdicts.jsonl", json.dumps(verdict) + "\n")
+
+    rc = evidence_validator.main(
+        [
+            "--code-root", str(code_root),
+            "--design-root", str(tmp_path / "design"),
+            "--benchmark", str(tmp_path / "benchmark.md"),
+            "--log-root", str(log_root),
+        ]
+    )
+
+    validated = json.loads((work / "validated_issues.json").read_text(encoding="utf-8"))
+    issue = validated["issues"][0]
+    assert rc == 0
+    assert validated["confirmed"] == 0
+    assert issue["status"] == "rejected"
+    assert "missing non-empty agent_review.tool_trace" in issue["fp_note"]
+
+
 def test_validator_accepts_agent_discovered_issue(tmp_path):
     code_root = tmp_path / "f-stack"
     work = tmp_path / ".agent-work"
@@ -445,6 +506,14 @@ def test_validator_accepts_agent_discovered_issue(tmp_path):
         "impact": "Transient failures are exposed to callers instead of being retried.",
         "false_positive_controls": ["Searched for retry helpers and callers; none are used on this path."],
         "related_files": ["src/client.c"],
+        "tool_trace": [
+            {
+                "tool": "rg",
+                "target": "retry|send_request",
+                "purpose": "check whether an alternate retry implementation exists",
+                "result": "no retry helper is used on this path",
+            }
+        ],
         "generalization_rationale": "The issue is based on a design-required retry behavior and code path evidence.",
     }
     _write(work / "agent_review_verdicts.jsonl", json.dumps(discovered) + "\n")
@@ -510,6 +579,14 @@ def test_agent_review_bundle_builder_emits_queue(tmp_path):
     )
 
     queue = json.loads((work / "agent_review_queue.json").read_text(encoding="utf-8"))
+    loop_contract = json.loads((work / "agent_loop_contract.json").read_text(encoding="utf-8"))
+    loop_state = json.loads((work / "agent_loop_state.json").read_text(encoding="utf-8"))
+    ledger_lines = [
+        json.loads(line)
+        for line in (work / "agent_run_ledger.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    queue_summary = json.loads((log_root / "trace" / "agent_review_queue_summary.json").read_text(encoding="utf-8"))
     candidate_item = next(item for item in queue["items"] if item["item_type"] == "candidate_review")
     domain_item = next(item for item in queue["items"] if item["item_type"] == "protocol_domain_review")
     bundle_path = tmp_path / candidate_item["bundle_path"]
@@ -521,13 +598,31 @@ def test_agent_review_bundle_builder_emits_queue(tmp_path):
     assert queue["protocol_domain_queued_count"] == 1
     assert queue["queued_count"] == 2
     assert queue["agent_work"] == str(work)
+    assert queue["agent_loop_contract"]["execution_model"] == "model_driven_opencode_loop"
+    assert queue["session"]["session_id"].startswith("opencode-")
+    assert queue["session"]["state_path"] == str(work / "agent_loop_state.json")
+    assert queue["session"]["ledger_path"] == str(work / "agent_run_ledger.jsonl")
+    assert queue["handoffs"][0]["from"] == "deterministic_recall_pipeline"
+    assert "forbidden_actions" in queue["guardrails"]
+    assert queue["approval_flows"]["default_policy"] == "read_only_auto_approved"
+    assert "per_verdict_required" in queue["tracing"]
+    assert "tool_trace" in queue["review_contract"]["confirmed_requires"][4]
+    assert loop_contract["session"]["session_id"] == queue["session"]["session_id"]
+    assert loop_state["session_id"] == queue["session"]["session_id"]
+    assert loop_state["current_phase"] == "awaiting_opencode_semantic_review"
+    assert loop_state["progress_metrics"]["queued_count"] == 2
+    assert ledger_lines[-1]["event"] == "prepare_review_handoff"
+    assert queue_summary["session_id"] == queue["session"]["session_id"]
+    assert queue_summary["execution_model"] == "model_driven_opencode_loop"
     assert candidate_item["bundle_abs_path"] == str(bundle_path)
     assert domain_bundle["item_type"] == "protocol_domain_review"
+    assert domain_bundle["agent_loop_contract_ref"] == "queue.agent_loop_contract"
     families = {item["family"] for item in queue["semantic_review_checklist"]}
     assert "protocol_or_feature_gap" in families
     assert "optional_or_recommended_behavior_omitted" in families
     assert "timer_randomization_or_delay_gap" in families
     assert bundle["candidate_id"] == candidate["candidate_id"]
+    assert bundle["agent_loop_contract_ref"] == "queue.agent_loop_contract"
     assert bundle["review_contract"]["verdict_file"] == "queue.verdict_output"
     assert bundle["semantic_review_checklist"]
 
@@ -698,6 +793,34 @@ def test_final_gate_rejects_confirmed_issue_without_agent_review(tmp_path):
     assert rc == 1
     assert any("agent_review" in problem for problem in verdict["problems"])
     assert any("missing opencode agent_review source" in problem for problem in verdict["problems"])
+
+
+def test_final_gate_rejects_confirmed_issue_without_tool_trace(tmp_path):
+    result_root = tmp_path / "result"
+    log_root = tmp_path / "logs"
+    issues = [_issue("confirmed", i) for i in range(1, 5)]
+    issues[0]["agent_review"]["tool_trace"] = []
+    _write(
+        result_root / "issues.json",
+        json.dumps(_result_doc(issues)),
+    )
+    _write(result_root / "issues.jsonl", "\n".join(json.dumps(i) for i in issues) + "\n")
+    _write(result_root / "00-summary.md", "# summary\n")
+    _write(result_root / "01-issue.md", "# issue\n")
+
+    rc = final_detection_gate.main(
+        [
+            "--code-root", str(tmp_path / "f-stack"),
+            "--design-root", str(tmp_path / "design"),
+            "--benchmark", str(tmp_path / "benchmark.md"),
+            "--result-root", str(result_root),
+            "--log-root", str(log_root),
+        ]
+    )
+
+    verdict = json.loads((log_root / "trace" / "final_detection_gate.json").read_text(encoding="utf-8"))
+    assert rc == 1
+    assert any("missing agent tool_trace" in problem for problem in verdict["problems"])
 
 
 def test_final_gate_rejects_missing_result_schema_fields(tmp_path):

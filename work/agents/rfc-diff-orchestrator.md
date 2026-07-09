@@ -42,12 +42,16 @@ python3 ${WORK_ROOT}/tools/scripts/rfc_goal_runner.py \
 
 ## Agent Review Loop
 
+`agent_review_queue.json` 中的 `session`、`agent_loop_contract`、`handoffs`、`guardrails`、`approval_flows` 和 `tracing` 是当前 session 的执行 contract。总控 agent 必须先读 `${AGENT_WORK}/agent_loop_state.json` 和 `${AGENT_WORK}/agent_run_ledger.jsonl`，再调度证据审查；如果是恢复任务，先读取已有 `agent_review_verdicts.jsonl`，跳过已完成的 `candidate_id`。
+
 调用 `rfc-evidence-reviewer` 时，传达以下目标：
 
 - 候选只是线索；不要信任 detector 标签。
 - 读取 `${AGENT_WORK}/agent_review_queue.json`，逐项读取 item 的 `bundle_abs_path`。
 - 用 `rg` 和源文件阅读按需探索设计文档与代码。
 - 允许新增 `AGENT-DISCOVERED-*` issue。
+- 每个 confirmed verdict 必须包含非空 `tool_trace`，记录真实搜索、阅读、命令或分析步骤。
+- 将本轮假设、进展、失败样本、下一步待办和停止原因追加到 `${AGENT_WORK}/agent_run_ledger.jsonl`。
 - 写 queue 中 `verdict_output` 指向的 JSONL verdict 文件。
 
 Evidence reviewer 完成后，再运行：
@@ -65,6 +69,9 @@ python3 ${WORK_ROOT}/tools/scripts/rfc_goal_runner.py --code-root ${CODE_ROOT} -
 ```text
 ${AGENT_WORK}/pipeline_state.json
 ${AGENT_WORK}/agent_review_queue.json
+${AGENT_WORK}/agent_loop_contract.json
+${AGENT_WORK}/agent_loop_state.json
+${AGENT_WORK}/agent_run_ledger.jsonl
 ${AGENT_WORK}/agent_review_verdicts.jsonl
 ${AGENT_WORK}/validated_issues.json
 ${AGENT_WORK}/ranked_issues.json
