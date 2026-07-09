@@ -9,9 +9,12 @@ This runner only *identifies* inconsistencies; it never modifies the target
 code. Final results are written under ``/result`` and trace artifacts under
 ``/logs``.
 
-Subcommands mirror the phases:
-    init | load-docs | extract-spec | index-code | map |
-    detect | review | report | gate | run-all
+Subcommands mirror the phases. ``prepare-review`` is the stable opencode entry:
+it refreshes the deterministic recall artifacts before writing review bundles.
+
+Subcommands:
+    init | load-docs | scope-plan | extract-spec | index-code | map |
+    detect | prepare-review | review | report | gate | run-all
 """
 
 from __future__ import annotations
@@ -38,6 +41,18 @@ PHASE_SCRIPTS: dict[str, list[str]] = {
     "index-code": ["c_code_indexer.py"],
     "map": ["requirement_code_mapper.py"],
     "detect": ["protocol_inconsistency_detector.py"],
+    "prepare-review": [
+        "benchmark_reader.py",
+        "rfc_fetch_convert.py",
+        "code_inventory_lite.py",
+        "rfc_scope_planner.py",
+        "rfc_scope_plan_validator.py",
+        "normative_requirement_extractor.py",
+        "c_code_indexer.py",
+        "requirement_code_mapper.py",
+        "protocol_inconsistency_detector.py",
+        "agent_review_bundle_builder.py",
+    ],
     "review": ["evidence_validator.py", "issue_ranker.py"],
     "report": ["issue_report_writer.py"],
     "gate": ["final_detection_gate.py"],
@@ -51,10 +66,54 @@ PHASE_ORDER = [
     "index-code",
     "map",
     "detect",
+    "prepare-review",
     "review",
     "report",
     "gate",
 ]
+
+
+def discover_code_root() -> str:
+    """Return the default target repository under the competition asset root.
+
+    The public task uses ``code/f-stack``, but hidden evaluations may place a
+    different repository under ``code/``. Prefer the historical path when it
+    exists, otherwise use the single directory under ``code/``.
+    """
+    code_dir = Path(rc.DEFAULT_ASSET_ROOT) / "code"
+    preferred = code_dir / "f-stack"
+    if preferred.exists():
+        return str(preferred)
+    if code_dir.exists():
+        dirs = sorted(p for p in code_dir.iterdir() if p.is_dir())
+        if len(dirs) == 1:
+            return str(dirs[0])
+        return str(code_dir)
+    return str(preferred)
+
+
+def discover_design_root() -> str:
+    asset_root = Path(rc.DEFAULT_ASSET_ROOT)
+    for name in ("Difference", "design", "design-docs", "docs"):
+        path = asset_root / name
+        if path.exists():
+            return str(path)
+    return str(asset_root / "Difference")
+
+
+def discover_benchmark(design_root: str) -> str:
+    root = Path(design_root)
+    preferred = root / "benchmark.md"
+    if preferred.exists():
+        return str(preferred)
+    if root.exists():
+        docs = sorted(
+            p for suffix in ("*.md", "*.txt", "*.rst", "*.adoc")
+            for p in root.rglob(suffix)
+        )
+        if docs:
+            return str(docs[0])
+    return str(preferred)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -62,13 +121,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         prog="rfc_goal_runner.py",
         description="RFC implementation-difference-detection pipeline runner.",
     )
-    p.add_argument("--code-root", required=False, default=rc.DEFAULT_ASSET_ROOT + "/code/f-stack",
-                   help="F-Stack code repository root.")
-    p.add_argument("--design-root", required=False, default=rc.DEFAULT_ASSET_ROOT + "/Difference",
+    p.add_argument("--code-root", required=False, default=None,
+                   help="Target code repository root. Defaults to the repository under ASSET_ROOT/code.")
+    p.add_argument("--design-root", required=False, default=None,
                    help="Design / RFC document root.")
-    p.add_argument("--benchmark", required=False,
-                   default=rc.DEFAULT_ASSET_ROOT + "/Difference/benchmark.md",
-                   help="Path to benchmark.md.")
+    p.add_argument("--benchmark", required=False, default=None,
+                   help="Path to benchmark/design entry markdown.")
     p.add_argument("--result-root", required=False, default="/result",
                    help="Final result output root.")
     p.add_argument("--log-root", required=False, default="/logs",
@@ -76,6 +134,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("command", choices=list(PHASE_ORDER) + ["run-all"],
                    help="Pipeline phase to run, or 'run-all'.")
     return p
+
+
+def resolve_paths(args: argparse.Namespace) -> None:
+    if not args.code_root:
+        args.code_root = discover_code_root()
+    if not args.design_root:
+        args.design_root = discover_design_root()
+    if not args.benchmark:
+        args.benchmark = discover_benchmark(args.design_root)
 
 
 def run_script(name: str, args: argparse.Namespace) -> int:
@@ -173,6 +240,7 @@ def mark_phase(args: argparse.Namespace, phase: str, status: str) -> None:
 def main(argv: list[str] | None = None) -> int:
     rc.add_script_dir_to_path()
     args = build_arg_parser().parse_args(argv)
+    resolve_paths(args)
 
     if args.command == "run-all":
         failures = []

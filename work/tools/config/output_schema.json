@@ -39,12 +39,13 @@
         "impact",
         "false_positive_controls",
         "related_files",
-        "report_path"
+        "report_path",
+        "agent_review"
       ],
       "properties": {
         "issue_id": {"type": "string"},
         "title": {"type": "string"},
-        "status": {"type": "string", "enum": ["confirmed", "probable", "rejected"]},
+        "status": {"type": "string", "enum": ["confirmed"]},
         "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
         "normative_level": {"type": "string"},
         "design_evidence": {
@@ -76,7 +77,18 @@
         "impact": {"type": "string"},
         "false_positive_controls": {"type": "array", "minItems": 1, "items": {"type": "string"}},
         "related_files": {"type": "array", "items": {"type": "string"}},
-        "report_path": {"type": "string"}
+        "report_path": {"type": "string"},
+        "agent_review": {
+          "type": "object",
+          "required": ["source", "agent_notes", "generalization_rationale"],
+          "properties": {
+            "source": {"type": "string", "const": "opencode"},
+            "candidate_id": {"type": "string"},
+            "agent_notes": {"type": "string"},
+            "generalization_rationale": {"type": "string"},
+            "tool_trace": {"type": "array"}
+          }
+        }
       }
     }
   }

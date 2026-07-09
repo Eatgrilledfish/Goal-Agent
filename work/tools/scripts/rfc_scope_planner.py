@@ -236,6 +236,8 @@ def classify(scored: list[dict], policy: dict) -> dict:
     threshold = policy.get("primary_score_threshold", 0.75)
     max_primary = policy.get("max_primary_rfcs", 8)
     min_primary = policy.get("min_primary_rfcs", 4)
+    core_policy = policy.get("core_protocol_primary", {})
+    gap_policy = policy.get("feature_gap_primary", {})
 
     excluded: list[dict] = []
     eligible: list[dict] = []
@@ -248,6 +250,8 @@ def classify(scored: list[dict], policy: dict) -> dict:
             reasons.append("obsoleted by a newer RFC also present in this benchmark; successor preferred")
         if s["operational"]:
             reasons.append("operational/deployment guidance; weak direct implementation obligation")
+        if s["protocol_area"] == "unknown" and not s.get("expected_code_areas"):
+            reasons.append("no protocol-domain mapping or code anchors; reference-only RFC")
         if reasons:
             excluded.append({"rfc": s["rfc"], "reason": "; ".join(reasons),
                              "final_score": s["scores"]["final"]})
@@ -257,15 +261,48 @@ def classify(scored: list[dict], policy: dict) -> dict:
     # Highest final score first.
     eligible.sort(key=lambda s: s["scores"]["final"], reverse=True)
 
-    primary = [s for s in eligible if s["scores"]["final"] >= threshold]
-    # Top-up to min_primary from the best remaining (covers small/threshold-miss sets).
-    if len(primary) < min_primary:
-        for s in eligible:
-            if s in primary:
-                continue
+    def primary_selection_reason(s: dict) -> str | None:
+        scores = s["scores"]
+        if scores["final"] >= threshold:
+            return "score-threshold"
+        if (
+            scores["implementation_boundary"] >= core_policy.get("min_implementation_boundary", 1.1)
+            and scores["security_or_protocol_core"] >= core_policy.get("min_security_or_protocol_core", 1.1)
+            and scores["code_anchor"] >= core_policy.get("min_code_anchor", 1.1)
+        ):
+            return "core-protocol-anchor"
+        if (
+            scores["normative_strength"] >= gap_policy.get("min_normative_strength", 1.1)
+            and scores["implementation_boundary"] >= gap_policy.get("min_implementation_boundary", 1.1)
+            and scores["code_anchor"] <= gap_policy.get("max_code_anchor", -0.1)
+        ):
+            return "feature-gap-probe"
+        return None
+
+    selected_reason: dict[str, str] = {}
+    primary = []
+    for s in eligible:
+        reason = primary_selection_reason(s)
+        if reason:
             primary.append(s)
-            if len(primary) >= min_primary:
-                break
+            selected_reason[s["rfc"]] = reason
+
+    # The documented policy says top max_primary RFCs also enter the primary
+    # loop. This keeps important near-threshold protocol RFCs from being left
+    # out before semantic review has a chance to inspect code evidence.
+    for s in eligible[:max_primary]:
+        if s not in primary:
+            primary.append(s)
+            selected_reason[s["rfc"]] = "top-score-within-max-primary"
+
+    # Top-up to min_primary from the best remaining (covers small/threshold-miss sets).
+    for s in eligible:
+        if len(primary) >= min_primary:
+            break
+        if s in primary:
+            continue
+        primary.append(s)
+        selected_reason[s["rfc"]] = "min-primary-top-up"
     # Hard cap.
     if len(primary) > max_primary:
         primary = primary[:max_primary]
@@ -290,6 +327,7 @@ def classify(scored: list[dict], policy: dict) -> dict:
             "tier": tier,
             "score": s["scores"]["final"],
             "reason": "; ".join(reasons) or "selected by policy score",
+            "selection_policy": selected_reason.get(s["rfc"], "secondary-reference"),
             "scope": s["protocol_area"],
             "expected_code_areas": s["expected_code_areas"],
             "risk": risk_of(sec),

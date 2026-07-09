@@ -59,7 +59,16 @@ def render_issue_md(issue: dict) -> str:
     if not issue.get("false_positive_controls"):
         lines.append("* (none)")
     lines.append("")
-    lines.append("## 7. Confidence")
+    if issue.get("agent_review"):
+        review = issue["agent_review"]
+        lines.append("## 7. Agent Review")
+        lines.append(f"- Source: {review.get('source', '')}")
+        if review.get("agent_notes"):
+            lines.append(f"- Notes: {review.get('agent_notes', '')}")
+        if review.get("generalization_rationale"):
+            lines.append(f"- Generalization: {review.get('generalization_rationale', '')}")
+        lines.append("")
+    lines.append("## 8. Confidence")
     lines.append(f"{issue.get('status', '')}, score={issue.get('confidence', 0.0)}")
     if issue.get("fp_note"):
         lines.append("")
@@ -71,8 +80,8 @@ def render_issue_md(issue: dict) -> str:
 def build_summary(issues: list[dict], code_root: str, benchmark: str,
                   stats: dict) -> str:
     confirmed = sum(1 for i in issues if i["status"] == "confirmed")
-    probable = sum(1 for i in issues if i["status"] == "probable")
     high_conf = sum(1 for i in issues if i["confidence"] >= 0.80)
+    review_queue = stats.get("probable_review_queue", 0)
     lines = [
         "# RFC / Implementation Difference Detection Summary",
         "",
@@ -84,7 +93,8 @@ def build_summary(issues: list[dict], code_root: str, benchmark: str,
         f"- Normative requirements extracted: {stats.get('requirement_count', 0)}",
         f"- Code files indexed: {stats.get('file_count', 0)}",
         f"- Candidate inconsistencies: {stats.get('candidate_count', 0)}",
-        f"- Confirmed/probable issues: {confirmed + probable}",
+        f"- Confirmed issues: {confirmed}",
+        f"- Probable issues queued for review: {review_queue}",
         "",
         "## Issues",
         "",
@@ -99,11 +109,11 @@ def build_summary(issues: list[dict], code_root: str, benchmark: str,
             f"{loc} | {i.get('confidence', 0.0)} |"
         )
     lines.append("")
-    if confirmed + probable < 4:
+    if confirmed < 4:
         lines.append("## Note")
         lines.append("")
         lines.append(
-            f"Fewer than 4 confirmed/probable issues found ({confirmed + probable}). "
+            f"Fewer than 4 confirmed issues found ({confirmed}). "
             "Reason: insufficient evidence / RFC fetch blocked / code paths unconfirmed. "
             "No issues were fabricated."
         )
@@ -121,7 +131,17 @@ def collect_stats(work: Path) -> dict:
         if p.exists():
             doc = rc.load_json(p)
             stats[key] = doc.get(key, doc.get("file_count", 0) if key == "file_count" else 0)
+    review_path = work / "probable_review_queue.json"
+    if review_path.exists():
+        stats["probable_review_queue"] = rc.load_json(review_path).get("probable", 0)
     return stats
+
+
+def clean_old_issue_reports(result_root: Path) -> None:
+    for path in result_root.glob("[0-9][0-9]-*.md"):
+        if path.name == "00-summary.md":
+            continue
+        path.unlink()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -140,7 +160,11 @@ def main(argv: list[str] | None = None) -> int:
     if not ranked_path.exists():
         print("[reporter] ranked_issues.json missing", file=sys.stderr)
         return 0
-    issues = rc.load_json(ranked_path).get("issues", [])
+    issues = [
+        i for i in rc.load_json(ranked_path).get("issues", [])
+        if i.get("status") == "confirmed"
+    ]
+    clean_old_issue_reports(result_root)
 
     confirmed = sum(1 for i in issues if i["status"] == "confirmed")
     probable = sum(1 for i in issues if i["status"] == "probable")

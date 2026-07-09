@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Phase 6: validate evidence chains and control false positives.
+"""Consume opencode semantic review verdicts and validate evidence shape.
 
-Every candidate must satisfy the six evidence requirements (section 9.8).
-Confidence is computed from evidence completeness plus normative-level and
-trace-status modifiers loaded from ``confidence_weights.json`` -- never
-hardcoded per issue.
-
-Output: .agent-work/validated_issues.json
+Final issue status is not computed by regex, confidence weights, or protocol
+domain rules. Upstream scripts create candidates and review bundles; the
+running opencode agent performs the semantic investigation and writes
+the ``agent_review_verdicts.jsonl`` path specified by the review queue. This phase only checks that the
+agent verdicts carry enough design/code evidence for the output schema and
+converts them into ``validated_issues.json`` for ranking/reporting.
 """
 
 from __future__ import annotations
@@ -15,201 +15,271 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 import rfc_common as rc
 
-MAY_REJECTION_RULES = [
-    "RFC is MAY and absence does not constitute a clear behavioral difference.",
-]
+VALID_STATUSES = {"confirmed", "probable", "rejected"}
+VERDICT_JSONL = "agent_review_verdicts.jsonl"
 
 
-def false_positive_controls(candidate: dict) -> list[str]:
-    controls: list[str] = []
-    ce = candidate.get("code_evidence", [])
-    if ce:
-        controls.append("Confirmed code location is reachable from the mapped protocol path.")
-        controls.append("Code evidence is anchored to a concrete file and line range, not a guess.")
-    else:
-        controls.append("No code location found; reported as a feature gap, not a behavioral violation.")
-    if candidate.get("detection_type") == "hardcoded_limit_mismatch":
-        controls.append("Hardcoded limit appears in control flow, not merely in a logging statement.")
-    if candidate.get("detection_type") == "silent_drop_error_handling_mismatch":
-        controls.append("Drop path lacks the RFC-required feedback (error/ICMP).")
-    return controls
+def load_candidates(work: Path) -> dict[str, dict]:
+    path = work / "candidate_issues.json"
+    if not path.exists():
+        return {}
+    candidates = rc.load_json(path).get("candidates", [])
+    return {
+        c.get("candidate_id", f"CANDIDATE-{idx:04d}"): c
+        for idx, c in enumerate(candidates, start=1)
+    }
 
 
-def compute_confidence(candidate: dict, weights: dict, domain_ok: bool) -> float:
-    w = weights.get("weights", {})
-    pen = weights.get("penalties", {})
-    cap = weights.get("confidence_cap", 0.9)
-    conf = 0.0
-    de = candidate.get("design_evidence", {})
-    ce = candidate.get("code_evidence", [])
-    if de and de.get("quote"):
-        conf += w.get("design_evidence_present", 0.0)
-    if ce and any(c.get("snippet") for c in ce):
-        conf += w.get("code_evidence_present", 0.0)
-    if ce and any(c.get("line_start") for c in ce):
-        conf += w.get("code_location_present", 0.0)
-    if de and (de.get("section") or de.get("source_anchor")):
-        conf += w.get("design_location_present", 0.0)
+def load_agent_verdicts(work: Path) -> tuple[list[dict], list[str]]:
+    """Load opencode verdicts.
 
-    # Quality, not just presence: more distinct matched code signals => stronger.
-    total_reasons = sum(len(c.get("match_reasons", [])) for c in ce)
-    strength = min(1.0, total_reasons / 3.0)
-    conf += w.get("evidence_strength_bonus", 0.0) * strength
+    JSONL is the required handoff format because the opencode loop can append
+    incrementally and resume long reviews without rewriting prior verdicts.
+    """
+    errors: list[str] = []
+    jsonl_path = work / VERDICT_JSONL
+    if jsonl_path.exists():
+        verdicts: list[dict] = []
+        for line_no, line in enumerate(jsonl_path.read_text(encoding="utf-8").splitlines(), start=1):
+            if not line.strip():
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError as exc:
+                errors.append(f"{VERDICT_JSONL}:{line_no}: invalid JSON: {exc}")
+                continue
+            if isinstance(obj, dict):
+                verdicts.append(obj)
+            else:
+                errors.append(f"{VERDICT_JSONL}:{line_no}: verdict must be an object")
+        return verdicts, errors
 
-    if any("control flow" in r or "control-flow" in r for r in candidate.get("detection_reasons", [])) or \
-       candidate.get("detection_type") in {"hardcoded_limit_mismatch", "wrong_control_flow",
-                                            "silent_drop_error_handling_mismatch"}:
-        conf += w.get("control_flow_evidence_present", 0.0)
-
-    # Domain anchoring is the sanity check that was missing: evidence that does
-    # not belong to the RFC's protocol domain must not be confirmed.
-    if domain_ok:
-        conf += w.get("domain_match_bonus", 0.0)
-    else:
-        conf -= pen.get("domain_mismatch", 0.0)
-
-    level = candidate.get("normative_level", "MAY")
-    conf += weights.get("normative_level_modifier", {}).get(level, 0.0)
-    conf += weights.get("trace_status_modifier", {}).get(candidate.get("trace_status", "linked"), 0.0)
-
-    # A single weak signal is not enough to land at the top of the scale.
-    if total_reasons <= 1:
-        conf -= pen.get("weak_single_signal", 0.0)
-
-    # Hard cap: heuristic detections are never certain. Previously the presence
-    # weights summed to ~1.0 (+MUST) so almost everything hit 1.0.
-    conf = max(0.0, min(cap, conf))
-    return round(conf, 3)
+    return [], [f"{VERDICT_JSONL} missing; opencode semantic review has not run"]
 
 
-def classify(conf: float, weights: dict, candidate: dict) -> str:
-    th = weights["thresholds"]
-    has_rfc = bool(candidate.get("design_evidence", {}).get("quote"))
-    has_code = bool(candidate.get("code_evidence"))
-    # Section 11.1 / Goal: every issue MUST carry RFC evidence AND code
-    # evidence (with a concrete code location). Candidates lacking either
-    # are rejected -- they cannot satisfy the output schema (code_evidence
-    # minItems=1) nor the Goal's per-issue evidence requirement. Feature-gap
-    # candidates with no code location are reported as rejected, not emitted.
-    if not has_rfc or not has_code:
-        return "rejected"
-    if conf < th["probable"]:
-        return "rejected"
-    if conf >= th["confirmed"]:
-        return "confirmed"
-    return "probable"
+def first_present(*values: Any, default: Any = "") -> Any:
+    for value in values:
+        if value not in (None, "", [], {}):
+            return value
+    return default
 
 
-def apply_fp_filters(candidate: dict, status: str) -> tuple[str, str | None]:
-    """Return (possibly_updated_status, rejection_reason). Section 11.1."""
-    if status == "rejected":
-        return status, None
-    level = candidate.get("normative_level", "MAY")
-    if level == "MAY" and candidate.get("detection_type") != "missing_feature_protocol_gap":
-        if status == "confirmed":
-            status = "probable"
-        return status, "MAY requirement down-weighted; emitted as probable/gap only."
-    if candidate.get("trace_status") == "unlinked":
-        # Unlinked requirements are weakly anchored; never confirm them.
-        if status == "confirmed":
-            status = "probable"
+def status_from_verdict(verdict: dict) -> tuple[str, str | None]:
+    raw = first_present(
+        verdict.get("status"),
+        verdict.get("agent_status"),
+        verdict.get("decision"),
+        default="",
+    )
+    status = str(raw).strip().lower()
+    if status not in VALID_STATUSES:
+        return "rejected", f"Invalid or missing opencode verdict status: {raw!r}"
     return status, None
 
 
-def domain_check(candidate: dict, domain_map: dict) -> tuple[bool, str | None]:
-    """Sanity check: the cited code must belong to the RFC's protocol domain.
-
-    Returns (ok, reason). When the RFC is absent from the domain map, or the
-    primary code file is not under one of the domain's code paths/tokens, the
-    evidence chain is broken (e.g. RFC3122 -> tcp_ecn.c) and the candidate is
-    rejected regardless of its keyword score.
-    """
-    rfc = candidate.get("design_evidence", {}).get("rfc", "")
-    domain = rc.resolve_rfc_domain(rfc, domain_map)
-    if not domain:
-        return False, (f"RFC {rfc} not in domain map; cannot anchor code evidence "
-                       "to a protocol domain.")
-    ce = candidate.get("code_evidence", [])
-    if ce:
-        primary = ce[0].get("file", "")
-        if primary and not rc.file_matches_domain(primary, domain):
-            topic_str = ", ".join(domain.get("topics", [])) or domain.get("protocol_area", "")
-            return False, (f"Code evidence file '{primary}' does not match RFC {rfc} "
-                           f"protocol domain ({topic_str}).")
-    return True, None
+def confidence_from_verdict(verdict: dict, status: str) -> tuple[float, str | None]:
+    raw = first_present(verdict.get("confidence"), verdict.get("agent_confidence"), default=None)
+    if raw is None:
+        defaults = {"confirmed": 0.8, "probable": 0.6, "rejected": 0.0}
+        return defaults[status], "Missing agent confidence; defaulted from status for sorting only."
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 0.0, f"Invalid agent confidence: {raw!r}"
+    return round(max(0.0, min(1.0, value)), 3), None
 
 
-def validate(candidate: dict, weights: dict, domain_map: dict) -> dict:
-    domain_ok, domain_note = domain_check(candidate, domain_map)
-    conf = compute_confidence(candidate, weights, domain_ok)
-    # Note: we deliberately do NOT floor confidence at min_confidence. That
-    # max() previously inflated every weak detection to >=0.65, which is why
-    # 53/53 issues passed as confirmed/probable. The detection type's
-    # min_confidence now only serves as documentation of expected strength.
-    status = classify(conf, weights, candidate)
-    if not domain_ok:
-        status = "rejected"
-        conf = min(conf, 0.4)
-    status, fp_reason = apply_fp_filters(candidate, status)
-    if domain_note:
-        fp_reason = domain_note
-    controls = false_positive_controls(candidate)
+def normalize_design_evidence(source: dict) -> dict:
+    de = source.get("design_evidence") or source.get("rfc_evidence") or {}
+    return {
+        "rfc": first_present(de.get("rfc"), de.get("doc_id"), source.get("rfc"), default=""),
+        "section": first_present(de.get("section"), source.get("section"), default=""),
+        "doc_path": first_present(de.get("doc_path"), de.get("source_doc"), source.get("source_doc"), default=""),
+        "quote": first_present(de.get("quote"), de.get("requirement_text"), source.get("requirement_text"), default=""),
+    }
 
+
+def normalize_code_evidence(source: dict) -> list[dict]:
+    out: list[dict] = []
+    for ce in source.get("code_evidence", []) or []:
+        if not isinstance(ce, dict):
+            continue
+        start = int(ce.get("line_start") or 0)
+        end = int(ce.get("line_end") or start or 0)
+        out.append({
+            "file": ce.get("file", ""),
+            "line_start": start,
+            "line_end": end,
+            "symbol": ce.get("symbol", ""),
+            "snippet": ce.get("snippet", ""),
+        })
+    return out
+
+
+def normalize_string_list(value: Any) -> list[str]:
+    if not value:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        return [str(item) for item in value if item]
+    return [str(value)]
+
+
+def evidence_errors(issue: dict) -> list[str]:
+    errors: list[str] = []
+    de = issue.get("design_evidence", {})
+    if not de.get("quote"):
+        errors.append("missing design_evidence.quote")
+    if not (de.get("rfc") or de.get("doc_path")):
+        errors.append("missing design_evidence.rfc/doc_path")
+    ce = issue.get("code_evidence", [])
+    if not ce:
+        errors.append("missing code_evidence")
+    for idx, item in enumerate(ce, start=1):
+        if not item.get("file"):
+            errors.append(f"code_evidence[{idx}] missing file")
+        if not item.get("snippet"):
+            errors.append(f"code_evidence[{idx}] missing snippet")
+        if int(item.get("line_start") or 0) <= 0:
+            errors.append(f"code_evidence[{idx}] missing line_start")
+        if int(item.get("line_end") or 0) <= 0:
+            errors.append(f"code_evidence[{idx}] missing line_end")
+    if not issue.get("inconsistency"):
+        errors.append("missing inconsistency explanation")
+    if issue.get("status") == "confirmed" and not issue.get("impact"):
+        errors.append("confirmed issue missing impact")
+    if issue.get("status") == "confirmed" and not issue.get("false_positive_controls"):
+        errors.append("confirmed issue missing false_positive_controls")
+    review = issue.get("agent_review", {})
+    if issue.get("status") == "confirmed" and review.get("source") != "opencode":
+        errors.append("confirmed issue missing opencode agent review source")
+    if issue.get("status") == "confirmed" and not review.get("generalization_rationale"):
+        errors.append("confirmed issue missing generalization_rationale")
+    return errors
+
+
+def merge_verdict(candidate: dict | None, verdict: dict) -> dict:
+    base = candidate or {}
+    status, status_note = status_from_verdict(verdict)
+    conf, conf_note = confidence_from_verdict(verdict, status)
+    verdict_de = normalize_design_evidence(verdict)
+    verdict_ce = normalize_code_evidence(verdict)
+
+    title = first_present(
+        verdict.get("title"),
+        verdict.get("issue_title"),
+        base.get("title"),
+        default="Design/code inconsistency",
+    )
+    if status == "confirmed":
+        # Confirmed verdicts must restate the evidence opencode judged. A bare
+        # candidate_id plus status would let helper-script evidence become the
+        # final issue, which violates the agent-review contract.
+        design_evidence = verdict_de
+        code_evidence = verdict_ce
+    else:
+        design_evidence = verdict_de if verdict_de.get("quote") else normalize_design_evidence(base)
+        code_evidence = verdict_ce or normalize_code_evidence(base)
+
+    related_files = sorted(set(normalize_string_list(
+        first_present(verdict.get("related_files"), base.get("related_files"), default=[])
+    )))
+    if not related_files:
+        related_files = sorted({c.get("file", "") for c in code_evidence if c.get("file")})
+
+    notes = [n for n in [status_note, conf_note] if n]
     issue = {
-        "issue_id": candidate["candidate_id"],
-        "title": candidate["title"],
+        "issue_id": first_present(verdict.get("candidate_id"), base.get("candidate_id"), default="AGENT-ISSUE"),
+        "title": title,
         "status": status,
         "confidence": conf,
-        "normative_level": candidate.get("normative_level", "MAY"),
-        "detection_type": candidate.get("detection_type"),
-        "design_evidence": {
-            "rfc": candidate["design_evidence"].get("rfc"),
-            "section": candidate["design_evidence"].get("section", ""),
-            "doc_path": candidate["design_evidence"].get("doc_path", ""),
-            "quote": candidate["design_evidence"].get("quote", ""),
+        "normative_level": first_present(
+            verdict.get("normative_level"),
+            base.get("normative_level"),
+            default="unknown",
+        ),
+        "detection_type": first_present(
+            verdict.get("semantic_family"),
+            verdict.get("detection_type"),
+            base.get("detection_type"),
+            default="agent_semantic_review",
+        ),
+        "design_evidence": design_evidence,
+        "code_evidence": code_evidence,
+        "inconsistency": first_present(
+            verdict.get("inconsistency"),
+            verdict.get("contradiction"),
+            "" if status == "confirmed" else base.get("inconsistency"),
+            default="",
+        ),
+        "impact": first_present(
+            verdict.get("impact"),
+            "" if status == "confirmed" else base.get("impact"),
+            default="",
+        ),
+        "false_positive_controls": normalize_string_list(first_present(
+            verdict.get("false_positive_controls"),
+            verdict.get("false_positive_risks"),
+            [] if status == "confirmed" else base.get("false_positive_controls"),
+            default=[],
+        )),
+        "related_files": related_files,
+        "requirement_id": first_present(verdict.get("requirement_id"), base.get("requirement_id"), default=""),
+        "protocol_area": first_present(verdict.get("protocol_area"), base.get("protocol_area"), default=""),
+        "agent_review": {
+            "source": "opencode",
+            "candidate_id": first_present(verdict.get("candidate_id"), base.get("candidate_id"), default=""),
+            "agent_notes": first_present(
+                verdict.get("agent_notes"),
+                verdict.get("finality_reason"),
+                verdict.get("review_notes"),
+                default="",
+            ),
+            "generalization_rationale": verdict.get("generalization_rationale", ""),
+            "tool_trace": verdict.get("tool_trace", verdict.get("tools_used", [])),
         },
-        "code_evidence": [
-            {
-                "file": c.get("file", ""),
-                "line_start": c.get("line_start", 0),
-                "line_end": c.get("line_end", 0),
-                "symbol": c.get("symbol", ""),
-                "snippet": c.get("snippet", ""),
-            }
-            for c in candidate.get("code_evidence", [])
-        ],
-        "inconsistency": candidate.get("inconsistency", ""),
-        "impact": infer_impact(candidate),
-        "false_positive_controls": controls if controls else ["No code evidence; reported as gap only."],
-        "related_files": sorted({c.get("file", "") for c in candidate.get("code_evidence", []) if c.get("file")}),
-        "requirement_id": candidate.get("requirement_id"),
-        "protocol_area": candidate.get("protocol_area"),
     }
-    if fp_reason:
-        issue["fp_note"] = fp_reason
+
+    errs = evidence_errors(issue)
+    if conf_note and status == "confirmed":
+        errs.append(conf_note)
+    if errs and status == "confirmed":
+        issue["status"] = "rejected"
+        issue["confidence"] = min(issue["confidence"], 0.2)
+        notes.append("Confirmed verdict rejected by schema/evidence validation: " + "; ".join(errs))
+    elif errs and status == "probable":
+        notes.append("Probable verdict has incomplete evidence: " + "; ".join(errs))
+    elif errs:
+        notes.append("Rejected verdict evidence issues: " + "; ".join(errs))
+
+    if notes:
+        issue["fp_note"] = " ".join(notes)
     return issue
 
 
-def infer_impact(candidate: dict) -> str:
-    dtype = candidate.get("detection_type", "")
-    impacts = {
-        "hardcoded_limit_mismatch": "Valid protocol items after the hardcoded limit may be ignored.",
-        "missing_required_behavior": "A required RFC behavior is not implemented; protocol conformance breaks.",
-        "wrong_control_flow": "The full header/option chain is not walked; later items are skipped.",
-        "missing_feature_protocol_gap": "A protocol capability required by the RFC is absent from the repository.",
-        "silent_drop_error_handling_mismatch": "Packets are dropped without the required error/feedback.",
-        "timer_delay_behavior_mismatch": "Randomized delay or suppression required by the RFC is missing.",
-        "packet_path_mismatch": "Packets may be bypassed, forwarded, or dropped instead of processed by the stack.",
-    }
-    return impacts.get(dtype, "Potential deviation from the RFC normative requirement.")
+def build_missing_verdict_issues(candidates: dict[str, dict]) -> list[dict]:
+    issues: list[dict] = []
+    for candidate_id, candidate in candidates.items():
+        verdict = {
+            "candidate_id": candidate_id,
+            "status": "rejected",
+            "confidence": 0.0,
+            "agent_notes": "Missing opencode semantic review verdict.",
+        }
+        issue = merge_verdict(candidate, verdict)
+        issue["fp_note"] = "Missing opencode semantic review verdict; helper candidates are not final evidence."
+        issues.append(issue)
+    return issues
 
 
 def main(argv: list[str] | None = None) -> int:
     rc.add_script_dir_to_path()
-    parser = argparse.ArgumentParser(description="Validate evidence chains.")
+    parser = argparse.ArgumentParser(description="Validate opencode agent review verdicts.")
     parser.add_argument("--code-root", required=True)
     parser.add_argument("--design-root", required=True)
     parser.add_argument("--benchmark", required=True)
@@ -218,17 +288,71 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     work = rc.agent_work_dir(Path(args.code_root))
-    cand_path = work / "candidate_issues.json"
-    if not cand_path.exists():
-        print("[validator] candidate_issues.json missing", file=sys.stderr)
-        return 0
-    candidates = rc.load_json(cand_path).get("candidates", [])
-    weights = rc.load_config("confidence_weights.json")
-    domain_map = rc.load_config("rfc_domain_map.json")
+    candidates = load_candidates(work)
+    verdicts, load_errors = load_agent_verdicts(work)
+    trace_root = rc.ensure_dir(Path(args.log_root) / "trace")
 
-    issues = [validate(c, weights, domain_map) for c in candidates]
+    if load_errors and not verdicts:
+        issues = build_missing_verdict_issues(candidates)
+        rc.save_json(work / "validated_issues.json", {
+            "validated_at": rc.now_iso(),
+            "agent_review_required": True,
+            "agent_review_present": False,
+            "errors": load_errors,
+            "total": len(issues),
+            "confirmed": 0,
+            "probable": 0,
+            "rejected": len(issues),
+            "issues": issues,
+        })
+        rc.save_json(trace_root / "agent_review_consumption.json", {
+            "consumed_at": rc.now_iso(),
+            "agent_review_present": False,
+            "errors": load_errors,
+            "candidate_count": len(candidates),
+        })
+        print("[validator] opencode verdicts missing; review cannot promote candidates", file=sys.stderr)
+        return 2
+
+    seen: set[str] = set()
+    issues: list[dict] = []
+    for verdict in verdicts:
+        candidate_id = str(first_present(verdict.get("candidate_id"), default=""))
+        candidate = candidates.get(candidate_id)
+        if candidate_id:
+            seen.add(candidate_id)
+        issues.append(merge_verdict(candidate, verdict))
+
+    for candidate_id, candidate in candidates.items():
+        if candidate_id not in seen:
+            issue = merge_verdict(candidate, {
+                "candidate_id": candidate_id,
+                "status": "rejected",
+                "confidence": 0.0,
+                "agent_notes": "Candidate was queued but opencode did not write a verdict.",
+            })
+            issue["fp_note"] = "Candidate was queued but opencode did not write a verdict."
+            issues.append(issue)
+
+    rejected = [i for i in issues if i["status"] == "rejected"]
+    (trace_root / "rejected_candidates.jsonl").write_text(
+        "\n".join(json.dumps(i, ensure_ascii=False) for i in rejected)
+        + ("\n" if rejected else ""),
+        encoding="utf-8",
+    )
+    rc.save_json(trace_root / "agent_review_consumption.json", {
+        "consumed_at": rc.now_iso(),
+        "agent_review_present": True,
+        "verdict_count": len(verdicts),
+        "candidate_count": len(candidates),
+        "missing_candidate_verdicts": sorted(set(candidates) - seen),
+        "load_errors": load_errors,
+    })
     rc.save_json(work / "validated_issues.json", {
         "validated_at": rc.now_iso(),
+        "agent_review_required": True,
+        "agent_review_present": True,
+        "load_errors": load_errors,
         "total": len(issues),
         "confirmed": sum(1 for i in issues if i["status"] == "confirmed"),
         "probable": sum(1 for i in issues if i["status"] == "probable"),
@@ -238,7 +362,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"[validator] confirmed={sum(1 for i in issues if i['status']=='confirmed')} "
           f"probable={sum(1 for i in issues if i['status']=='probable')} "
           f"rejected={sum(1 for i in issues if i['status']=='rejected')}")
-    return 0
+    return 0 if not load_errors else 1
 
 
 if __name__ == "__main__":

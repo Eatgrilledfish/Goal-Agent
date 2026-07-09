@@ -1,5 +1,5 @@
 {
-  "_comment": "Heuristic patterns driving protocol_inconsistency_detector.py. Each detection type derives candidate inconsistencies from RFC requirement IR + code evidence, never from a hardcoded issue list. rfc_signals are deliberately broad so genuinely-mapped requirements are not filtered out before the code-evidence stage; code_signals keep a specific pattern (high signal) plus a broad fallback (catches mapped code so behavior can be reviewed downstream).",
+  "_comment": "Heuristic patterns driving protocol_inconsistency_detector.py. Each detection type derives candidate inconsistencies from RFC requirement IR + code evidence, never from a hardcoded issue list. rfc_signals may be broad, but code_signals must cite specific implementation evidence; generic fallback patterns are intentionally excluded.",
   "detection_types": {
     "hardcoded_limit_mismatch": {
       "description": "RFC requires processing all valid items (or imposes no fixed count); code stops after a hardcoded limit and returns success.",
@@ -8,10 +8,10 @@
         "macros": ["MAX", "LIMIT", "_MAX", "MAXND", "NDOPT", "NRTT"],
         "patterns": [
           {"regex": "i\\s*<\\s*[A-Z_]*MAX[A-Z_]*", "reason": "loop bounded by a fixed MAX macro constant"},
+          {"regex": "(?i)if\\s*\\([^)]*\\b\\w*(?:max|limit)\\w*\\b[^)]*\\)", "reason": "control flow stops or branches on a maximum/limit variable"},
           {"regex": "ndopts->.*opt_count\\s*[<>]", "reason": "option loop bounded by an option count rather than TLV length"},
           {"regex": "#define\\s+\\w*MAX\\w*", "reason": "hardcoded MAX/limit style macro definition"},
-          {"regex": "\\[[A-Z_]*MAX[A-Z_]*\\]", "reason": "array sized by a hardcoded MAX/limit constant"},
-          {"regex": "return", "reason": "function returns — potential behavior mismatch with RFC requirement"}
+          {"regex": "\\[[A-Z_]*MAX[A-Z_]*\\]", "reason": "array sized by a hardcoded MAX/limit constant"}
         ]
       },
       "min_confidence": 0.70
@@ -22,8 +22,8 @@
       "code_signals": {
         "absence": "requirement_code_mapper reports trace_status=unlinked or no candidate_code_locations; for linked traces the mapped symbol must still be reviewed against the requirement",
         "patterns": [
-          {"regex": "return\\s+0\\s*;", "reason": "function returns success without performing the required action"},
-          {"regex": "\\b\\w+\\s*\\(", "reason": "implementation symbol referenced — behavior should be reviewed against RFC requirement"}
+          {"regex": "(?i)not\\s+implemented|not\\s+supported|do\\s+not\\s+support", "reason": "implementation explicitly says the required behavior is not implemented/supported"},
+          {"regex": "return\\s+0\\s*;", "reason": "function returns success without performing the required action"}
         ]
       },
       "min_confidence": 0.65
@@ -33,9 +33,9 @@
       "rfc_signals": ["extension header", "chain", "each option", "next header", "walk", "traverse", "header", "option", "chain", "extension", "each", "all", "every"],
       "code_signals": {
         "patterns": [
-          {"regex": "break\\s*;", "reason": "early break out of header/option processing loop"},
-          {"regex": "goto\\s+bad", "reason": "control flow jumps to error path instead of continuing chain"},
-          {"regex": "return", "reason": "function returns — potential behavior mismatch with RFC requirement"}
+          {"regex": "doesn'?t follow the whole chain of extension headers", "reason": "implementation comment says the extension-header chain is not walked"},
+          {"regex": "only looks at the extension header", "reason": "implementation comment says only the first extension header is inspected"},
+          {"regex": "hdr->proto\\s*==\\s*IPPROTO_FRAGMENT", "reason": "fragment lookup checks only the IPv6 header's immediate Next Header field"}
         ]
       },
       "min_confidence": 0.68
@@ -46,7 +46,7 @@
       "code_signals": {
         "absence": "domain code_paths yield zero indexed symbols; for linked traces the mapped symbol must still be reviewed against the required capability",
         "patterns": [
-          {"regex": "\\b\\w+\\s*\\(", "reason": "related implementation symbol referenced — capability coverage must be reviewed against RFC requirement"}
+          {"regex": "(?i)ENOTSUP|EOPNOTSUPP|not\\s+supported|unsupported|do\\s+not\\s+support", "reason": "mapped code explicitly reports the protocol capability as unsupported"}
         ]
       },
       "min_confidence": 0.60
@@ -57,8 +57,7 @@
       "code_signals": {
         "patterns": [
           {"regex": "goto\\s+(drop|bad|freeit)", "reason": "packet silently dropped without required ICMP/error feedback"},
-          {"regex": "m_freem\\s*\\(", "reason": "packet freed without emitting required feedback"},
-          {"regex": "return", "reason": "function returns — potential behavior mismatch with RFC requirement"}
+          {"regex": "m_freem\\s*\\(", "reason": "packet freed without emitting required feedback"}
         ]
       },
       "min_confidence": 0.66
@@ -69,8 +68,7 @@
       "code_signals": {
         "patterns": [
           {"regex": "delay\\s*=\\s*0", "reason": "delay forced to zero where RFC requires randomized delay"},
-          {"regex": "arc_random|random.*delay|Random", "reason": "no randomized delay primitive found in mapped function"},
-          {"regex": "return", "reason": "function returns — potential behavior mismatch with RFC requirement"}
+          {"regex": "(?i)delay rule.*not implemented|not implemented.*delay|random delay.*not necessary", "reason": "implementation/comment indicates randomized delay is not implemented or bypassed"}
         ]
       },
       "min_confidence": 0.62
@@ -81,8 +79,8 @@
       "code_signals": {
         "patterns": [
           {"regex": "ff_kni\\s*\\(|kni_ingress|ff_veth", "reason": "packet redirected to KNI/veth bypass instead of protocol stack"},
-          {"regex": "ETHERTYPE_IP6", "reason": "IPv6 packet path handling branch"},
-          {"regex": "return", "reason": "function returns — potential behavior mismatch with RFC requirement"}
+          {"regex": "rte_is_multicast_ether_addr\\s*\\(", "reason": "multicast frames are classified before protocol-specific handling"},
+          {"regex": "return\\s+FILTER_MULTI\\s*;", "reason": "multicast packet is routed to the generic multicast/KNI path"}
         ]
       },
       "min_confidence": 0.64

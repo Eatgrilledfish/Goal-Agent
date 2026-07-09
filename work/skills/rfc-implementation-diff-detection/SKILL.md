@@ -1,163 +1,194 @@
 ---
 name: rfc-implementation-diff-detection
-description: RFC代码实现不一致识别。读取RFC规范文档与F-Stack C/C++/DPDK/FreeBSD实现代码，提取规范性需求(MUST/SHOULD/MAY)，建立需求→代码追溯矩阵，检测不一致问题，生成证据链报告。只读代码，不修改目标工程。
+description: 设计文档/RFC 与目标代码实现不一致识别。helper 脚本负责加载设计、提取需求、索引代码、生成候选和证据包；运行中的 opencode agent 负责按需探索代码与设计文档并写出最终语义 verdict。只读目标工程。
 ---
 
-# RFC 实现差异检视流水线
+# 设计/代码实现差异检视流程
 
-本 Skill 定义 RFC 规范与 C/C++ 网络协议栈实现之间的差异检视流程。全程只读目标代码，所有输出写入 `/result`、`/logs` 和 `.agent-work/`。
+本 Skill 定义“设计依据 ↔ 代码实现”差异检视流程。它兼容 RFC 形式的协议设计文档，也允许 opencode 对非 RFC 的设计文档进行人工智能语义调查。全程只读目标代码，所有输出写入 `/result`、`/logs` 和 `.agent-work/`。
 
-## 运行前提
+## 核心原则
 
-- 目标仓库为 F-Stack（C/C++/DPDK/FreeBSD 网络协议栈），**不存在 `pom.xml`、`maven-settings.xml`**
-- 不得运行 Maven / Java 构建
-- 不得修改 `code/**`、`Difference/**`、`benchmark.md`
-- 只允许写入 `/result/**`、`/logs/**`、`.agent-work/**`
+- 候选生成是 recall，不是裁决。
+- regex、权重、domain map、`semantic_detection` 只能帮助排序和找上下文，不能决定 final confirmed。
+- final confirmed/probable/rejected 必须来自 opencode 写入的 `${AGENT_WORK}/agent_review_verdicts.jsonl`。
+- opencode 可以确认候选，也可以新增 `AGENT-DISCOVERED-*` issue，只要提供完整设计证据和代码证据。
+- 不得硬编码公开项目、文件名、RFC 编号或已知 gold issue。
 
-## 目录结构（固定路径）
+## 目录约定
 
 ```text
-CODE_ROOT   = /app/code/judge-assets/01_03_ai_implementation_design_difference_detection/code/f-stack
-DESIGN_ROOT = /app/code/judge-assets/01_03_ai_implementation_design_difference_detection/Difference
-BENCHMARK   = ${DESIGN_ROOT}/benchmark.md
+CODE_ROOT   = <ASSET_ROOT>/code/<target-project>
+DESIGN_ROOT = <ASSET_ROOT>/Difference or design/design-docs/docs
+BENCHMARK   = <DESIGN_ROOT>/benchmark.md or the design entry document
 RESULT_ROOT = /result
 LOG_ROOT    = /logs
 ```
 
+`rfc_goal_runner.py` 在未显式传参时会自动发现 `ASSET_ROOT/code/` 下的目标仓库。公共样例是 F-Stack；隐藏评测不应假设项目名固定。
+
 ## 流水线阶段
 
-### Phase 0: Preflight — 环境初始化
+### Phase 0: Preflight
 
-- 确认 `CODE_ROOT`、`DESIGN_ROOT`、`BENCHMARK` 路径存在
-- 创建 `.agent-work/`、`/result`、`/logs/trace` 目录
-- 写入 `pipeline_state.json` 初始化状态
-- 缺失关键输入 → STOP，输出 `missing_competition_inputs`
+创建 `.agent-work/`、`/result`、`/logs/trace`，记录输入路径。
 
 ```bash
 python3 work/tools/scripts/rfc_goal_runner.py init
 ```
 
-### Phase 1: Load RFC Sources — 加载 RFC 文档
+### Phase 1: Load Design / RFC Sources
 
-- 解析 `benchmark.md`，提取 RFC 列表与 commit 信息
-- 批量获取 RFC 原文（本地缓存优先，缺失时从 `rfc-editor.org` 拉取）
-- 处理 RFC supersession 链（如 8200→2460, 4861→2461），记录替代关系
+解析设计入口，公共 RFC 任务会提取 RFC 列表并缓存 RFC 文档。若设计不是 RFC，opencode 仍应在审阅阶段直接读取 `DESIGN_ROOT` 中的设计文档。
 
 ```bash
 python3 work/tools/scripts/rfc_goal_runner.py load-docs
 ```
 
-**调用脚本**: `benchmark_reader.py` → `rfc_fetch_convert.py`
+调用脚本：`benchmark_reader.py`、`rfc_fetch_convert.py`
 
-### Phase 2: Build Normative Requirements — 提取规范性需求
+### Phase 2: Scope Plan
 
-- 遍历所有 RFC 文档，提取 MUST / MUST NOT / SHOULD / SHOULD NOT / MAY 条款
-- 每条需求附 RFC 编号、章节号、原文引用、规范级别
-- 输出结构化 IR：`rfc_requirements.json`
+生成轻量代码清单，选择第一轮重点设计/RFC 范围，避免把引用性 RFC 或无代码锚点的文档放大为主任务。
+
+```bash
+python3 work/tools/scripts/rfc_goal_runner.py scope-plan
+```
+
+调用脚本：`code_inventory_lite.py`、`rfc_scope_planner.py`、`rfc_scope_plan_validator.py`
+
+### Phase 3: Extract Requirements
+
+从 RFC/设计文档中抽取规范性或约束性语句。对 RFC 使用 MUST/SHOULD/MAY；若没有 RFC manifest 或没有抽到 RFC requirement，则从普通设计文档中抽取 modal design requirement，保留 requirement text、source doc 与章节上下文，并用 generic mapper 做跨项目召回。
 
 ```bash
 python3 work/tools/scripts/rfc_goal_runner.py extract-spec
 ```
 
-**调用脚本**: `normative_requirement_extractor.py`
+调用脚本：`normative_requirement_extractor.py`
 
-### Phase 3: Index Code — 扫描 C/H 代码
+### Phase 4: Index Code
 
-- 递归扫描 F-Stack 下所有 `.c`、`.h` 文件
-- 提取函数签名、宏定义、控制流结构、协议常量
-- 按协议域（IPv6/IPsec/TCP/UDP/SCTP/ICMP/ND）分类索引
+扫描目标仓库 C/C++/header/build 文件，提取函数、宏、符号和片段。索引器必须支持多行函数签名与 FreeBSD/KNF 风格，但不得把已知 issue 写成特例。
 
 ```bash
 python3 work/tools/scripts/rfc_goal_runner.py index-code
 ```
 
-**调用脚本**: `c_code_indexer.py`
-**输出**: `code_index.json`
+输出：`.agent-work/code_index.json`、`/logs/trace/code_index_stats.json`
 
-### Phase 4: Requirement-Code Mapping — 需求→代码追溯
+### Phase 5: Requirement-Code Mapping
 
-- 将每条 RFC 规范需求映射到候选代码位置
-- 状态标记：`linked`（已匹配）/ `unlinked`（未匹配）/ `ambiguous`（多候选）
-- 利用 `rfc_domain_map.json` 协议域→代码路径映射辅助匹配
+将需求映射到可能相关的代码位置，输出追溯矩阵。映射结果是调查入口，不是证据结论。
 
 ```bash
 python3 work/tools/scripts/rfc_goal_runner.py map
 ```
 
-**调用脚本**: `requirement_code_mapper.py`
-**输出**: `rfc_code_trace.json`
+输出：`.agent-work/rfc_code_trace.json`
 
-### Phase 5: Difference Detection — 不一致检测
+### Phase 6: Candidate Recall
 
-- 基于 7 种检测类型提出不一致候选：
-  1. `hardcoded_limit_mismatch` — 硬编码限制与 RFC 不符
-  2. `missing_required_behavior` — 缺失 RFC 要求的 MUST/SHOULD 行为
-  3. `wrong_control_flow` — TLV/扩展头遍历链路提前终止
-  4. `missing_feature_protocol_gap` — 协议域整体缺失实现
-  5. `silent_drop_error_handling_mismatch` — 静默丢弃却未发 ICMP/错误反馈
-  6. `timer_delay_behavior_mismatch` — 定时器/延迟/随机化行为不符
-  7. `packet_path_mismatch` — 报文路径错误（旁路/转发/丢弃）
-
-- 每个候选必须同时提供 RFC 原文证据和代码证据
+基于需求、代码索引、追溯矩阵提出候选不一致。候选可以使用规则或模式做召回，但不得作为最终 issue 输出。
 
 ```bash
 python3 work/tools/scripts/rfc_goal_runner.py detect
 ```
 
-**调用脚本**: `protocol_inconsistency_detector.py`
-**输出**: `candidate_issues.json`
+输出：`.agent-work/candidate_issues.json`
 
-### Phase 6: Evidence Review — 证据审查与误报过滤
+### Phase 7: Prepare Agent Review
 
-- 评估每条候选的置信度（权重：设计证据 0.25 + 代码证据 0.25 + 代码位置 0.15 + 设计位置 0.10 + 误报控制 0.15 + 控制流证据 0.10）
-- 规范级别调整：MUST +0.05, SHOULD 不变, MAY -0.10
-- 追溯状态调整：linked 不变, ambiguous -0.10, unlinked -0.30
-- 分类：`confirmed`(≥0.80) / `probable`(≥0.65) / `rejected`(<0.65)
-- MAY 条款降权，无代码证据的候选不输出
+这是 opencode 的稳定入口。它会先刷新 Phase 1-6 的确定性召回 artifacts，再把候选、设计片段、代码上下文、相关需求、建议检索命令打包给 opencode。
+
+```bash
+python3 work/tools/scripts/rfc_goal_runner.py prepare-review
+```
+
+输出：
+
+```text
+${AGENT_WORK}/agent_review_queue.json
+${AGENT_WORK}/agent-review/*.json
+/logs/trace/agent_review_queue_summary.json
+```
+
+`agent_review_queue.json` 包含 `agent_work`、`verdict_output` 和每个 item 的 `bundle_abs_path`，opencode 应使用这些绝对路径接续审阅。
+queue 的 `items` 先列 `protocol_domain_review`，再列 `candidate_review`。opencode 应先做协议/设计域级调查，再用候选 bundle 补充确认或拒绝。
+
+### Phase 8: Opencode Semantic Review
+
+这是唯一的语义裁决阶段，由 opencode 执行，不由 Python helper 自动替代。
+
+opencode 必须：
+
+1. 读取 `${AGENT_WORK}/agent_review_queue.json`。
+2. 逐个读取 queue item 的 `bundle_abs_path`。
+3. 对候选证据做 just-in-time 调查：`rg`、`sed`、`nl`、读调用者、读相邻宏、读设计上下文。
+4. 对候选未覆盖的设计要求继续做全局调查。
+5. 写 queue 中 `verdict_output` 指向的 JSONL 文件。
+
+JSONL verdict 的 `status` 只能是：
+
+- `confirmed`：进入正式结果候选，仍需 schema/evidence 校验。
+- `probable`：进入 review queue，不写入 `/result/issues.json`。
+- `rejected`：丢弃并记录原因。
+
+### Phase 9: Validate, Rank, Report, Gate
+
+`review` 阶段只消费 opencode verdict；缺少 verdict 时失败，不把 helper 分数升级为 issue。
 
 ```bash
 python3 work/tools/scripts/rfc_goal_runner.py review
-```
-
-**调用脚本**: `evidence_validator.py` → `issue_ranker.py`
-
-### Phase 7: Report — 生成报告
-
-- 生成机器可读主结果：`/result/issues.json`（schema 见 `output_schema.json`）
-- 生成人类可读总览：`/result/00-summary.md`
-- 逐 issue 生成证据链报告：`/result/01-*.md`
-- 每份报告含 RFC 原文引用、代码位置、检测类型、置信度、证据链
-
-```bash
 python3 work/tools/scripts/rfc_goal_runner.py report
-```
-
-**调用脚本**: `issue_report_writer.py`
-
-### Phase 8: Final Detection Gate — 最终判定门
-
-- 校验输出完整性：`issues.json` 存在且合法、至少一个单 issue markdown
-- 检查问题数量与质量：confirmed + probable ≥ 4 个
-- 不足 4 个时记录原因（RFC 获取失败 / 证据不足 / 代码路径无法确认），不得伪造
-
-```bash
 python3 work/tools/scripts/rfc_goal_runner.py gate
 ```
 
-**调用脚本**: `final_detection_gate.py`
-**输出**: `/logs/trace/final_detection_gate.json`
+调用脚本：
+
+- `evidence_validator.py`：校验 opencode verdict 的字段和证据完整性，写 `validated_issues.json`。
+- `issue_ranker.py`：只把 `confirmed` 写入 `ranked_issues.json`；`probable` 写入 `probable_review_queue.json`。
+- `issue_report_writer.py`：生成 `/result`。
+- `final_detection_gate.py`：确保主结果只含 confirmed，且 schema 合法。
+
+## Confirmed Issue 要求
+
+每个 confirmed issue 必须包含：
+
+- 设计证据：设计文档/RFC 路径、章节或标题、短引用。
+- 代码证据：repo-relative 文件、行号范围、符号、代码片段。
+- 不一致解释：设计要求与实现行为之间的真实语义矛盾或遗漏。
+- 影响说明：协议、功能、运行时或用户可见影响。
+- 误报控制：至少一个反向检查。
+- 泛化说明：为什么这不是针对公开项目或已知答案的硬编码。
+
+Feature gap 可以 confirmed，但需要代码侧证据支撑缺失判断，例如显式 unsupported/not implemented 注释、相邻入口函数缺少分支、构建/注册表缺失、全局搜索摘要或替代实现排除记录。
+
+MAY/SHOULD 行为可以 confirmed，但必须解释省略该行为造成的互操作、兼容、功能或设计一致性影响，并证明没有其他代码路径实现该行为。
 
 ## 完成标准
 
-1. `rfc_goal_runner.py run-all` 退出码 0
-2. `/result/issues.json` 已生成
-3. `/result/00-summary.md` 已生成
-4. `/result/` 下至少一个 `01-*.md` 单 issue 报告
-5. `/logs/trace/final_detection_gate.json` 已生成，gate 判定通过
+1. `${AGENT_WORK}/agent_review_verdicts.jsonl` 存在。
+2. `/result/issues.json`、`/result/issues.jsonl`、`/result/00-summary.md` 已生成。
+3. `/result/issues.json` 中只包含 `confirmed` issue。
+4. `/logs/trace/final_detection_gate.json` 已生成。
+5. confirmed 少于 4 个时，报告说明证据不足原因，不伪造。
 
-## 关键约束
+## Public Fixture Regression
 
-- **不修改目标代码**：所有阶段只读 `code/`、`Difference/`、`benchmark.md`
-- **不依赖 Maven/Java**：本题为 C/C++/DPDK/FreeBSD 工程，无 Java 构建
-- **不引入 Spring Boot / ShopHub 假设**
-- **证据不足不伪造**：未达 4 个 issue 时在 `00-summary.md` 如实说明原因
+公共 F-Stack 样例有一个只用于本地回归的 gold evaluator：
+
+```bash
+python3 work/tools/scripts/public_fstack_gold_evaluator.py \
+  --result /result/issues.json \
+  --output /logs/trace/public_fstack_gold_eval.json
+```
+
+它检查最终 confirmed 输出是否覆盖公开样例的已知问题，并估算额外 confirmed 比例。该 evaluator 不得被 detector、mapper、validator、ranker、report 或正式 gate 调用；隐藏评测仍以 opencode 的通用设计/代码语义审阅为准。
+
+## 禁止事项
+
+- 不修改目标代码或设计文档。
+- 不运行与目标技术栈无关的构建系统。
+- 不引入 Spring Boot、ShopHub、F-Stack 公开答案等项目特定假设。
+- 不用规则分数、regex 命中或候选标题替代 opencode 语义判断。

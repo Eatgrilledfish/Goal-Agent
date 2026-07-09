@@ -6,10 +6,20 @@
   "prefer_code_checkable_behavior": true,
   "exclude_operational_guidance": true,
   "exclude_obsoleted_if_successor_present": true,
-  "max_primary_rfcs": 8,
+  "max_primary_rfcs": 12,
 
   "primary_score_threshold": 0.75,
   "min_primary_rfcs": 4,
+  "core_protocol_primary": {
+    "min_implementation_boundary": 0.85,
+    "min_security_or_protocol_core": 0.8,
+    "min_code_anchor": 0.45
+  },
+  "feature_gap_primary": {
+    "min_normative_strength": 0.50,
+    "min_implementation_boundary": 0.50,
+    "max_code_anchor": 0.40
+  },
 
   "scoring_weights": {
     "normative_strength": 0.25,

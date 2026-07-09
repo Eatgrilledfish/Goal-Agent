@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""Phase 2: extract normative requirements from cached RFC documents.
+"""Phase 2: extract normative requirements from cached RFC / design documents.
 
 Scans each RFC markdown for RFC 2119 keywords (MUST / SHOULD / MAY ...),
 records the enclosing section, requirement text, normative level, topic and
-protocol area, and applies RFC supersession (section 7.1 / 9.4).
+protocol area, and applies RFC supersession (section 7.1 / 9.4). When the
+design input is not RFC-based, falls back to extracting modal design
+requirements from the design document tree so hidden projects are not forced
+through the public F-Stack/RFC shape.
 
 Outputs:
   .agent-work/rfc_requirements.json   (list of requirement IR records)
@@ -23,6 +26,7 @@ from pathlib import Path
 import rfc_common as rc
 
 SECTION_RE = re.compile(r"^#{1,6}\s+(\d+(?:\.\d+)*\.?)\s+(.+)$")
+HEADING_RE = re.compile(r"^#{1,6}\s+(.+)$")
 SENTENCE_END_RE = re.compile(r"(?<=[.!?])\s+")
 REQ_ID_COUNTER: dict[str, int] = {}
 
@@ -35,6 +39,19 @@ _KEYWORD_TOKEN_RE = re.compile(
     r"\b(MUST NOT|SHALL NOT|SHOULD NOT|MUST|SHALL|SHOULD|REQUIRED|"
     r"RECOMMENDED|OPTIONAL|MAY|NOT)\b"
 )
+DESIGN_MODAL_PATTERN = re.compile(
+    r"\b(MUST NOT|SHALL NOT|SHOULD NOT|MUST|SHALL|SHOULD|REQUIRED|"
+    r"RECOMMENDED|OPTIONAL|MAY|must not|shall not|should not|must|shall|"
+    r"should|required|recommended)\b"
+)
+GENERIC_DESIGN_MODAL_PATTERN = re.compile(
+    r"\b(MUST NOT|SHALL NOT|SHOULD NOT|MUST|SHALL|SHOULD|REQUIRED|"
+    r"RECOMMENDED|OPTIONAL|MAY|must not|shall not|should not|must|shall|"
+    r"should|required|recommended|must be|must have|is required to|are required to|"
+    r"requires|require|ensure|ensures|forbid|forbids|forbidden|prohibit|"
+    r"prohibits|prohibited|cannot|must never)\b"
+)
+DESIGN_DOC_SUFFIXES = {".md", ".txt", ".rst", ".adoc"}
 # Filler words that survive once RFC 2119 keywords are stripped from the
 # boilerplate notice / enumeration. If *only* these remain, the sentence is a
 # keyword enumeration, not a requirement.
@@ -79,10 +96,41 @@ def current_section(lines: list[str], upto: int) -> tuple[str, str]:
     return "", ""
 
 
+def current_heading(lines: list[str], upto: int) -> tuple[str, str]:
+    for i in range(upto, -1, -1):
+        m = HEADING_RE.match(lines[i].strip())
+        if m:
+            title = m.group(1).strip()
+            return rc.slugify(title, maxlen=40), title
+    return "preamble", "Preamble"
+
+
 def split_sentences(text: str) -> list[str]:
     text = re.sub(r"\s+", " ", text).strip()
     parts = SENTENCE_END_RE.split(text)
     return [p.strip() for p in parts if p.strip()]
+
+
+def requirement_context(full: str, match: re.Match) -> str:
+    """Return the paragraph containing a normative/modal keyword.
+
+    RFC text wraps sentences across physical lines. A line-only snippet loses
+    the subject ("when sending a proxy advertisement ...") and leaves only the
+    tail ("the sender should delay ..."), which hurts code mapping. A bounded
+    paragraph preserves enough local design context for generic matching.
+    """
+    para_start = full.rfind("\n\n", 0, match.start())
+    para_start = 0 if para_start == -1 else para_start + 2
+    para_end = full.find("\n\n", match.end())
+    para_end = len(full) if para_end == -1 else para_end
+    paragraph = re.sub(r"\s+", " ", full[para_start:para_end]).strip()
+    if 10 <= len(paragraph) <= 800:
+        return paragraph
+    start = full.rfind("\n", 0, match.start()) + 1
+    end = full.find("\n", match.end())
+    if end == -1:
+        end = len(full)
+    return re.sub(r"\s+", " ", full[start:end]).strip()
 
 
 def next_req_id(rfc: str, section: str, level: str) -> str:
@@ -91,6 +139,36 @@ def next_req_id(rfc: str, section: str, level: str) -> str:
     seq = f"{REQ_ID_COUNTER[key]:03d}"
     safe_level = level.replace(" ", "-")
     return f"{rfc}-{section}-{safe_level}-{seq}"
+
+
+def normalize_level(level: str) -> str:
+    low = level.lower()
+    return {
+        "must not": "MUST NOT",
+        "shall not": "SHALL NOT",
+        "should not": "SHOULD NOT",
+        "must": "MUST",
+        "shall": "SHALL",
+        "should": "SHOULD",
+        "required": "REQUIRED",
+        "recommended": "RECOMMENDED",
+        "must be": "MUST",
+        "must have": "MUST",
+        "is required to": "REQUIRED",
+        "are required to": "REQUIRED",
+        "requires": "REQUIRED",
+        "require": "REQUIRED",
+        "ensure": "REQUIRED",
+        "ensures": "REQUIRED",
+        "forbid": "MUST NOT",
+        "forbids": "MUST NOT",
+        "forbidden": "MUST NOT",
+        "prohibit": "MUST NOT",
+        "prohibits": "MUST NOT",
+        "prohibited": "MUST NOT",
+        "cannot": "MUST NOT",
+        "must never": "MUST NOT",
+    }.get(low, level)
 
 
 def extract_from_doc(doc_path: Path, rfc_key: str, domain: dict,
@@ -102,14 +180,9 @@ def extract_from_doc(doc_path: Path, rfc_key: str, domain: dict,
 
     requirements: list[dict] = []
     full = "\n".join(lines)
-    for match in rc.RFC2119_PATTERN.finditer(full):
-        level = match.group(1)
-        # Sentence (line) containing the keyword.
-        start = full.rfind("\n", 0, match.start()) + 1
-        end = full.find("\n", match.end())
-        if end == -1:
-            end = len(full)
-        sentence = re.sub(r"\s+", " ", full[start:end]).strip()
+    for match in DESIGN_MODAL_PATTERN.finditer(full):
+        level = normalize_level(match.group(1))
+        sentence = requirement_context(full, match)
         if not sentence or len(sentence) < 10:
             continue
         # Skip the fixed RFC 2119 boilerplate / keyword enumeration notice.
@@ -138,8 +211,81 @@ def extract_from_doc(doc_path: Path, rfc_key: str, domain: dict,
     return requirements
 
 
+def iter_design_docs(design_root: Path, benchmark: Path) -> list[Path]:
+    docs: list[Path] = []
+    if benchmark.exists() and benchmark.suffix.lower() in DESIGN_DOC_SUFFIXES:
+        docs.append(benchmark)
+    if design_root.exists():
+        for path in sorted(design_root.rglob("*")):
+            if not path.is_file() or path.suffix.lower() not in DESIGN_DOC_SUFFIXES:
+                continue
+            if path in docs:
+                continue
+            # Skip raw RFC mirror files in a mixed design tree; RFC extraction
+            # handles those with stronger section metadata.
+            if re.match(r"rfc-?\d+\.(md|txt)$", path.name, re.IGNORECASE):
+                continue
+            docs.append(path)
+    return docs
+
+
+def extract_from_design_tree(design_root: Path, benchmark: Path) -> list[dict]:
+    """Extract generic design requirements when no RFC requirements exist.
+
+    This is intentionally a recall step. It gives opencode concrete design
+    snippets to investigate in arbitrary projects, but final issue status still
+    comes only from opencode semantic verdicts.
+    """
+    requirements: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for doc_path in iter_design_docs(design_root, benchmark):
+        try:
+            text = rc.read_text(doc_path)
+        except OSError:
+            continue
+        if not text.strip():
+            continue
+        if len(text) > 2_000_000:
+            text = text[:2_000_000]
+        lines = text.splitlines()
+        full = "\n".join(lines)
+        doc_id = f"DESIGN-{rc.slugify(doc_path.stem, maxlen=28).upper()}"
+        for match in GENERIC_DESIGN_MODAL_PATTERN.finditer(full):
+            level = normalize_level(match.group(1))
+            requirement_text = requirement_context(full, match)
+            if not requirement_text or len(requirement_text) < 10:
+                continue
+            if is_rfc2119_boilerplate(requirement_text):
+                continue
+            normalized_text = re.sub(r"\s+", " ", requirement_text).strip().lower()
+            dedupe_key = (str(doc_path), normalized_text)
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            line_no = full.count("\n", 0, match.start()) + 1
+            section, title = current_heading(lines, line_no - 1)
+            req_id = next_req_id(doc_id, section, level)
+            requirements.append({
+                "requirement_id": req_id,
+                "rfc": doc_id,
+                "section": section,
+                "title": title,
+                "normative_level": level,
+                "requirement_text": requirement_text,
+                "topic": "design",
+                "protocol_area": "generic_design",
+                "keywords": [],
+                "source_doc": str(doc_path),
+                "source_anchor": f"heading-{section}",
+                "source_kind": "design_document",
+                "superseded_by": [],
+            })
+    return requirements
+
+
 def main(argv: list[str] | None = None) -> int:
     rc.add_script_dir_to_path()
+    REQ_ID_COUNTER.clear()
     parser = argparse.ArgumentParser(description="Extract RFC normative requirements.")
     parser.add_argument("--code-root", required=True)
     parser.add_argument("--design-root", required=True)
@@ -155,10 +301,9 @@ def main(argv: list[str] | None = None) -> int:
 
     work = rc.agent_work_dir(Path(args.code_root))
     manifest_path = work / "rfc_manifest.json"
+    manifest = rc.load_json(manifest_path) if manifest_path.exists() else {"rfcs": []}
     if not manifest_path.exists():
-        print("[normative] rfc_manifest.json missing; run load-docs first", file=sys.stderr)
-        return 0
-    manifest = rc.load_json(manifest_path)
+        print("[normative] rfc_manifest.json missing; using generic design-doc extraction", file=sys.stderr)
     domain_map = rc.load_config("rfc_domain_map.json")
     supersession = domain_map.get("supersession", {})
     domains = domain_map.get("domains", {})
@@ -197,6 +342,11 @@ def main(argv: list[str] | None = None) -> int:
                 superseded.update(older)
         domain = domains.get(rfc_key, {})
         all_reqs.extend(extract_from_doc(doc_path, rfc_key, domain, superseded))
+
+    if not all_reqs:
+        all_reqs = extract_from_design_tree(Path(args.design_root), Path(args.benchmark))
+        if all_reqs:
+            print(f"[normative] generic design-doc fallback extracted {len(all_reqs)} requirements")
 
     rc.save_json(work / "rfc_requirements.json", {
         "extracted_at": rc.now_iso(),

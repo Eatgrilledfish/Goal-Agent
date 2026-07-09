@@ -1,0 +1,9 @@
+__pycache__/
+.pytest_cache/
+*.py[cod]
+
+local-sim/
+prompt*.md
+opencode-prompt.md
+FIX-rfc-*.md
+*copy.md

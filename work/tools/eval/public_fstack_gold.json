@@ -1,0 +1,78 @@
+{
+  "name": "public-fstack-known-issues",
+  "purpose": "Local regression oracle for the public F-Stack fixture. This file must not be imported by detector, mapper, validator, ranker, or report generation code.",
+  "min_required_matches": 4,
+  "max_extra_confirmed_rate": 0.5,
+  "issues": [
+    {
+      "gold_id": "FSTACK-ND-10-OPTION-LIMIT",
+      "title": "ND 10-Option Limit",
+      "rfc": "RFC4861",
+      "sections_any": ["6.3.4", "4.1", "4.6"],
+      "files_any": ["freebsd/netinet6/nd6.c"],
+      "text_groups": [
+        ["option", "options"],
+        ["limit", "maxndopt", "10"]
+      ]
+    },
+    {
+      "gold_id": "FSTACK-PROXY-NA-NO-RANDOM-DELAY",
+      "title": "Proxy NA - No Random Delay",
+      "rfc": "RFC4861",
+      "sections_any": ["7.2.8"],
+      "files_any": ["freebsd/netinet6/nd6_nbr.c"],
+      "text_groups": [
+        ["proxy"],
+        ["advertisement", "na", "neighbor advertisement"],
+        ["random", "delay"]
+      ]
+    },
+    {
+      "gold_id": "FSTACK-PROXY-NA-NO-UNSOLICITED",
+      "title": "Proxy NA - No Unsolicited NA",
+      "rfc": "RFC4861",
+      "sections_any": ["7.2.6", "7.2.8"],
+      "files_any": ["freebsd/netinet6/nd6_nbr.c"],
+      "text_groups": [
+        ["proxy"],
+        ["unsolicited"],
+        ["advertisement", "na", "neighbor advertisement"]
+      ]
+    },
+    {
+      "gold_id": "FSTACK-FRAGMENT-CHAIN-NOT-WALKED",
+      "title": "Fragment Chain Not Walked",
+      "rfc": "RFC8200",
+      "sections_any": ["4", "4.5"],
+      "files_any": ["dpdk/lib/ip_frag/rte_ip_frag.h"],
+      "text_groups": [
+        ["fragment"],
+        ["extension", "header"],
+        ["chain", "walk", "traverse", "only checks"]
+      ]
+    },
+    {
+      "gold_id": "FSTACK-NO-DHCPV6-SUPPORT",
+      "title": "No DHCPv6 Support",
+      "rfc": "RFC8415",
+      "sections_any": [],
+      "files_any": [],
+      "text_groups": [
+        ["dhcpv6", "dhcp6"],
+        ["feature gap", "not implemented", "unsupported", "do not support", "no support"]
+      ]
+    },
+    {
+      "gold_id": "FSTACK-MLD-MISROUTED-VIA-KNI",
+      "title": "MLD Misrouted via KNI",
+      "rfc": "RFC2710",
+      "sections_any": [],
+      "files_any": ["lib/ff_dpdk_if.c", "lib/ff_dpdk_kni.c"],
+      "text_groups": [
+        ["mld", "multicast listener"],
+        ["kni", "kernel nic"],
+        ["filter_multi", "misroute", "misrouted", "filter", "route"]
+      ]
+    }
+  ]
+}

@@ -1,8 +1,8 @@
-# RFC 实现差异检视入口说明
+# 设计/代码实现差异检视入口说明
 
-本文件是比赛作品入口。评分平台加载本 Markdown 后，请按这里定位赛事提供的待检视工程（F-Stack 及其设计依据 RFC），加载 `work/` 运行资产，识别代码实现与设计文档/RFC 之间的不一致问题并输出证据链。
+本文件是比赛作品入口。评分平台加载本 Markdown 后，应由运行中的 opencode CLI 作为主 agent 执行检视：读取设计文档与目标代码仓，使用 `work/` 下的 helper 脚本生成索引、候选、证据包，然后由 opencode 自己做语义调查和最终裁决。
 
-本系统**不修改目标代码**，只识别不一致问题、输出 issues 及证据链报告。不需要安装插件，不需要复制文件到目标仓库。
+本系统不修改目标代码，只识别设计文档与实现之间的不一致问题，输出 issues 与证据链报告。
 
 ## 1. 定位目录
 
@@ -11,33 +11,35 @@
 - `SUBMISSION_ROOT`：本提交包根目录，包含 `INSTRUCTION.md` 和 `work/`。
 - `WORK_ROOT`：固定为 `${SUBMISSION_ROOT}/work`。
 
-比赛评测环境中，赛事资产根目录固定为：
+比赛评测环境中，赛事资产根目录通常为：
 
 ```text
 ASSET_ROOT=/app/code/judge-assets/01_03_ai_implementation_design_difference_detection
 ```
 
-该目录由平台提供，结构为：
+公共样例结构为：
 
 ```text
 01_03_ai_implementation_design_difference_detection/
 ├── code/
-│   └── f-stack/        ← 待检视的 C/C++/DPDK/FreeBSD 网络协议栈代码
+│   └── f-stack/
 └── Difference/
-    └── benchmark.md    ← 设计依据入口，列出相关 RFC 与 F-Stack commit 信息
+    └── benchmark.md
 ```
 
-由此派生固定路径：
+隐藏评测可能把不同内部工程放在 `code/` 下。不要写死 `f-stack`：若 `code/f-stack` 存在则使用它；否则使用 `code/` 下唯一的项目目录；若存在多个目录，由 opencode 检查设计入口并选择真正的目标代码仓。
+
+推荐派生路径：
 
 ```text
-CODE_ROOT=${ASSET_ROOT}/code/f-stack
-DESIGN_ROOT=${ASSET_ROOT}/Difference
-BENCHMARK=${ASSET_ROOT}/Difference/benchmark.md
+CODE_ROOT=<ASSET_ROOT>/code/<target-project>
+DESIGN_ROOT=<ASSET_ROOT>/Difference        # 若不存在，检查 design/、design-docs/、docs/
+BENCHMARK=<DESIGN_ROOT>/benchmark.md       # 若不存在，选择设计入口 markdown/txt
 RESULT_ROOT=/result
 LOG_ROOT=/logs
 ```
 
-执行时应优先使用上述固定路径作为比赛入口。仅当本地调试环境不存在该固定路径时，才允许通过命令行参数传入：
+本地调试时可以显式传入：
 
 ```text
 --code-root <path>
@@ -47,27 +49,34 @@ LOG_ROOT=/logs
 --log-root <path>
 ```
 
-## 2. 加载作品与主执行路径
+## 2. 必须加载的作品资产
 
-运行前读取以下资产：
+opencode 启动后必须读取：
 
 ```text
 ${WORK_ROOT}/skills/rfc-implementation-diff-detection/SKILL.md
+${WORK_ROOT}/agents/rfc-diff-orchestrator.md
+${WORK_ROOT}/agents/rfc-evidence-reviewer.md
 ${WORK_ROOT}/agents/*.md
-${WORK_ROOT}/skills/*.md
 ${WORK_ROOT}/tools/scripts/*.py
 ${WORK_ROOT}/tools/config/*.json
 ```
 
-当前比赛平台和本地验证环境均支持 subagent/Task 调用，因此必须：
+角色边界：
 
-1. 先加载 `${WORK_ROOT}/skills/rfc-implementation-diff-detection/SKILL.md`；
-2. 再调用 `rfc-diff-orchestrator` 作为总控 agent；
-3. 由 orchestrator 调度 `work/agents/*.md` 中定义的 subagent 与 `work/tools/scripts/*.py` 确定性 helper 脚本完成 RFC 读取、规范提取、代码扫描、映射、检测、审查、报告与最终 gate。
+- Python helper scripts：索引、召回、证据包生成、schema 校验、报告生成。
+- opencode agent：读取设计与代码、按需 `rg`/读文件/追调用链、判断是否真有设计实现不一致。
+- `evidence_validator.py`：只消费 opencode verdict 并校验证据形状，不用规则或权重决定 confirmed。
 
-## 3. 启动命令
+## 3. 主执行路径
 
-确定性主入口为 `rfc_goal_runner.py`，它管理 `.agent-work/` 状态目录、按阶段调度 helper 脚本、生成最终结果。一键执行全部阶段：
+不要把 `run-all` 当作最终 agent loop。正式执行时先初始化，再运行 `prepare-review`。`prepare-review` 会刷新确定性召回链路：
+
+```text
+load-docs -> scope-plan -> extract-spec -> index-code -> map -> detect -> bundle
+```
+
+之后必须暂停 helper-only pipeline，由 opencode 完成语义审阅；没有 opencode verdict 时不得进入正式结果。
 
 ```bash
 python3 ${WORK_ROOT}/tools/scripts/rfc_goal_runner.py \
@@ -76,68 +85,141 @@ python3 ${WORK_ROOT}/tools/scripts/rfc_goal_runner.py \
   --benchmark ${BENCHMARK} \
   --result-root ${RESULT_ROOT} \
   --log-root ${LOG_ROOT} \
-  run-all
+  init
+
+python3 ${WORK_ROOT}/tools/scripts/rfc_goal_runner.py --code-root ${CODE_ROOT} --design-root ${DESIGN_ROOT} --benchmark ${BENCHMARK} --result-root ${RESULT_ROOT} --log-root ${LOG_ROOT} prepare-review
 ```
 
-也可分阶段执行（阶段顺序见 SKILL.md）：
+`prepare-review` 会生成：
 
 ```text
-init | load-docs | extract-spec | index-code | map | detect | review | report | gate
+${AGENT_WORK}/agent_review_queue.json
+${AGENT_WORK}/agent-review/*.json
+${LOG_ROOT}/trace/agent_review_queue_summary.json
 ```
 
-如果平台支持 agent/skill 调用，则按本文件第 2 节：先加载 SKILL.md，再调用 `rfc-diff-orchestrator`，由 orchestrator 调用 helper scripts 和 subagents 完成检视。
+其中 `AGENT_WORK` 由 runner 写入 queue 的 `agent_work` 字段，通常是 `CODE_ROOT` 同级目录下的 `.agent-work`。随后 opencode 必须读取 `agent_review_queue.json` 和每个 item 的 `bundle_abs_path`，执行语义调查。候选只是召回提示，不是完整搜索空间；若设计文档描述了候选未覆盖的问题，opencode 可以新增 `AGENT-DISCOVERED-*` verdict。
 
-`rfc_goal_runner.py` 是确定性 helper toolkit 与流水线骨架，不是自主修改代码的 actor。本题**不修复代码**，所有阶段只读代码、只写 `/result`、`/logs` 与 `.agent-work/`。
+opencode 审阅完成后写入：
 
-## 4. 执行完成判定
+```text
+${AGENT_WORK}/agent_review_verdicts.jsonl
+```
 
-满足以下全部条件即视为完成：
+每行一个 JSON object，字段至少包含：
 
-1. `rfc_goal_runner.py` 正常退出（`run-all` 退出码 0）；
-2. `/result/issues.json` 生成；
-3. `/result/00-summary.md` 生成；
-4. `/result` 下至少生成一个单 issue markdown 文件（`01-*.md` 等）；
-5. `/logs/trace/final_detection_gate.json` 生成，且 gate 判定通过或已记录未达 4 个 issue 的原因。
+```json
+{
+  "candidate_id": "candidate id or AGENT-DISCOVERED-001",
+  "status": "confirmed",
+  "confidence": 0.9,
+  "title": "short issue title",
+  "normative_level": "MUST/SHOULD/MAY/design-requirement/unknown",
+  "design_evidence": {
+    "rfc": "RFC id or design document id",
+    "section": "section or heading",
+    "doc_path": "design document path",
+    "quote": "short design quote"
+  },
+  "code_evidence": [
+    {
+      "file": "repo-relative source file",
+      "line_start": 1,
+      "line_end": 2,
+      "symbol": "function/class/module",
+      "snippet": "source excerpt"
+    }
+  ],
+  "inconsistency": "why design and implementation differ",
+  "impact": "runtime/protocol/user-visible impact",
+  "false_positive_controls": ["reverse checks performed"],
+  "related_files": ["repo-relative files"],
+  "agent_notes": "concise reasoning and tool trail",
+  "generalization_rationale": "why this is not project-name hardcoding"
+}
+```
+
+只允许 `status` 为 `confirmed`、`probable`、`rejected`。正式结果只输出 `confirmed`；`probable` 进入 review queue。
+
+最后运行：
+
+```bash
+python3 ${WORK_ROOT}/tools/scripts/rfc_goal_runner.py --code-root ${CODE_ROOT} --design-root ${DESIGN_ROOT} --benchmark ${BENCHMARK} --result-root ${RESULT_ROOT} --log-root ${LOG_ROOT} review
+python3 ${WORK_ROOT}/tools/scripts/rfc_goal_runner.py --code-root ${CODE_ROOT} --design-root ${DESIGN_ROOT} --benchmark ${BENCHMARK} --result-root ${RESULT_ROOT} --log-root ${LOG_ROOT} report
+python3 ${WORK_ROOT}/tools/scripts/rfc_goal_runner.py --code-root ${CODE_ROOT} --design-root ${DESIGN_ROOT} --benchmark ${BENCHMARK} --result-root ${RESULT_ROOT} --log-root ${LOG_ROOT} gate
+```
+
+## 4. opencode 审阅准则
+
+确认一个 issue 必须同时满足：
+
+1. 设计文档/RFC 明确描述行为、约束、能力或禁止事项。
+2. 代码证据位于相关实现路径，包含具体文件、行号、符号和片段。
+3. 代码证据与设计要求存在真实语义矛盾、遗漏或不完整实现。
+4. 至少做一次反向误报检查，例如检查调用路径、宏使用、邻近分支、配置开关、替代实现或测试代码混淆。
+5. 结论不能依赖项目名或已知答案；应能迁移到其他设计文档和代码仓。
+
+Feature gap 和 MAY/SHOULD 行为也可以作为 confirmed issue，但必须更严格：
+
+- Feature gap 必须给代码证据，例如相邻实现注释、入口函数缺失分支、构建配置缺失、全局搜索摘要或显式 unsupported/not implemented 证据。
+- MAY/SHOULD 必须说明遗漏为什么产生互操作、功能或设计一致性差异，并检查没有其他路径提供该行为。
+
+禁止行为：
+
+- 不得把 regex 命中、权重分数、`semantic_detection` 标记当最终结论。
+- 不得针对 F-Stack 或公开 gold issue 硬编码标题、文件或 RFC。
+- 不得伪造缺失证据；证据不足写 `probable` 或 `rejected`。
+- 不得修改 `code/**`、`Difference/**`、`benchmark.md` 或目标设计文档。
 
 ## 5. 结果获取方式
 
-裁判读取以下文件：
+裁判读取：
 
 ```text
-/result/issues.json      ← 机器可读主结果
-/result/issues.jsonl     ← 每行一个 issue
-/result/00-summary.md    ← 人类可读总览
-/result/*.md             ← 单 issue 证据链报告
+/result/issues.json
+/result/issues.jsonl
+/result/00-summary.md
+/result/*.md
 ```
 
-其中 `issues.json` 是机器可读主结果，schema 见 `work/skills/rfc-implementation-diff-detection/SKILL.md` 及 `work/tools/config/output_schema.json`。
-
-## 6. 关键约束
-
-禁止修改：
+日志与可接续状态：
 
 ```text
-code/**            ← 待检视目标代码，只读
-Difference/**      ← 设计依据，只读
-benchmark.md       ← 设计入口，只读
+/logs/trace/**
+${AGENT_WORK}/pipeline_state.json
+${AGENT_WORK}/agent_review_queue.json
+${AGENT_WORK}/agent_review_verdicts.jsonl
+${AGENT_WORK}/validated_issues.json
+${AGENT_WORK}/ranked_issues.json
+${AGENT_WORK}/probable_review_queue.json
 ```
 
-只允许写：
+## 6. 完成判定
+
+满足以下全部条件即视为完成：
+
+1. opencode 已写入 `${AGENT_WORK}/agent_review_verdicts.jsonl`。
+2. `review`、`report`、`gate` 阶段已执行。
+3. `/result/issues.json`、`/result/00-summary.md`、`/logs/trace/final_detection_gate.json` 已生成。
+4. `/result/issues.json` 中只包含 `confirmed` issue。
+5. 若 confirmed 少于 4 个，报告必须说明证据不足原因，不得补造。
+
+评价目标：
 
 ```text
-/result/**
-/logs/**
-.agent-work/**
-```
-
-不得运行 Maven / Java 构建（本题为 C/C++/DPDK/FreeBSD 工程，无 `pom.xml`、`maven-settings.xml`）。不得引入 Spring Boot / ShopHub 相关假设与脚本。
-
-## 7. 评价目标
-
-```text
-识别 issues 数量 >= 4（confirmed/probable）
+识别 confirmed issues 数量 >= 4
 误报率 <= 50%
 总检视时长 <= 6 小时
 ```
 
-若证据不足未达 4 个 issue，不得伪造。应在 `00-summary.md` 中如实说明原因（RFC 获取失败 / 证据不足 / 代码路径无法确认）。
+## 7. 公开样例回归检查（可选）
+
+公共 F-Stack 样例可以用以下命令检查最终 confirmed 输出是否覆盖公开已知问题：
+
+```bash
+python3 ${WORK_ROOT}/tools/scripts/public_fstack_gold_evaluator.py \
+  --result ${RESULT_ROOT}/issues.json \
+  --output ${LOG_ROOT}/trace/public_fstack_gold_eval.json
+```
+
+这是本地回归 oracle，不是正式检测逻辑。它不得被 `prepare-review`、detector、validator、ranker、report 或 gate 自动调用；隐藏评测项目仍必须依赖 opencode 对设计文档和代码的通用语义审阅。

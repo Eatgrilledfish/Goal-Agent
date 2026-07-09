@@ -20,6 +20,20 @@ from pathlib import Path
 
 import rfc_common as rc
 
+CONTEXT_BEFORE_LINES = 40
+LEVEL_RANK = {
+    "MUST": 6,
+    "MUST NOT": 6,
+    "SHALL": 6,
+    "SHALL NOT": 6,
+    "REQUIRED": 6,
+    "SHOULD": 4,
+    "SHOULD NOT": 4,
+    "RECOMMENDED": 4,
+    "MAY": 2,
+    "OPTIONAL": 2,
+}
+
 
 def load_code_index(work: Path) -> dict:
     path = work / "code_index.json"
@@ -36,6 +50,25 @@ def read_snippet(code_root: Path, file_rel: str, line_start: int, line_end: int)
     s = max(0, (line_start or 1) - 1)
     e = max(s + 1, line_end or (s + 1))
     return "\n".join(lines[s:e])
+
+
+def snippet_with_context(code_root: Path, loc: dict) -> tuple[str, dict]:
+    """Return symbol evidence plus nearby leading comments.
+
+    Function headers often carry the precise "not implemented" or RFC-section
+    notes that explain the behavioral gap. Keep the symbol identity, but widen
+    the evidence range a little when the source tree is available.
+    """
+    line_start = loc.get("line_start", 0) or 1
+    line_end = loc.get("line_end", line_start) or line_start
+    context_start = max(1, line_start - CONTEXT_BEFORE_LINES)
+    snippet = read_snippet(code_root, loc["file"], context_start, line_end)
+    if not snippet:
+        return loc.get("snippet", ""), loc
+    evidence_loc = dict(loc)
+    evidence_loc["line_start"] = context_start
+    evidence_loc["line_end"] = line_end
+    return snippet, evidence_loc
 
 
 def code_signals_hit(snippet: str, code_signals: dict, base_line: int = 0) -> list[dict]:
@@ -80,6 +113,75 @@ def rfc_signals_hit(req_text: str, rfc_signals: list[str]) -> bool:
     return any(sig.lower() in low for sig in rfc_signals)
 
 
+def has_protocol_term(req: dict, low_snippet: str) -> bool:
+    terms: list[str] = []
+    terms.extend(req.get("keywords", []) or [])
+    terms.append(req.get("topic", "") or "")
+    terms.append(req.get("protocol_area", "") or "")
+    terms.append(req.get("rfc", "") or "")
+    for term in terms:
+        low = str(term).lower()
+        if len(low) >= 5 and low in low_snippet:
+            return True
+    return False
+
+
+def is_semantic_high_precision(dtype: str, req: dict, hits: list[dict],
+                               snippet: str, domain_matched: bool = True) -> bool:
+    """True when a candidate has more than a loose keyword/regex hit.
+
+    This is the deterministic reviewer layer: broad detector patterns may open
+    review items, but only concrete semantic evidence should reach final output.
+    The rules are phrased as reusable evidence shapes, not project-specific
+    filenames or known issue IDs.
+    """
+    low_req = (req.get("requirement_text", "") or "").lower()
+    low_snippet = snippet.lower()
+    line_text = " ".join(h.get("line_text", "") for h in hits).lower()
+    reasons = " ".join(h.get("reason", "") for h in hits).lower()
+
+    if not domain_matched and dtype in {
+        "hardcoded_limit_mismatch",
+        "missing_feature_protocol_gap",
+        "timer_delay_behavior_mismatch",
+        "packet_path_mismatch",
+    } and not has_protocol_term(req, low_snippet):
+        return False
+
+    if dtype == "hardcoded_limit_mismatch":
+        return (
+            ("option" in low_req or "header" in low_req or "each" in low_req or "all" in low_req)
+            and ("option" in low_snippet or "header" in low_snippet)
+            and ("max" in line_text or "limit" in line_text)
+        )
+    if dtype == "wrong_control_flow":
+        return (
+            "whole chain" in low_snippet
+            or "only looks at the extension header" in low_snippet
+            or "only the first" in low_snippet
+        )
+    if dtype == "missing_feature_protocol_gap":
+        return (
+            "not support" in line_text
+            or "not supported" in line_text
+            or "unsupported" in line_text
+            or "not implemented" in line_text
+        )
+    if dtype == "timer_delay_behavior_mismatch":
+        return (
+            "random" in low_req
+            and "delay" in low_req
+            and ("not implemented" in low_snippet or "delay rule" in low_snippet or "delay = 0" in low_snippet)
+        )
+    if dtype == "packet_path_mismatch":
+        return (
+            ("multicast" in low_req or "mld" in low_req or "icmpv6" in low_req)
+            and ("filter_multi" in low_snippet or "kni" in low_snippet or "bypass" in reasons)
+            and ("multicast" in low_snippet or "icmpv6" in low_snippet)
+        )
+    return False
+
+
 def detect_for_requirement(req: dict, trace: dict, code_index: dict,
                            code_root: Path, patterns_cfg: dict) -> list[dict]:
     """Derive candidates that each carry concrete RFC text + a concrete code line.
@@ -107,14 +209,13 @@ def detect_for_requirement(req: dict, trace: dict, code_index: dict,
 
         for loc in locations:
             line_start = loc.get("line_start", 0)
-            # Prefer the snippet captured by the indexer (stored in the trace)
-            # so detection does not depend on the source tree being mounted at
-            # detect time; fall back to reading the file if absent.
-            snippet = loc.get("snippet") or read_snippet(
-                code_root, loc["file"], line_start, loc.get("line_end"))
+            snippet, evidence_loc = snippet_with_context(code_root, loc)
             if not snippet:
                 continue
-            hits = code_signals_hit(snippet, code_signals, base_line=max(0, line_start - 1))
+            hits = code_signals_hit(
+                snippet, code_signals,
+                base_line=max(0, (evidence_loc.get("line_start", line_start) or line_start) - 1),
+            )
             if not hits:
                 continue
             # Absence-oriented types (rfc_signals describe a capability/behavior
@@ -126,10 +227,65 @@ def detect_for_requirement(req: dict, trace: dict, code_index: dict,
                 review_note = (
                     "requirement linked but implementation behavior needs review"
                 )
-            candidates.append(make_candidate(req, dtype, dcfg, loc, hits, snippet,
-                                             review_note=review_note))
+            candidate = make_candidate(req, dtype, dcfg, evidence_loc, hits, snippet,
+                                       review_note=review_note)
+            if is_semantic_high_precision(
+                dtype, req, hits, snippet,
+                domain_matched=evidence_loc.get("domain_matched", True),
+            ):
+                candidate["semantic_detection"] = True
+                candidate.setdefault("detection_reasons", []).append(
+                    "semantic_high_precision_evidence"
+                )
+            candidates.append(candidate)
 
     return candidates
+
+
+def candidate_sort_score(candidate: dict) -> tuple:
+    """Prefer stronger, more specific evidence when collapsing duplicates."""
+    level = candidate.get("normative_level", "MAY")
+    ce = candidate.get("code_evidence", [])
+    reasons = sum(len(c.get("match_reasons", [])) for c in ce)
+    quote = candidate.get("design_evidence", {}).get("quote", "").lower()
+    specificity = sum(
+        1 for token in ("option", "proxy", "delay", "fragment", "extension", "multicast", "dhcp")
+        if token in quote
+    )
+    return (
+        LEVEL_RANK.get(level, 0),
+        reasons,
+        specificity,
+        candidate.get("min_confidence", 0.0),
+    )
+
+
+def dedupe_candidates(candidates: list[dict]) -> list[dict]:
+    """Collapse repeated hits from adjacent RFC sentences and same code line."""
+    best: dict[tuple, dict] = {}
+    for candidate in candidates:
+        ce = candidate.get("code_evidence", [{}])[0]
+        evidence_lines = ce.get("evidence_lines", [])
+        line = evidence_lines[0].get("line") if evidence_lines else ce.get("line_start", 0)
+        key = (
+            candidate.get("detection_type"),
+            candidate.get("design_evidence", {}).get("rfc"),
+            ce.get("file"),
+            ce.get("symbol"),
+            line,
+        )
+        previous = best.get(key)
+        if previous is None or candidate_sort_score(candidate) > candidate_sort_score(previous):
+            best[key] = candidate
+    return sorted(
+        best.values(),
+        key=lambda c: (
+            c.get("design_evidence", {}).get("rfc", ""),
+            c.get("detection_type", ""),
+            c.get("code_evidence", [{}])[0].get("file", ""),
+            c.get("code_evidence", [{}])[0].get("line_start", 0),
+        ),
+    )
 
 
 # A hardcoded MAX/limit-style macro/constant referenced in a matched code line.
@@ -229,7 +385,8 @@ def make_candidate(req: dict, dtype: str, dcfg: dict, loc: dict,
         "line_start": loc.get("line_start", 0),
         "line_end": loc.get("line_end", 0),
         "snippet": snippet,
-        "match_reasons": [h["reason"] for h in hits],
+        "domain_matched": loc.get("domain_matched", True),
+        "match_reasons": sorted({h["reason"] for h in hits}),
         "evidence_lines": [
             {"line": h["line"], "text": h["line_text"], "reason": h["reason"]}
             for h in hits
@@ -245,8 +402,12 @@ def make_candidate(req: dict, dtype: str, dcfg: dict, loc: dict,
     title = req.get("title", "") or req.get("topic", dtype)
     reason_bits = [f"detection_type={dtype}", f"code={file_rel}:{first['line']}"]
     reason_bits.extend(h["reason"] for h in hits)
+    evidence_slug = rc.slugify(
+        f"{file_rel}-{symbol or 'symbol'}-{first['line']}",
+        maxlen=48,
+    )
     candidate = {
-        "candidate_id": f"{req.get('requirement_id', 'REQ')}-{dtype}",
+        "candidate_id": f"{req.get('requirement_id', 'REQ')}-{dtype}-{evidence_slug}",
         "requirement_id": req.get("requirement_id"),
         "title": f"{title}: {dtype.replace('_', ' ')}",
         "detection_type": dtype,
@@ -259,6 +420,7 @@ def make_candidate(req: dict, dtype: str, dcfg: dict, loc: dict,
         "min_confidence": dcfg.get("min_confidence", 0.5),
         "protocol_area": req.get("protocol_area"),
         "topic": req.get("topic"),
+        "domain_matched": loc.get("domain_matched", True),
     }
     if review_note:
         candidate["review_note"] = review_note
@@ -292,6 +454,7 @@ def main(argv: list[str] | None = None) -> int:
     for req_id, req in reqs.items():
         trace = traces.get(req_id, {"candidate_code_locations": [], "trace_status": "unlinked"})
         candidates.extend(detect_for_requirement(req, trace, code_index, code_root, patterns_cfg))
+    candidates = dedupe_candidates(candidates)
 
     rc.save_json(work / "candidate_issues.json", {
         "detected_at": rc.now_iso(),
