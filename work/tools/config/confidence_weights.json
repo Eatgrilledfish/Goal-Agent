@@ -1,0 +1,42 @@
+{
+  "_comment": "Confidence weights used by evidence_validator.py and issue_ranker.py. Confidence is derived from evidence completeness and quality, never hardcoded per issue. A hard cap (<1.0) keeps heuristic detections from masquerading as certainty, and a domain-mismatch sanity check rejects evidence that does not belong to the RFC's protocol domain.",
+  "weights": {
+    "design_evidence_present": 0.20,
+    "design_location_present": 0.10,
+    "code_evidence_present": 0.15,
+    "code_location_present": 0.15,
+    "control_flow_evidence_present": 0.10,
+    "evidence_strength_bonus": 0.15,
+    "domain_match_bonus": 0.10
+  },
+  "penalties": {
+    "domain_mismatch": 0.25,
+    "weak_single_signal": 0.15
+  },
+  "confidence_cap": 0.90,
+  "normative_level_modifier": {
+    "MUST": 0.05,
+    "MUST NOT": 0.05,
+    "REQUIRED": 0.05,
+    "SHALL": 0.05,
+    "SHALL NOT": 0.05,
+    "SHOULD": 0.0,
+    "SHOULD NOT": 0.0,
+    "MAY": -0.10
+  },
+  "trace_status_modifier": {
+    "linked": 0.0,
+    "ambiguous": -0.10,
+    "unlinked": -0.30
+  },
+  "thresholds": {
+    "confirmed": 0.80,
+    "probable": 0.65,
+    "rejected": 0.0
+  },
+  "ranking": {
+    "confirmed_first": true,
+    "tiebreak": "confidence_desc_then_normative_level",
+    "normative_level_order": ["MUST", "MUST NOT", "SHALL", "SHALL NOT", "REQUIRED", "SHOULD", "SHOULD NOT", "MAY"]
+  }
+}
