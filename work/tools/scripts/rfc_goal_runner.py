@@ -28,6 +28,12 @@ SCRIPT_DIR = rc.SCRIPT_DIR
 
 PHASE_SCRIPTS: dict[str, list[str]] = {
     "load-docs": ["benchmark_reader.py", "rfc_fetch_convert.py"],
+    # Phase 2.5: build a lite code inventory, then dynamically scope which
+    # RFCs enter first-round detection, then validate that scope
+    # (FIX-rfc-scope-planner.md). Runs before extract-spec so requirement
+    # extraction only touches selected_primary_rfcs.
+    "scope-plan": ["code_inventory_lite.py", "rfc_scope_planner.py",
+                   "rfc_scope_plan_validator.py"],
     "extract-spec": ["normative_requirement_extractor.py"],
     "index-code": ["c_code_indexer.py"],
     "map": ["requirement_code_mapper.py"],
@@ -40,6 +46,7 @@ PHASE_SCRIPTS: dict[str, list[str]] = {
 PHASE_ORDER = [
     "init",
     "load-docs",
+    "scope-plan",
     "extract-spec",
     "index-code",
     "map",
@@ -72,7 +79,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def run_script(name: str, args: argparse.Namespace) -> int:
-    """Invoke a sibling phase script with the shared path arguments."""
+    """Invoke a sibling phase script with the shared path arguments.
+
+    When the scope-plan phase has produced ``rfc_scope_plan.json``, pass
+    ``--scope-plan`` to the normative extractor so it only processes the
+    selected primary RFCs rather than the full benchmark set.
+    """
     script = SCRIPT_DIR / name
     if not script.exists():
         print(f"[runner] missing phase script: {script}", file=sys.stderr)
@@ -85,6 +97,10 @@ def run_script(name: str, args: argparse.Namespace) -> int:
         "--result-root", args.result_root,
         "--log-root", args.log_root,
     ]
+    if name == "normative_requirement_extractor.py":
+        work = rc.agent_work_dir(Path(args.code_root))
+        if (work / "rfc_scope_plan.json").exists():
+            cmd.append("--scope-plan")
     print(f"[runner] phase -> {name}")
     proc = subprocess.run(cmd)
     return proc.returncode

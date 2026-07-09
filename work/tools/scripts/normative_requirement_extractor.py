@@ -146,6 +146,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--benchmark", required=True)
     parser.add_argument("--result-root", default="/result")
     parser.add_argument("--log-root", default="/logs")
+    # When set, restrict extraction to the RFCs the scope planner selected as
+    # primary (FIX-rfc-scope-planner.md). Falls back to the full set if the
+    # plan is missing, so the phase degrades gracefully when scope-plan skipped.
+    parser.add_argument("--scope-plan", action="store_true",
+                        help="Only process RFCs in selected_primary_rfcs.")
     args = parser.parse_args(argv)
 
     work = rc.agent_work_dir(Path(args.code_root))
@@ -160,10 +165,25 @@ def main(argv: list[str] | None = None) -> int:
 
     loaded_rfcs = {e["rfc"] for e in manifest.get("rfcs", []) if e.get("status") == "ok"}
 
+    # Resolve the scope restriction (if any) before iterating the manifest.
+    primary_rfcs: set[str] | None = None
+    if args.scope_plan:
+        plan_path = work / "rfc_scope_plan.json"
+        if plan_path.exists():
+            plan = rc.load_json(plan_path)
+            primary_rfcs = {e["rfc"] for e in plan.get("selected_primary_rfcs", [])}
+            print(f"[normative] scope-plan active: restricting to "
+                  f"{len(primary_rfcs)} primary RFC(s)")
+        else:
+            print("[normative] --scope-plan given but rfc_scope_plan.json "
+                  "missing; processing all RFCs", file=sys.stderr)
+
     all_reqs: list[dict] = []
     for entry in manifest.get("rfcs", []):
         rfc_key = entry["rfc"]
         if entry.get("status") != "ok":
+            continue
+        if primary_rfcs is not None and rfc_key not in primary_rfcs:
             continue
         # Skip RFCs obsoleted by a newer RFC we also loaded.
         obsolete_by = [newer for newer, older in supersession.items() if rfc_key in older]

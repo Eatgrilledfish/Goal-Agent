@@ -1,0 +1,70 @@
+{
+  "_comment": "Hardcoded RFC *selection policy* for the scope-planner phase. This intentionally contains NO RFC numbers -- the rule is the policy, not a fixed RFC list. The planner scores every RFC discovered in benchmark.md against these preferences and selects dynamically, so the system adapts to any RFC set the benchmark throws at it. See FIX-rfc-scope-planner.md.",
+
+  "prefer_current_core_protocol": true,
+  "prefer_must_level_requirements": true,
+  "prefer_code_checkable_behavior": true,
+  "exclude_operational_guidance": true,
+  "exclude_obsoleted_if_successor_present": true,
+  "max_primary_rfcs": 8,
+
+  "primary_score_threshold": 0.75,
+  "min_primary_rfcs": 4,
+
+  "scoring_weights": {
+    "normative_strength": 0.25,
+    "implementation_boundary": 0.25,
+    "code_anchor": 0.20,
+    "contradiction_testability": 0.15,
+    "security_or_protocol_core": 0.10,
+    "current_rfc_status": 0.05
+  },
+
+  "protocol_area_impl_boundary": {
+    "ipv6_core": 1.0,
+    "ipv6_nd": 1.0,
+    "icmpv6": 1.0,
+    "ipv6_fragment": 1.0,
+    "ipv6_frag_nd": 1.0,
+    "ipv6_addressing": 0.9,
+    "ipv6_autoconf": 0.9,
+    "mld": 0.85,
+    "ipv6_privacy": 0.8,
+    "ipv6_flowlabel": 0.8,
+    "ipv6_nd_dns": 0.75,
+    "ipv6_inverse_nd": 0.7,
+    "dhcpv6": 0.55,
+    "ipv6_socket": 0.3,
+    "ipv6_socket_api": 0.3,
+    "ipv6_ext_header": 0.3,
+    "unknown": 0.4
+  },
+
+  "protocol_area_security": {
+    "ipv6_core": 0.9,
+    "ipv6_nd": 1.0,
+    "icmpv6": 1.0,
+    "ipv6_fragment": 1.0,
+    "ipv6_frag_nd": 1.0,
+    "ipv6_addressing": 0.9,
+    "ipv6_autoconf": 0.8,
+    "mld": 0.8,
+    "ipv6_privacy": 0.7,
+    "ipv6_flowlabel": 0.6,
+    "ipv6_nd_dns": 0.6,
+    "ipv6_inverse_nd": 0.6,
+    "dhcpv6": 0.4,
+    "ipv6_socket": 0.2,
+    "ipv6_socket_api": 0.2,
+    "ipv6_ext_header": 0.2,
+    "unknown": 0.4
+  },
+
+  "operational_keywords": [
+    "operational",
+    "firewall",
+    "event logger",
+    "deployment",
+    "operations"
+  ]
+}
