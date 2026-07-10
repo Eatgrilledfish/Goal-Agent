@@ -425,7 +425,7 @@ def test_prepare_is_semantic_neutral_and_writes_agent_contract(workspace):
     assert manifest["design"]["document_count"] == 1
     assert manifest["code"]["suffix_counts"] == {".py": 1}
     assert contract["execution_model"] == "opencode-owned-model-driven-loop"
-    assert contract["contract_version"] == 6
+    assert contract["contract_version"] == 7
     assert contract["handoff_integrity"]["max_concurrent_subagent_tasks"] == 2
     assert len(contract["coverage_contract"]["exploration_modes"]) == 3
     assert "dynamic_probe" in contract["coverage_contract"]
@@ -435,6 +435,88 @@ def test_prepare_is_semantic_neutral_and_writes_agent_contract(workspace):
     ]
     assert (state / "dynamic_probes.jsonl").is_file()
     assert not (state / "candidate_issues.json").exists()
+
+
+def test_prepare_materializes_session_local_review_inputs(workspace):
+    state = workspace["state"]
+    assert isinstance(state, Path)
+    manifest = ac.load_json(state / "workspace_manifest.json")
+    contract = ac.load_json(state / "agent_loop_contract.json")
+    review_code = Path(manifest["paths"]["review_code_root"])
+    review_design = Path(manifest["paths"]["review_design_root"])
+    assert review_code.is_relative_to(state)
+    assert review_design.is_relative_to(state)
+    assert (review_code / "service.py").read_bytes() == (workspace["code"] / "service.py").read_bytes()
+    assert (review_design / "contract.md").read_bytes() == (workspace["design"] / "contract.md").read_bytes()
+    assert contract["guardrails"]["agent_read_roots"] == [str(review_code), str(review_design)]
+    assert (review_code / ".git").is_file()
+    git_probe = subprocess.run(
+        ["git", "-C", str(review_code), "rev-parse", "--show-toplevel"],
+        text=True,
+        capture_output=True,
+    )
+    assert git_probe.returncode != 0
+
+
+def test_review_copy_keeps_source_directories_with_generic_build_names(tmp_path):
+    code = tmp_path / "code"
+    design = tmp_path / "design"
+    result = tmp_path / "result"
+    logs = tmp_path / "logs"
+    code.mkdir()
+    design.mkdir()
+    (code / "build").mkdir()
+    (code / "build" / "recipe.txt").write_text("build recipe\n", encoding="utf-8")
+    (code / "vendor").mkdir()
+    (code / "vendor" / "library.c").write_text("int imported(void);\n", encoding="utf-8")
+    (code / "target").mkdir()
+    (code / "target" / "generated.c").write_text("int generated(void);\n", encoding="utf-8")
+    (design / "spec.md").write_text("The recipes must be preserved.\n", encoding="utf-8")
+    run_runner("prepare", code, design, result, logs)
+    manifest = ac.load_json(logs / "state" / "workspace_manifest.json")
+    review_code = Path(manifest["paths"]["review_code_root"])
+    assert (review_code / "build" / "recipe.txt").read_text(encoding="utf-8") == "build recipe\n"
+    assert (review_code / "vendor" / "library.c").read_text(encoding="utf-8") == "int imported(void);\n"
+    assert (review_code / "target" / "generated.c").read_text(encoding="utf-8") == "int generated(void);\n"
+
+
+def test_prepare_preserves_internal_directory_symlinks_in_review_copy(tmp_path):
+    code = tmp_path / "code"
+    design = tmp_path / "design"
+    result = tmp_path / "result"
+    logs = tmp_path / "logs"
+    (code / "actual").mkdir(parents=True)
+    design.mkdir()
+    (code / "actual" / "service.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (code / "alias").symlink_to("actual", target_is_directory=True)
+    (design / "spec.md").write_text("The value must be one.\n", encoding="utf-8")
+    run_runner("prepare", code, design, result, logs)
+    manifest = ac.load_json(logs / "state" / "workspace_manifest.json")
+    records = {item["path"]: item for item in manifest["code"]["files"]}
+    review_code = Path(manifest["paths"]["review_code_root"])
+    assert records["alias"]["kind"] == "symlink"
+    assert (review_code / "alias").is_symlink()
+    assert (review_code / "alias").resolve() == review_code / "actual"
+
+
+def test_prepare_does_not_follow_preexisting_review_parent_symlink(tmp_path):
+    code = tmp_path / "code"
+    design = tmp_path / "design"
+    result = tmp_path / "result"
+    logs = tmp_path / "logs"
+    outside = tmp_path / "outside"
+    code.mkdir()
+    design.mkdir()
+    outside.mkdir()
+    (code / "service.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (design / "spec.md").write_text("The value must be one.\n", encoding="utf-8")
+    (outside / "marker.txt").write_text("keep\n", encoding="utf-8")
+    (logs / "state").mkdir(parents=True)
+    (logs / "state" / "review-inputs").symlink_to(outside, target_is_directory=True)
+    proc = run_runner("prepare", code, design, result, logs, check=False)
+    assert proc.returncode != 0
+    assert (outside / "marker.txt").read_text(encoding="utf-8") == "keep\n"
+    assert not (outside / "code").exists()
 
 
 def test_design_check_rejects_wrong_claim_schema_before_investigation(workspace):
@@ -740,6 +822,59 @@ def test_prepare_resumes_same_session_without_erasing_handoffs(workspace):
     assert ac.load_json(state / "agent_loop_state.json")["session_id"] == workspace["session_id"]
 
 
+def test_prepare_resume_rejects_original_mutation_without_rebaselining(workspace):
+    state = workspace["state"]
+    code = workspace["code"]
+    assert isinstance(state, Path)
+    assert isinstance(code, Path)
+    manifest_path = state / "workspace_manifest.json"
+    manifest_before = manifest_path.read_bytes()
+    review_code = Path(ac.load_json(manifest_path)["paths"]["review_code_root"])
+    review_before = (review_code / "service.py").read_bytes()
+    (code / "service.py").write_text("VALUE = 'mutated'\n", encoding="utf-8")
+    proc = run_runner("prepare", code, workspace["design"], workspace["result"], workspace["logs"], check=False)
+    assert proc.returncode == 2
+    assert manifest_path.read_bytes() == manifest_before
+    assert (review_code / "service.py").read_bytes() == review_before
+
+
+def test_prepare_resume_rejects_snapshot_mutation_without_repairing_it(workspace):
+    state = workspace["state"]
+    assert isinstance(state, Path)
+    manifest_path = state / "workspace_manifest.json"
+    manifest_before = manifest_path.read_bytes()
+    review_code = Path(ac.load_json(manifest_path)["paths"]["review_code_root"])
+    contaminated = b"VALUE = 'contaminated'\n"
+    (review_code / "service.py").write_bytes(contaminated)
+    proc = run_runner(
+        "prepare", workspace["code"], workspace["design"], workspace["result"], workspace["logs"], check=False
+    )
+    assert proc.returncode == 2
+    assert manifest_path.read_bytes() == manifest_before
+    assert (review_code / "service.py").read_bytes() == contaminated
+
+
+def test_prepare_with_different_roots_has_no_snapshot_side_effects(workspace, tmp_path):
+    state = workspace["state"]
+    assert isinstance(state, Path)
+    manifest_path = state / "workspace_manifest.json"
+    manifest_before = manifest_path.read_bytes()
+    review_code = Path(ac.load_json(manifest_path)["paths"]["review_code_root"])
+    review_before = (review_code / "service.py").read_bytes()
+    other_code = tmp_path / "other-code"
+    other_design = tmp_path / "other-design"
+    other_code.mkdir()
+    other_design.mkdir()
+    (other_code / "main.py").write_text("VALUE = 2\n", encoding="utf-8")
+    (other_design / "spec.md").write_text("The value must be two.\n", encoding="utf-8")
+    proc = run_runner(
+        "prepare", other_code, other_design, workspace["result"], workspace["logs"], check=False
+    )
+    assert proc.returncode == 2
+    assert manifest_path.read_bytes() == manifest_before
+    assert (review_code / "service.py").read_bytes() == review_before
+
+
 def test_validator_re_reads_cited_source_and_rejects_fabricated_quote(workspace):
     populate_handoffs(workspace, count=1, bad_quote=True)
     proc = run_runner(
@@ -998,6 +1133,97 @@ def test_gate_rejects_target_code_mutation_after_prepare(workspace):
     gate = ac.load_json(workspace["logs"] / "trace" / "final_gate.json")
     assert gate["checks"]["target_roots_unchanged"] is False
     assert any("target file changed after prepare" in error for error in gate["errors"])
+
+
+def test_gate_rejects_review_snapshot_mutation(workspace):
+    populate_handoffs(workspace)
+    run_runner("review", workspace["code"], workspace["design"], workspace["result"], workspace["logs"])
+    run_runner("report", workspace["code"], workspace["design"], workspace["result"], workspace["logs"])
+    state = workspace["state"]
+    assert isinstance(state, Path)
+    manifest = ac.load_json(state / "workspace_manifest.json")
+    review_code = Path(manifest["paths"]["review_code_root"])
+    (review_code / "service.py").write_text("def contaminated():\n    return True\n", encoding="utf-8")
+    proc = run_runner(
+        "gate", workspace["code"], workspace["design"], workspace["result"], workspace["logs"], check=False
+    )
+    assert proc.returncode == 1
+    gate = ac.load_json(workspace["logs"] / "trace" / "final_gate.json")
+    assert gate["checks"]["target_roots_unchanged"] is True
+    assert gate["checks"]["review_snapshots_unchanged"] is False
+    assert any("review snapshot file changed after prepare" in error for error in gate["errors"])
+
+
+def test_gate_rejects_added_review_directory_symlink(workspace):
+    populate_handoffs(workspace)
+    run_runner("review", workspace["code"], workspace["design"], workspace["result"], workspace["logs"])
+    run_runner("report", workspace["code"], workspace["design"], workspace["result"], workspace["logs"])
+    state = workspace["state"]
+    assert isinstance(state, Path)
+    review_code = Path(ac.load_json(state / "workspace_manifest.json")["paths"]["review_code_root"])
+    (review_code / "unexpected-link").symlink_to(".", target_is_directory=True)
+    proc = run_runner(
+        "gate", workspace["code"], workspace["design"], workspace["result"], workspace["logs"], check=False
+    )
+    assert proc.returncode == 1
+    gate = ac.load_json(workspace["logs"] / "trace" / "final_gate.json")
+    assert gate["checks"]["review_snapshots_unchanged"] is False
+    assert any("review snapshot tree has files added" in error for error in gate["errors"])
+
+
+def test_gate_rejects_missing_review_git_barrier(workspace):
+    populate_handoffs(workspace)
+    run_runner("review", workspace["code"], workspace["design"], workspace["result"], workspace["logs"])
+    run_runner("report", workspace["code"], workspace["design"], workspace["result"], workspace["logs"])
+    state = workspace["state"]
+    assert isinstance(state, Path)
+    review_code = Path(ac.load_json(state / "workspace_manifest.json")["paths"]["review_code_root"])
+    (review_code / ".git").unlink()
+    proc = run_runner(
+        "gate", workspace["code"], workspace["design"], workspace["result"], workspace["logs"], check=False
+    )
+    assert proc.returncode == 1
+    gate = ac.load_json(workspace["logs"] / "trace" / "final_gate.json")
+    assert gate["checks"]["review_snapshots_unchanged"] is False
+    assert any("Git isolation barrier is missing" in error for error in gate["errors"])
+
+
+def test_gate_rejects_symlinked_review_parent_even_with_identical_files(workspace):
+    populate_handoffs(workspace)
+    run_runner("review", workspace["code"], workspace["design"], workspace["result"], workspace["logs"])
+    run_runner("report", workspace["code"], workspace["design"], workspace["result"], workspace["logs"])
+    state = workspace["state"]
+    assert isinstance(state, Path)
+    review_parent = state / "review-inputs"
+    backup = state / "review-inputs-backup"
+    review_parent.rename(backup)
+    review_parent.symlink_to(backup, target_is_directory=True)
+    proc = run_runner(
+        "gate", workspace["code"], workspace["design"], workspace["result"], workspace["logs"], check=False
+    )
+    assert proc.returncode == 1
+    gate = ac.load_json(workspace["logs"] / "trace" / "final_gate.json")
+    assert gate["checks"]["review_snapshots_unchanged"] is False
+    assert any("review code root path contains a symlink" in error for error in gate["errors"])
+
+
+def test_gate_rejects_failed_session_preflight(workspace):
+    populate_handoffs(workspace)
+    run_runner("review", workspace["code"], workspace["design"], workspace["result"], workspace["logs"])
+    run_runner("report", workspace["code"], workspace["design"], workspace["result"], workspace["logs"])
+    state = workspace["state"]
+    assert isinstance(state, Path)
+    manifest_path = state / "workspace_manifest.json"
+    manifest = ac.load_json(manifest_path)
+    manifest["preflight_problems"] = ["review input could not be isolated"]
+    ac.save_json(manifest_path, manifest)
+    proc = run_runner(
+        "gate", workspace["code"], workspace["design"], workspace["result"], workspace["logs"], check=False
+    )
+    assert proc.returncode == 1
+    gate = ac.load_json(workspace["logs"] / "trace" / "final_gate.json")
+    assert gate["checks"]["preflight_passed"] is False
+    assert any("session preflight did not pass" in error for error in gate["errors"])
 
 
 def test_report_refuses_output_root_outside_prepared_session(workspace, tmp_path):

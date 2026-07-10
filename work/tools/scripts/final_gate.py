@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -53,7 +54,7 @@ def _check_issue(issue: dict[str, Any], session_id: str, result_root: Path) -> l
     return errors
 
 
-def _tree_changes(root: Path, records: list[dict[str, Any]]) -> list[str]:
+def _tree_changes(root: Path, records: list[dict[str, Any]], label: str = "target") -> list[str]:
     """Compare current target files with the prepare-time content snapshot."""
     expected = {str(record.get("path")): record for record in records if record.get("path")}
     current = {ac.relative_path(root, path): path for path in ac.iter_files(root)}
@@ -61,26 +62,26 @@ def _tree_changes(root: Path, records: list[dict[str, Any]]) -> list[str]:
     added = sorted(set(current) - set(expected))
     removed = sorted(set(expected) - set(current))
     if added:
-        errors.append(f"target tree has files added after prepare: {added[:10]}")
+        errors.append(f"{label} tree has files added after prepare: {added[:10]}")
     if removed:
-        errors.append(f"target tree has files removed after prepare: {removed[:10]}")
+        errors.append(f"{label} tree has files removed after prepare: {removed[:10]}")
     for relative in sorted(set(expected) & set(current)):
         record = expected[relative]
         path = current[relative]
         expected_kind = str(record.get("kind") or "file")
         actual_kind = "symlink" if path.is_symlink() else "file"
         if actual_kind != expected_kind:
-            errors.append(f"target tree entry kind changed after prepare: {relative}")
+            errors.append(f"{label} tree entry kind changed after prepare: {relative}")
             continue
         if expected_kind == "symlink":
             if str(path.readlink()) != str(record.get("link_target") or ""):
-                errors.append(f"target symlink changed after prepare: {relative}")
+                errors.append(f"{label} symlink changed after prepare: {relative}")
             continue
         expected_hash = str(record.get("sha256") or "")
         if not expected_hash:
-            errors.append(f"prepare snapshot lacks sha256 for target file: {relative}")
+            errors.append(f"prepare snapshot lacks sha256 for {label} file: {relative}")
         elif ac.sha256_file(path) != expected_hash:
-            errors.append(f"target file changed after prepare: {relative}")
+            errors.append(f"{label} file changed after prepare: {relative}")
     return errors
 
 
@@ -207,6 +208,9 @@ def run(args: argparse.Namespace) -> int:
 
     manifest_path = root / "workspace_manifest.json"
     manifest = ac.load_json(manifest_path) if manifest_path.exists() else {}
+    preflight_problems = manifest.get("preflight_problems", []) if isinstance(manifest, dict) else []
+    for problem in preflight_problems:
+        errors.append(f"session preflight did not pass: {problem}")
     manifest_paths = manifest.get("paths", {}) if isinstance(manifest.get("paths"), dict) else {}
     expected_runtime_paths = {
         "code_root": str(code_root),
@@ -220,11 +224,51 @@ def run(args: argparse.Namespace) -> int:
             errors.append(f"runtime {name} does not match prepared session")
     if result.get("code_root") != str(code_root) or result.get("design_root") != str(design_root):
         errors.append("issues.json code/design roots do not match gate inputs")
-    errors.extend(_tree_changes(code_root, manifest.get("code", {}).get("files", [])))
-    errors.extend(_tree_changes(
+    target_integrity_errors = _tree_changes(code_root, manifest.get("code", {}).get("files", []))
+    target_integrity_errors.extend(_tree_changes(
         design_root,
         manifest.get("design", {}).get("source_files", manifest.get("design", {}).get("documents", [])),
     ))
+    errors.extend(target_integrity_errors)
+    review_workspace = manifest.get("review_workspace", {})
+    review_integrity_errors: list[str] = []
+    review_code_value = str(manifest_paths.get("review_code_root") or "")
+    review_design_value = str(manifest_paths.get("review_design_root") or "")
+    review_code_root = Path(os.path.abspath(review_code_value)) if review_code_value else None
+    review_design_root = Path(os.path.abspath(review_design_value)) if review_design_value else None
+    expected_review_code_root = Path(os.path.abspath(str(root / "review-inputs" / "code")))
+    expected_review_design_root = Path(os.path.abspath(str(root / "review-inputs" / "design")))
+    code_path_errors = (
+        ac.lexical_path_errors(root, review_code_root, "review code root") if review_code_root else []
+    )
+    design_path_errors = (
+        ac.lexical_path_errors(root, review_design_root, "review design root") if review_design_root else []
+    )
+    if review_code_root != expected_review_code_root:
+        code_path_errors.append("review code root is not the fixed session review path")
+    if review_design_root != expected_review_design_root:
+        design_path_errors.append("review design root is not the fixed session review path")
+    review_integrity_errors.extend(code_path_errors + design_path_errors)
+    if code_path_errors or review_code_root is None or not review_code_root.is_dir():
+        review_integrity_errors.append("review code root is missing or outside session state")
+    else:
+        barrier_errors = ac.review_git_barrier_errors(review_code_root)
+        review_integrity_errors.extend(barrier_errors)
+        barrier_record = review_workspace.get("git_isolation_barrier", {})
+        if barrier_record.get("path") != ".git":
+            review_integrity_errors.append("review code Git isolation barrier manifest is missing")
+        elif not barrier_errors and barrier_record.get("sha256") != ac.sha256_file(review_code_root / ".git"):
+            review_integrity_errors.append("review code Git isolation barrier hash changed")
+        review_integrity_errors.extend(_tree_changes(
+            review_code_root, review_workspace.get("code", {}).get("files", []), "review snapshot"
+        ))
+    if design_path_errors or review_design_root is None or not review_design_root.is_dir():
+        review_integrity_errors.append("review design root is missing or outside session state")
+    else:
+        review_integrity_errors.extend(_tree_changes(
+            review_design_root, review_workspace.get("design_source_files", []), "review snapshot"
+        ))
+    errors.extend(review_integrity_errors)
     expected_groups = {
         str(group.get("document_key"))
         for group in manifest.get("design", {}).get("document_groups", [])
@@ -625,6 +669,7 @@ def run(args: argparse.Namespace) -> int:
 
     checks.update({
         "result_artifacts_exist": all((result_root / name).is_file() for name in ("issues.json", "issues.jsonl", "00-summary.md")),
+        "preflight_passed": not preflight_problems,
         "confirmed_count_target": len(issues) >= MIN_CONFIRMED,
         "only_confirmed_published": all(issue.get("status") == "confirmed" for issue in issues),
         "handoff_chain_complete": not any("handoff" in error for error in errors),
@@ -642,7 +687,8 @@ def run(args: argparse.Namespace) -> int:
         "investigation_round_recorded": bool(rounds),
         "exploration_modes_complete": bool(expected_modes) and not missing_modes,
         "dynamic_probe_integrity": not probe_integrity_errors,
-        "target_roots_unchanged": not any("target " in error for error in errors),
+        "target_roots_unchanged": not target_integrity_errors,
+        "review_snapshots_unchanged": not review_integrity_errors,
         "within_time_budget": elapsed_seconds <= MAX_SECONDS,
         "evidence_validation_passed": (
             (trace_root / "evidence_validation.json").is_file()

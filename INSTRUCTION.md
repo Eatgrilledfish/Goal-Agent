@@ -17,6 +17,8 @@ STATE_ROOT=${LOG_ROOT}/state
 
 从 `${ASSET_ROOT}/code` 自动选择目标代码仓：只有一个项目目录就直接使用；有多个时阅读设计入口、README 和构建清单后自主匹配。设计材料位于 `${ASSET_ROOT}` 的非 `code` 目录。不得按项目名、语言、框架或协议做选择。
 
+将发现的原始输入分别记为 `CODE_ROOT` 和 `DESIGN_ROOT`。这两个路径只交给 deterministic helper 做清单、复制和最终真实性校验；Task 子 agent 不直接读取外部输入路径。
+
 若设计目录包含完整正文，直接作为 `DESIGN_ROOT`。若只有 catalog/链接清单，先由你阅读 catalog 并写 `${STATE_ROOT}/design_source_plan.json`：
 
 ```json
@@ -64,12 +66,14 @@ python3 ${WORK_ROOT}/tools/scripts/goal_runner.py prepare \
 
 再读 `workspace_manifest.json`、`agent_loop_contract.json`、`agent_loop_state.json` 和 ledger。`prepare` 只做清单、只读快照和 session 契约，不做语义判断。
 
+`prepare` 会在 `${STATE_ROOT}/review-inputs` 创建本 session 的语义中立物理副本。从 `workspace_manifest.paths` 读取 `review_code_root` 和 `review_design_root`，分别记为 `REVIEW_CODE_ROOT`、`REVIEW_DESIGN_ROOT`；两者必须位于 `${STATE_ROOT}`。从此所有主/子 agent 的 read、glob、grep 和语言导航只使用 review roots，证据路径始终写成相对 review root 的路径。所有 helper 的 `--code-root/--design-root` 仍传原始 `CODE_ROOT/DESIGN_ROOT`，由 validator 按相同相对路径回读原始输入。review snapshot 刻意不携带 VCS metadata，禁止运行 git history/blame，也禁止向上发现 submission 仓库。禁止用 symlink 代替 review 副本，禁止 Task 回退读取原始外部路径。
+
 ## 3. 强制模型驱动 handoff
 
 必须使用 opencode Task/子 agent。Task 缺失是平台阻塞；禁止主 agent 模拟多个角色、手工填 verdict 或用规则兜底。
 
-1. 主 agent 作为 orchestrator 阅读仓库入口、构建/注册/配置和目录边界，写 `architecture_map.json`。明确 owned、adapter、imported、generated、fast/slow execution planes，以及同一设计行为的平行实现；从真实代码语义记录值得反查设计的风险观察，例如集合容量/提前终止、链式推进、同步与延迟副作用、分类/分派/所有权变化、配置分支和平行路径差异。观察必须引用代码位置，不用 regex 命中直接下结论。同时只依据仓库和当前环境证据记录已有 build/test/runtime surface 与 dynamic probe 约束，不安装依赖。
-2. 启动 fresh Task，要求它先完整读取 `work/skills/spec-analyst.md`，只读 `DESIGN_ROOT` 与 catalog provenance，禁止读代码。为避免长 handoff 被截断，Task 直接写 `${STATE_ROOT}/design_coverage.json` 与 `${STATE_ROOT}/design_claims.jsonl`，聊天只返回计数和路径。Task 返回后立刻运行下列 gate；返回非 0 时不得创建 investigation task，必须让 fresh spec-analyst repair Task 按 `logs/trace/design_validation.json` 重写两个 artifact 并再次校验：
+1. 主 agent 作为 orchestrator 只在 `REVIEW_CODE_ROOT` 阅读仓库入口、构建/注册/配置和目录边界，写 `architecture_map.json`。明确 owned、adapter、imported、generated、fast/slow execution planes，以及同一设计行为的平行实现；从真实代码语义记录值得反查设计的风险观察，例如集合容量/提前终止、链式推进、同步与延迟副作用、分类/分派/所有权变化、配置分支和平行路径差异。观察必须引用相对代码路径，不用 regex 命中直接下结论。同时只依据仓库和当前环境证据记录已有 build/test/runtime surface 与 dynamic probe 约束，不安装依赖。
+2. 启动 fresh Task，要求它先完整读取 `work/skills/spec-analyst.md`，只读 `REVIEW_DESIGN_ROOT` 与 catalog provenance，禁止读代码或原始外部设计路径。为避免长 handoff 被截断，Task 直接写 `${STATE_ROOT}/design_coverage.json` 与 `${STATE_ROOT}/design_claims.jsonl`，聊天只返回计数和路径。Task 返回后立刻运行下列 gate；返回非 0 时不得创建 investigation task，必须让 fresh spec-analyst repair Task 按 `logs/trace/design_validation.json` 重写两个 artifact 并再次校验：
 
 ```bash
 python3 ${WORK_ROOT}/tools/scripts/goal_runner.py design-check \
@@ -88,7 +92,7 @@ python3 ${WORK_ROOT}/tools/scripts/handoff_merge.py \
 ```
 
 合并失败时不得启动 investigator；只修复报错 task 的结构。
-4. 按不同 claim/边界启动 fresh investigator Task；每个 Task 先读 `work/skills/code-investigator.md`，再即时搜索、读调用链、配置、构建、平行实现和测试。为避免 provider 突发并发导致整批 stream 悬挂，**每批最多同时启动 2 个 Task**；一批取得完成事件或按恢复规则处理缺失 handoff 后，才启动下一批。每个 finding 都写 `dynamic_probe_selection`，但测试可用性不能降低静态证据要求。并行 Task 禁止写共享 JSONL：每项只写 `${STATE_ROOT}/handoffs/investigators/<task_id>.json`，聊天只返回路径。每批结束后执行下列命令；只有结构校验通过的 finding 才能进入 critic：
+4. 按不同 claim/边界启动 fresh investigator Task；每个 Task 先读 `work/skills/code-investigator.md`，只在 `REVIEW_CODE_ROOT`/`REVIEW_DESIGN_ROOT` 即时搜索、读调用链、配置、构建、平行实现和测试，并输出相对路径。为控制资源并让缺失 handoff 能按项恢复，**每批最多同时启动 2 个 Task**；一批取得完成事件或按恢复规则处理缺失 handoff 后，才启动下一批。每个 finding 都写 `dynamic_probe_selection`，但测试可用性不能降低静态证据要求。并行 Task 禁止写共享 JSONL：每项只写 `${STATE_ROOT}/handoffs/investigators/<task_id>.json`，聊天只返回路径。每批结束后执行下列命令；只有结构校验通过的 finding 才能进入 critic：
 
 ```bash
 python3 ${WORK_ROOT}/tools/scripts/handoff_merge.py \
@@ -100,8 +104,8 @@ python3 ${WORK_ROOT}/tools/scripts/handoff_merge.py \
 
 搜索命中或无命中本身不是结论。
    Task 因 provider timeout、stream timeout 或工具错误返回且没有 handoff 时，只为缺失项启动一次 fresh 重试；不得重跑已有有效 handoff，也不得让整批永久等待。第二次仍失败则在 task 写 `deferred` 和具体运行证据限制，继续其他任务，并由 coverage audit 保留缺口；这只是 session 恢复，不得改用规则/regex 或手工 verdict 兜底。
-5. 对 `contradiction_supported|uncertain` findings 做模型驱动的 dynamic probe triage。只选择高价值、可观察、低成本且当前环境已有依赖的少量候选；不是数量门槛，也不是 regex/rule fallback。对选中项启动 fresh Task，复用 `work/skills/code-investigator.md` 的 dynamic probe 流程：逐字继承 claim.probe_oracle，在 `${STATE_ROOT}/probes/<probe_id>/workspace` 的目标仓隔离副本中复用已有 build/test/runtime 入口，禁止写原目标、联网安装依赖或调用可变外部系统。先跑最小 baseline；baseline/环境失败、未完成执行或无法证明目标路径已触达时一律 `inconclusive`。每项只写 `${STATE_ROOT}/handoffs/probes/<finding_id>.json`，批次结束后用 `handoff_merge.py` 合并到 `dynamic_probes.jsonl`，参数必须包含 `--artifact-type probe --session-id ${SESSION_ID}`。测试失败不能单独确认 issue；测试通过是反证但不自动证明全面一致。
-6. 对每个 `contradiction_supported` finding 启动新的 fresh critic Task。critic 先读 `work/skills/evidence-critic.md`，只接收 claim、finding、关联 probe（如有）和源路径，不接收 investigator 的聊天推理；独立重读设计/代码并至少做两项反证检查，同时写 `dynamic_probe_review`。每项只写 `${STATE_ROOT}/handoffs/critics/<finding_id>.json`，批次结束后用 `handoff_merge.py` 合并到 `critic_reviews.jsonl`，参数必须包含 `--artifact-type critic --session-id ${SESSION_ID}`。合并失败时只重做坏 handoff。每个 finding 只允许一个有效 critic；不得因为数量不足而对相同证据重复找 critic。只有 investigator 补充了新的可核验证据后，才可创建新的 critic revision。
+5. 对 `contradiction_supported|uncertain` findings 做模型驱动的 dynamic probe triage。只选择高价值、可观察、低成本且当前环境已有依赖的少量候选；不是数量门槛，也不是 regex/rule fallback。对选中项启动 fresh Task，复用 `work/skills/code-investigator.md` 的 dynamic probe 流程：逐字继承 claim.probe_oracle，从 `REVIEW_CODE_ROOT` 复制到 `${STATE_ROOT}/probes/<probe_id>/workspace` 后复用已有 build/test/runtime 入口，禁止写 review snapshot 或原目标、联网安装依赖或调用可变外部系统。先跑最小 baseline；baseline/环境失败、未完成执行或无法证明目标路径已触达时一律 `inconclusive`。每项只写 `${STATE_ROOT}/handoffs/probes/<finding_id>.json`，批次结束后用 `handoff_merge.py` 合并到 `dynamic_probes.jsonl`，参数必须包含 `--artifact-type probe --session-id ${SESSION_ID}`。测试失败不能单独确认 issue；测试通过是反证但不自动证明全面一致。
+6. 对每个 `contradiction_supported` finding 启动新的 fresh critic Task。critic 先读 `work/skills/evidence-critic.md`，只接收 claim、finding、关联 probe（如有）和 review roots，不接收 investigator 的聊天推理；只在 review roots 独立重读设计/代码并至少做两项反证检查，同时写 `dynamic_probe_review`。每项只写 `${STATE_ROOT}/handoffs/critics/<finding_id>.json`，批次结束后用 `handoff_merge.py` 合并到 `critic_reviews.jsonl`，参数必须包含 `--artifact-type critic --session-id ${SESSION_ID}`。合并失败时只重做坏 handoff。每个 finding 只允许一个有效 critic；不得因为数量不足而对相同证据重复找 critic。只有 investigator 补充了新的可核验证据后，才可创建新的 critic revision。
 7. 启动 fresh final-judge Task，先完整读取 `work/skills/final-judge.md`。它只从通过结构校验的 claim、finding、critic 和 probe 生成 verdict。`design_evidence`、`code_evidence`、`expected_behavior`、`actual_behavior`、`false_positive_checks`、`tool_trace` 与 `critic_review` 必须逐值复制对应 handoff，禁止在 judge 阶段改写、补造或换行号。只有 investigator=`contradiction_supported` 且 critic=`confirm_contradiction` 才能 confirmed；实现满足设计必须 rejected。
 8. 启动 fresh coverage Task，先读 `work/skills/coverage-critic.md`，审计文档组、behavior families、execution planes、边界和三种 exploration mode，同时写 `semantic_coverage.json` 与 `coverage_audit.json`。audit 必须给出结构化 `next_round_tasks`（claim、lens、mode、boundary、plane、证据问题）；有高价值缺口时主 agent 必须执行这些任务或记录具体证据限制，不能只把 audit 改写成停止说明。明显可低成本动态复核却全部无理由跳过时属于证据缺口；不可构建、硬件依赖或不适合运行验证不属于失败。
 

@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shutil
 import sys
 from collections import Counter
 from pathlib import Path
@@ -120,11 +122,144 @@ def code_manifest(root: Path) -> dict[str, Any]:
     }
 
 
+def _review_copy_ignore(directory: str, names: list[str]) -> set[str]:
+    return {
+        name for name in names
+        if name in {".git", ".hg", ".svn"}
+        or (
+            (Path(directory) / name).is_dir()
+            and (name in ac.DEFAULT_IGNORED_DIRS or name.startswith(".cache"))
+        )
+    }
+
+
+def _iter_symlinks(root: Path):
+    ignored = ac.DEFAULT_IGNORED_DIRS
+    for current, dirs, files in os.walk(root, followlinks=False):
+        dirs[:] = sorted(
+            name for name in dirs
+            if name not in ignored and not name.startswith(".cache")
+        )
+        base = Path(current)
+        for name in [*dirs, *(name for name in sorted(files) if name not in {".git", ".hg", ".svn"})]:
+            path = base / name
+            if path.is_symlink():
+                yield path
+
+
+def _review_destination_errors(destination: Path, state_root: Path) -> list[str]:
+    return ac.lexical_path_errors(state_root, destination, "review snapshot")
+
+
+def materialize_review_tree(
+    source: Path,
+    destination: Path,
+    *,
+    state_root: Path,
+    block_parent_git: bool = False,
+) -> list[str]:
+    """Copy one supplied root into session state without interpreting its content."""
+    source = source.resolve()
+    destination = destination.absolute()
+    destination_errors = _review_destination_errors(destination, state_root)
+    if destination_errors:
+        return destination_errors
+    try:
+        destination.relative_to(source)
+    except ValueError:
+        pass
+    else:
+        return [f"review snapshot destination is inside its source root: {destination}"]
+    try:
+        source.relative_to(destination)
+    except ValueError:
+        pass
+    else:
+        return [f"review source is inside its snapshot destination: {source}"]
+
+    if destination.exists():
+        shutil.rmtree(destination)
+    ac.ensure_dir(destination.parent)
+    shutil.copytree(source, destination, symlinks=True, ignore=_review_copy_ignore)
+
+    problems: list[str] = []
+    for source_link in _iter_symlinks(source):
+        relative = source_link.absolute().relative_to(source)
+        destination_link = destination / relative
+        resolved_source_target = source_link.resolve(strict=False)
+        try:
+            target_relative = resolved_source_target.relative_to(source)
+        except ValueError:
+            problems.append(f"source symlink escapes supplied root: {relative}")
+            continue
+
+        # Rewrite absolute or non-canonical links so the copied tree never points
+        # back through the original external workspace.
+        copied_target = destination / target_relative
+        safe_target = os.path.relpath(copied_target, destination_link.parent)
+        if str(destination_link.readlink()) != safe_target:
+            destination_link.unlink()
+            destination_link.symlink_to(safe_target, target_is_directory=source_link.is_dir())
+    if block_parent_git:
+        # An invalid local gitdir marker makes Git stop here instead of discovering
+        # the submission repository above the snapshot. VCS history is intentionally
+        # excluded from the self-contained review input. iter_files ignores this
+        # reserved metadata filename, so it is not source evidence.
+        (destination / ".git").write_text(ac.REVIEW_GIT_BARRIER_CONTENT, encoding="utf-8")
+    return problems
+
+
+def review_copy_errors(source_records: list[dict], review_records: list[dict], label: str) -> list[str]:
+    """Verify copied regular files byte-for-byte and preserve the entry topology."""
+    source = {str(item.get("path")): item for item in source_records if item.get("path")}
+    review = {str(item.get("path")): item for item in review_records if item.get("path")}
+    errors: list[str] = []
+    if set(source) != set(review):
+        missing = sorted(set(source) - set(review))
+        extra = sorted(set(review) - set(source))
+        if missing:
+            errors.append(f"{label} review snapshot is missing entries: {missing[:10]}")
+        if extra:
+            errors.append(f"{label} review snapshot has extra entries: {extra[:10]}")
+    for relative in sorted(set(source) & set(review)):
+        expected = source[relative]
+        actual = review[relative]
+        if expected.get("kind") != actual.get("kind"):
+            errors.append(f"{label} review snapshot changed entry kind: {relative}")
+        elif expected.get("kind") == "file" and expected.get("sha256") != actual.get("sha256"):
+            errors.append(f"{label} review snapshot content mismatch: {relative}")
+    return errors
+
+
+def record_integrity_errors(expected_records: list[dict], current_records: list[dict], label: str) -> list[str]:
+    """Compare an existing session baseline without allowing prepare to reset it."""
+    expected = {str(item.get("path")): item for item in expected_records if item.get("path")}
+    current = {str(item.get("path")): item for item in current_records if item.get("path")}
+    errors: list[str] = []
+    added = sorted(set(current) - set(expected))
+    removed = sorted(set(expected) - set(current))
+    if added:
+        errors.append(f"{label} has entries added since session prepare: {added[:10]}")
+    if removed:
+        errors.append(f"{label} has entries removed since session prepare: {removed[:10]}")
+    for relative in sorted(set(expected) & set(current)):
+        before = expected[relative]
+        now = current[relative]
+        if before.get("kind") != now.get("kind"):
+            errors.append(f"{label} entry kind changed since session prepare: {relative}")
+        elif before.get("kind") == "symlink":
+            if before.get("link_target") != now.get("link_target"):
+                errors.append(f"{label} symlink changed since session prepare: {relative}")
+        elif before.get("sha256") != now.get("sha256"):
+            errors.append(f"{label} file changed since session prepare: {relative}")
+    return errors
+
+
 def loop_contract(paths: dict[str, str], session_id: str) -> dict[str, Any]:
     state_root = Path(paths["state_root"])
     artifacts = {name: str(state_root / filename) for name, filename in ARTIFACT_NAMES.items()}
     return {
-        "contract_version": 6,
+        "contract_version": 7,
         "execution_model": "opencode-owned-model-driven-loop",
         "session": {
             "session_id": session_id,
@@ -207,6 +342,11 @@ def loop_contract(paths: dict[str, str], session_id: str) -> dict[str, Any]:
         },
         "guardrails": {
             "target_roots_read_only": [paths["code_root"], paths["design_root"]],
+            "agent_read_roots": [paths["review_code_root"], paths["review_design_root"]],
+            "source_path_rule": (
+                "Model agents read/search only the session-local review roots and cite paths relative to them. "
+                "Validators re-read the same relative paths under the original supplied roots."
+            ),
             "allowed_writes": [paths["state_root"], paths["result_root"], paths["log_root"]],
             "forbidden": [
                 "Use project names, known benchmark answers, fixed file paths, fixed symbols, regex hits, or scores as issue decisions.",
@@ -216,12 +356,13 @@ def loop_contract(paths: dict[str, str], session_id: str) -> dict[str, Any]:
                 "Modify the target code repository or design documents.",
             ],
             "evidence_truth": "The validator re-reads cited files and rejects quotes or snippets that do not match source lines.",
-            "source_integrity": "Prepare hashes every supplied design/code file; the final gate rejects additions, removals, edits, or symlink retargeting under either target root.",
+            "source_integrity": "Prepare hashes every supplied design/code file and its session-local review copy; the final gate rejects changes to either the original target roots or the review snapshots.",
         },
         "approval_flows": {
             "auto_approved": [
-                "Read files under the supplied roots.",
-                "Use repository-local search, navigation, build metadata, and read-only version-control commands.",
+                "Read and search the session-local review roots created by prepare.",
+                "Use the deterministic prepare helper to inventory and copy supplied roots without semantic interpretation.",
+                "Use search, navigation, build metadata, and source configuration inside the session-local review roots.",
                 "Run a focused probe only in a session-owned isolated copy, using an oracle derived from the supplied design claim.",
                 "Fetch a read-only design URL selected from the supplied catalog and cache it under session state.",
                 "Write session artifacts under the allowed output roots.",
@@ -370,31 +511,117 @@ def prepare(args: argparse.Namespace) -> int:
         problems.append("target code repository contains no files")
 
     prepared_at = ac.now_iso()
+    review_root = state_root / "review-inputs"
+    review_code_root = review_root / "code"
+    review_design_root = review_root / "design"
     paths = {
         "code_root": str(code_root),
         "design_root": str(design_root),
         "result_root": str(result_root),
         "log_root": str(log_root),
         "state_root": str(state_root),
+        "review_code_root": str(review_code_root),
+        "review_design_root": str(review_design_root),
     }
     existing_state_path = state_root / ARTIFACT_NAMES["state"]
     existing_manifest_path = state_root / "workspace_manifest.json"
     resumed = False
     existing_state: dict[str, Any] = {}
-    if existing_state_path.exists() and existing_manifest_path.exists():
+    existing_manifest: dict[str, Any] = {}
+    if existing_state_path.exists() != existing_manifest_path.exists():
+        problem = "state root has an incomplete prior session; choose a new --state-root"
+        ac.save_json(log_root / "trace" / "preflight.json", {"ok": False, "problems": [problem]})
+        print(f"[prepare] {problem}", file=sys.stderr)
+        return 2
+    if existing_state_path.exists():
         existing_state = ac.load_json(existing_state_path)
         existing_manifest = ac.load_json(existing_manifest_path)
         previous_paths = existing_manifest.get("paths", {})
-        if previous_paths.get("code_root") != str(code_root) or previous_paths.get("design_root") != str(design_root):
-            problem = "state root belongs to different code/design roots; choose a new --state-root"
+        if any(previous_paths.get(name) != value for name, value in paths.items()):
+            problem = "state root belongs to different prepared paths; choose a new --state-root"
             ac.save_json(log_root / "trace" / "preflight.json", {"ok": False, "problems": [problem]})
             print(f"[prepare] {problem}", file=sys.stderr)
             return 2
         session_id = str(existing_state.get("session_id") or "")
-        resumed = bool(session_id)
-    if not resumed:
+        resumed = bool(session_id) and session_id == str(existing_manifest.get("session_id") or "")
+        if not resumed:
+            problem = "state root has inconsistent session identifiers; choose a new --state-root"
+            ac.save_json(log_root / "trace" / "preflight.json", {"ok": False, "problems": [problem]})
+            print(f"[prepare] {problem}", file=sys.stderr)
+            return 2
+
+    review_code: dict[str, Any] = {"file_count": 0, "files": []}
+    review_design_source_files: list[dict] = []
+    if resumed:
+        previous_review = existing_manifest.get("review_workspace", {})
+        review_code = previous_review.get("code", {})
+        review_design_source_files = previous_review.get("design_source_files", [])
+        problems.extend(record_integrity_errors(
+            existing_manifest.get("code", {}).get("files", []), code["files"], "original code root"
+        ))
+        problems.extend(record_integrity_errors(
+            existing_manifest.get("design", {}).get("source_files", []),
+            design_source_files,
+            "original design root",
+        ))
+        review_path_errors = [
+            *_review_destination_errors(review_code_root, state_root),
+            *_review_destination_errors(review_design_root, state_root),
+        ]
+        problems.extend(review_path_errors)
+        if review_path_errors or not review_code_root.is_dir() or not review_design_root.is_dir():
+            problems.append("session-local review roots are missing")
+        else:
+            barrier_errors = ac.review_git_barrier_errors(review_code_root)
+            problems.extend(barrier_errors)
+            barrier_record = previous_review.get("git_isolation_barrier", {})
+            if barrier_record.get("path") != ".git":
+                problems.append("review code Git isolation barrier manifest is missing")
+            elif not barrier_errors and barrier_record.get("sha256") != ac.sha256_file(review_code_root / ".git"):
+                problems.append("review code Git isolation barrier hash changed")
+            current_review_code = code_manifest(review_code_root)
+            current_review_design = [
+                file_record(review_design_root, path, include_hash=True)
+                for path in ac.iter_files(review_design_root)
+            ]
+            problems.extend(record_integrity_errors(
+                review_code.get("files", []), current_review_code["files"], "review code snapshot"
+            ))
+            problems.extend(record_integrity_errors(
+                review_design_source_files, current_review_design, "review design snapshot"
+            ))
+        if existing_manifest.get("preflight_problems"):
+            problems.append("prior session did not pass preflight")
+        if problems:
+            ac.save_json(log_root / "trace" / "preflight.json", {"ok": False, "problems": problems})
+            for problem in problems:
+                print(f"[prepare] {problem}", file=sys.stderr)
+            return 2
+    else:
         session_id = "session-" + ac.stable_id(str(code_root), str(design_root), prepared_at)
-    manifest = {
+        try:
+            materialization_errors = materialize_review_tree(
+                code_root, review_code_root, state_root=state_root, block_parent_git=True
+            )
+            materialization_errors.extend(materialize_review_tree(
+                design_root, review_design_root, state_root=state_root
+            ))
+            problems.extend(materialization_errors)
+            if not materialization_errors:
+                review_code = code_manifest(review_code_root)
+                review_design_source_files = [
+                    file_record(review_design_root, path, include_hash=True)
+                    for path in ac.iter_files(review_design_root)
+                ]
+                problems.extend(review_copy_errors(code["files"], review_code["files"], "code"))
+                problems.extend(review_copy_errors(design_source_files, review_design_source_files, "design"))
+        except (OSError, shutil.Error) as exc:
+            problems.append(f"could not materialize session-local review inputs: {exc}")
+
+    git_barrier = {}
+    if not resumed and (review_code_root / ".git").is_file() and not (review_code_root / ".git").is_symlink():
+        git_barrier = {"path": ".git", "sha256": ac.sha256_file(review_code_root / ".git")}
+    manifest = existing_manifest if resumed else {
         "prepared_at": prepared_at,
         "session_id": session_id,
         "paths": paths,
@@ -407,6 +634,12 @@ def prepare(args: argparse.Namespace) -> int:
             "source_manifest": source_manifest,
         },
         "code": code,
+        "review_workspace": {
+            "kind": "session_local_semantic_neutral_copy",
+            "git_isolation_barrier": git_barrier,
+            "code": review_code,
+            "design_source_files": review_design_source_files,
+        },
         "preflight_problems": problems,
         "semantic_analysis_performed": False,
     }
@@ -433,7 +666,8 @@ def prepare(args: argparse.Namespace) -> int:
         "code_files": code["file_count"],
     })
 
-    ac.save_json(state_root / "workspace_manifest.json", manifest)
+    if not resumed:
+        ac.save_json(state_root / "workspace_manifest.json", manifest)
     ac.save_json(state_root / "agent_loop_contract.json", contract)
     ac.save_json(state_root / ARTIFACT_NAMES["state"], state)
     for key in (

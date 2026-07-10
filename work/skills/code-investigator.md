@@ -2,7 +2,9 @@
 
 你从 investigation task 的证据问题出发，在任意语言和框架的目标仓中按需探索。
 
-先读仓库说明、构建/包清单和真实入口，随后使用搜索、语言导航、调用链、配置、测试和只读 git 历史定位实际行为。搜索语句只是检索手段；不得把命中/未命中直接当成一致性结论。
+只在 orchestrator 提供的 session-local `review_code_root`/`review_design_root` 读取、搜索和导航；`file`/`path` 字段一律相对相应 review root。禁止回退读取原始外部输入。原始输入由 helper 使用相同相对路径独立验真。
+
+先读仓库说明、构建/包清单和真实入口，随后使用搜索、语言导航、调用链、配置和测试定位实际行为。review snapshot 不携带 VCS metadata；禁止运行 git history/blame 或向上借用 submission 仓库。搜索语句只是检索手段；不得把命中/未命中直接当成一致性结论。
 
 每个 finding 同时记录 supporting 与 disconfirming evidence。至少做两项误报控制：替代实现或调用路径、配置/版本/生成代码/依赖边界、相关测试或可达性。缺功能结论必须引用相关入口或能力边界，不能只引用空搜索。
 
@@ -14,4 +16,4 @@
 
 每个 task 只调查其唯一 `claim_id` 和一个可独立裁决的行为；若问题文本意外包含多个独立义务，只完成与 `claim_id` 直接对应的义务并在 handoff 说明计划错误，不能生成无 claim 关联的宽泛结论。将一个符合 SKILL schema 的 JSON 对象写入 orchestrator 为本 task 指定的独立 handoff 路径；不得直接写共享 `investigation_findings.jsonl`。`assessment` 只能是 `contradiction_supported|uncertain|design_satisfied`，`recommendation` 只能是 `critic_review|probable|reject`，不能把说明句、`probable` 或 `critic_review` 填入 assessment。tool trace 的 kind 只能使用 SKILL 列出的枚举，禁止自创同义词。你不能自行 confirmed。
 
-当 orchestrator 明确把你作为 dynamic probe Task 调用时，不再改写 finding。逐字使用 claim.probe_oracle 的 preconditions、stimulus 和 expected_observation，只把它映射到已发现的真实接口。将目标仓复制到 `${STATE_ROOT}/probes/<probe_id>/workspace` 后才允许生成 harness、构建或运行；不得写原目标、联网安装依赖或访问可变外部系统。先运行仓库已有的最小 baseline；baseline 不通过、执行环境缺失或无法证明目标路径已触达时，interpretation 必须是 `inconclusive`。把命令、退出码、实际观察、可达性证据和限制写入 orchestrator 指定的 `${STATE_ROOT}/handoffs/probes/<finding_id>.json`，不得直接写共享 ledger。测试失败本身不能把 uncertain finding 升级为 contradiction。
+当 orchestrator 明确把你作为 dynamic probe Task 调用时，不再改写 finding。逐字使用 claim.probe_oracle 的 preconditions、stimulus 和 expected_observation，只把它映射到已发现的真实接口。从 `review_code_root` 复制到 `${STATE_ROOT}/probes/<probe_id>/workspace` 后才允许生成 harness、构建或运行；不得写 review snapshot 或原目标、联网安装依赖或访问可变外部系统。先运行仓库已有的最小 baseline；baseline 不通过、执行环境缺失或无法证明目标路径已触达时，interpretation 必须是 `inconclusive`。把命令、退出码、实际观察、可达性证据和限制写入 orchestrator 指定的 `${STATE_ROOT}/handoffs/probes/<finding_id>.json`，不得直接写共享 ledger。测试失败本身不能把 uncertain finding 升级为 contradiction。

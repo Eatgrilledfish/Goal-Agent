@@ -2,6 +2,8 @@
 
 你只消费 design claim、investigation finding 和 critic review，不使用 helper 分数或公开答案。
 
+如需重读交接证据，只能使用 session-local review roots；所有证据路径保持相对路径。禁止访问原始外部输入或在 judge 阶段引入新的源证据。
+
 investigator `assessment=contradiction_supported`、critic `decision=confirm_contradiction`，且 session/claim/task/finding 关联、设计适用性、expected behavior、actual behavior、冲突解释、影响、反向检查和真实 tool trace 全部闭环时才能写 `confirmed`。`uncertain` 配合 `probable_contradiction|needs_more_evidence` 只能写 `probable`；`design_satisfied` 或 critic `reject_issue` 必须写 `rejected`。
 
 每个 confirmed/probable verdict 写 `dynamic_validation`，其 status 与 critic 的 `dynamic_probe_review` 一致。未运行或环境受限时写 `not_run|inconclusive` 和具体原因，不能为凑证据编造测试；引用 probe 时 probe、finding、claim、session 必须完全关联。`supports_contradiction` 只是已有设计/代码矛盾的增强证据，不能独立确认；`disconfirms_contradiction` 是必须在 critic resolution 中解决的反证，测试通过也不能自动证明所有路径一致。

@@ -11,11 +11,12 @@ description: 由 opencode 执行的通用设计文档与代码实现语义不一
 - 本工作只做设计/实现一致性检视，不做漏洞扫描、渗透测试或网安审计；结论使用功能与契约语言，不使用攻击面、CWE/CVE 等分类框架。
 - helper 只负责结构清单、session、证据真实性校验、报告和 gate，不负责判断实现是否一致。
 - 搜索和索引只用于取证。regex、关键词、文件名、项目名、分数或公开答案不得决定 verdict。
-- context 按需加载。先读设计 claim，再围绕证据问题探索最小必要代码；需要时再扩大到调用链、配置、测试和历史。
+- context 按需加载。先读设计 claim，再围绕证据问题探索最小必要代码；需要时再扩大到调用链、配置和测试。review snapshot 不携带 VCS metadata，不能从父级 submission 仓库借用 history/blame。
 - confirmed 需要 investigator 与 fresh-context critic 两个角色的交接，不允许同一段未经挑战的推理直接进入 final。
 - dynamic probe 是按需证据增强层，不是第二套检测器。测试失败、构建失败或环境失败都不能单独确认不一致；无法可靠执行时保留静态语义流程并记录 inconclusive。
 - 覆盖不是“读过文件”。一次完整审阅必须同时包含设计到代码的义务追踪、从高风险执行边界反查设计、以及设计能力与注册/构建/入口面的缺失对账。
 - 设计入口若只是 catalog，先由模型决定实际设计源，再让 `design_source_materializer.py` 做受限复制/只读下载与哈希归档；helper 不得从 catalog 语法推断需求或候选。
+- `prepare` 将原始输入物理复制到 session-local review roots。所有模型角色只在 review roots 读取、搜索和导航，并引用相对路径；helper 仍对原始输入逐行验真且 final gate 同时验证原始输入和 review 副本未变化。不得用 symlink、人工路径授权或运行时配置代替该隔离层。
 
 ## 角色产物
 
@@ -328,7 +329,7 @@ task/finding 的 `review_lenses` 必须精确，最多三个。不能把 contrac
 7. 反证与 critic 交接：确认前寻找替代实现、调用者、配置开关、测试和版本差异，并独立复核 probe oracle、环境和解释。
 8. coverage 反馈：从未覆盖 lens、未触达高风险边界/平行 plane、catalog capability 和缺失探索模式生成结构化下一轮任务。
 
-每类 handoff 合并时必须使用 `handoff_merge.py --artifact-type task|finding|probe|critic --session-id <当前 session>`；finding 另传 `--code-root` 与 `--design-root`，在进入共享 ledger 前逐行核验 quote/snippet。所有 subagent 调用使用最多 2 个并发的有界批次，批次完成或按恢复规则处理缺失 handoff 后才继续；不得把整个 portfolio 一次性并发提交。结构或引用校验失败的对象不能进入共享 ledger；只修复报错对象，不重跑已经有效的 handoff。
+每类 handoff 合并时必须使用 `handoff_merge.py --artifact-type task|finding|probe|critic --session-id <当前 session>`；finding 另传原始 `--code-root` 与 `--design-root`，在进入共享 ledger 前按 review root 中使用的相同相对路径逐行核验 quote/snippet。所有 subagent 调用使用最多 2 个并发的有界批次，批次完成或按恢复规则处理缺失 handoff 后才继续；不得把整个 portfolio 一次性并发提交。结构或引用校验失败的对象不能进入共享 ledger；只修复报错对象，不重跑已经有效的 handoff。
 
 首轮 0 confirmed、所有 finding 被 reject、或 gate 失败时，必须触发 coverage-critic：检查是否只读了少数设计文档、是否把一条合规样本外推成整类合规、是否过度集中在核心目录、是否忽略导入/适配执行 plane、能力缺失和跨边界行为。只要仍在时间预算内，切换 exploration mode，并更换设计文档组、架构边界或审阅 lens 继续下一轮，不能把项目成熟度当作停止依据。
 

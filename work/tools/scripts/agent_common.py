@@ -15,12 +15,13 @@ from typing import Any, Iterable
 DEFAULT_ASSET_ROOT = "/app/code/judge-assets/01_03_ai_implementation_design_difference_detection"
 DEFAULT_IGNORED_DIRS = {
     ".git", ".hg", ".svn", ".idea", ".vscode", ".tox", ".venv", "venv",
-    "__pycache__", "node_modules", "vendor", "dist", "build", "target", "coverage",
+    "__pycache__",
 }
 DESIGN_SUFFIXES = {
     ".md", ".markdown", ".txt", ".rst", ".adoc", ".asc", ".pdf", ".docx",
     ".yaml", ".yml", ".json", ".toml",
 }
+REVIEW_GIT_BARRIER_CONTENT = "gitdir: .goal-agent-no-vcs\n"
 
 
 def now_iso() -> str:
@@ -114,6 +115,31 @@ def contained_path(root: Path, value: str) -> Path | None:
     return resolved
 
 
+def lexical_path_errors(root: Path, candidate: Path, label: str) -> list[str]:
+    """Require lexical containment and reject every symlink in the relative path."""
+    root = root.resolve()
+    candidate = Path(os.path.abspath(str(candidate)))
+    try:
+        relative = candidate.relative_to(root)
+    except ValueError:
+        return [f"{label} is outside session state: {candidate}"]
+    cursor = root
+    for part in relative.parts:
+        cursor = cursor / part
+        if cursor.is_symlink():
+            return [f"{label} path contains a symlink: {cursor}"]
+    return []
+
+
+def review_git_barrier_errors(review_code_root: Path) -> list[str]:
+    barrier = review_code_root / ".git"
+    if barrier.is_symlink() or not barrier.is_file():
+        return ["review code Git isolation barrier is missing or not a regular file"]
+    if read_text(barrier) != REVIEW_GIT_BARRIER_CONTENT:
+        return ["review code Git isolation barrier content changed"]
+    return []
+
+
 def validate_source_evidence(item: Any, root: Path, label: str, text_field: str) -> list[str]:
     """Verify that a cited excerpt exists in the declared source line range."""
     if not isinstance(item, dict):
@@ -154,9 +180,15 @@ def iter_files(root: Path, ignored_dirs: Iterable[str] = DEFAULT_IGNORED_DIRS) -
     if not root.exists():
         return
     for current, dirs, files in os.walk(root):
-        dirs[:] = sorted(d for d in dirs if d not in ignored and not d.startswith(".cache"))
         base = Path(current)
+        visible_dirs = sorted(d for d in dirs if d not in ignored and not d.startswith(".cache"))
+        directory_links = [base / name for name in visible_dirs if (base / name).is_symlink()]
+        dirs[:] = visible_dirs
+        for path in directory_links:
+            yield path
         for name in sorted(files):
+            if name in {".git", ".hg", ".svn"}:
+                continue
             yield base / name
 
 
