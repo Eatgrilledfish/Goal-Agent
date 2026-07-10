@@ -16,10 +16,24 @@ import agent_common as ac
 
 
 ARTIFACT_TYPES = {"generic", "task", "finding", "critic", "probe"}
+ARTIFACT_KEYS = {
+    "task": "task_id",
+    "finding": "finding_id",
+    "critic": "finding_id",
+    "probe": "probe_id",
+}
 TRACE_KINDS = {
     "design_read", "code_search", "code_navigation", "code_read", "reverse_check",
     "test", "config_read", "history_read", "build_read", "analysis",
 }
+
+
+class HandoffValidationError(ValueError):
+    def __init__(self, errors_by_id: dict[str, list[str]]):
+        self.errors_by_id = errors_by_id
+        self.invalid_ids = sorted(errors_by_id)
+        self.errors = [error for identifier in self.invalid_ids for error in errors_by_id[identifier]]
+        super().__init__("; ".join(self.errors))
 
 
 def _present(value: Any) -> bool:
@@ -166,6 +180,31 @@ def _read_values(path: Path) -> list[dict[str, Any]]:
     raise ValueError("handoff must be one JSON object, an object array, or JSONL objects")
 
 
+def validate_item(
+    item: dict[str, Any],
+    *,
+    artifact_type: str,
+    identifier: str,
+    session_id: str | None = None,
+    code_root: Path | None = None,
+    design_root: Path | None = None,
+) -> list[str]:
+    label = f"{artifact_type} ({identifier})"
+    errors = validate_artifact(item, artifact_type, label)
+    if session_id and item.get("session_id") != session_id:
+        errors.append(f"{label}: session_id does not match current session")
+    if artifact_type == "finding" and code_root and design_root:
+        for index, evidence in enumerate(item.get("design_evidence", []), start=1):
+            errors.extend(ac.validate_source_evidence(
+                evidence, design_root, f"{label}: design_evidence[{index}]", "quote"
+            ))
+        for index, evidence in enumerate(item.get("code_evidence", []), start=1):
+            errors.extend(ac.validate_source_evidence(
+                evidence, code_root, f"{label}: code_evidence[{index}]", "snippet"
+            ))
+    return errors
+
+
 def merge(
     input_dir: Path,
     output: Path,
@@ -174,7 +213,7 @@ def merge(
     session_id: str | None = None,
     code_root: Path | None = None,
     design_root: Path | None = None,
-) -> dict[str, int]:
+) -> dict[str, Any]:
     if not input_dir.is_dir():
         raise ValueError(f"handoff directory is missing: {input_dir}")
     existing: list[dict[str, Any]] = []
@@ -212,24 +251,17 @@ def merge(
         values[identifier] = item
         imported += 1
 
-    validation_errors: list[str] = []
+    validation_errors: dict[str, list[str]] = {}
     for identifier in ordered:
         item = values[identifier]
-        label = f"merged {artifact_type} ({identifier})"
-        validation_errors.extend(validate_artifact(item, artifact_type, label))
-        if session_id and item.get("session_id") != session_id:
-            validation_errors.append(f"{label}: session_id does not match current session")
-        if artifact_type == "finding" and code_root and design_root:
-            for index, evidence in enumerate(item.get("design_evidence", []), start=1):
-                validation_errors.extend(ac.validate_source_evidence(
-                    evidence, design_root, f"{label}: design_evidence[{index}]", "quote"
-                ))
-            for index, evidence in enumerate(item.get("code_evidence", []), start=1):
-                validation_errors.extend(ac.validate_source_evidence(
-                    evidence, code_root, f"{label}: code_evidence[{index}]", "snippet"
-                ))
+        item_errors = validate_item(
+            item, artifact_type=artifact_type, identifier=identifier,
+            session_id=session_id, code_root=code_root, design_root=design_root,
+        )
+        if item_errors:
+            validation_errors[identifier] = item_errors
     if validation_errors:
-        raise ValueError("; ".join(validation_errors))
+        raise HandoffValidationError(validation_errors)
 
     ac.ensure_dir(output.parent)
     temporary = output.with_suffix(output.suffix + ".tmp")
@@ -238,30 +270,82 @@ def merge(
         encoding="utf-8",
     )
     temporary.replace(output)
-    return {"files": len(files), "imported": imported, "ledger_entries": len(ordered)}
+    return {
+        "files": len(files), "imported": imported, "ledger_entries": len(ordered),
+        "validated_ids": ordered,
+    }
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Merge isolated subagent JSON handoffs into JSONL.")
-    parser.add_argument("--input-dir", required=True)
-    parser.add_argument("--output", required=True)
-    parser.add_argument("--key", required=True)
+    inputs = parser.add_mutually_exclusive_group(required=True)
+    inputs.add_argument("--input-dir")
+    inputs.add_argument("--check-file")
+    parser.add_argument("--output")
+    parser.add_argument("--key")
     parser.add_argument("--artifact-type", choices=sorted(ARTIFACT_TYPES), default="generic")
     parser.add_argument("--session-id", default=None)
     parser.add_argument("--code-root", default=None)
     parser.add_argument("--design-root", default=None)
+    parser.add_argument("--report", default=None)
     args = parser.parse_args(argv)
+    key = args.key or ARTIFACT_KEYS.get(args.artifact_type)
+    report_path = Path(args.report).resolve() if args.report else None
+    batch_gate_path = (
+        Path(args.output).resolve().parent / "investigator_batch_gate.json"
+        if args.input_dir and args.output and args.artifact_type == "finding"
+        else None
+    )
     try:
-        result = merge(
-            Path(args.input_dir).resolve(), Path(args.output).resolve(), args.key,
-            artifact_type=args.artifact_type, session_id=args.session_id,
-            code_root=Path(args.code_root).resolve() if args.code_root else None,
-            design_root=Path(args.design_root).resolve() if args.design_root else None,
-        )
+        if not key:
+            raise ValueError("--key is required for generic artifacts")
+        code_root = Path(args.code_root).resolve() if args.code_root else None
+        design_root = Path(args.design_root).resolve() if args.design_root else None
+        if args.check_file:
+            values = _read_values(Path(args.check_file).resolve())
+            if len(values) != 1:
+                raise ValueError("--check-file must contain exactly one object")
+            item = values[0]
+            identifier = str(item.get(key) or "")
+            if not identifier:
+                raise ValueError(f"checked handoff lacks {key}")
+            errors = validate_item(
+                item, artifact_type=args.artifact_type, identifier=identifier,
+                session_id=args.session_id, code_root=code_root, design_root=design_root,
+            )
+            if errors:
+                raise HandoffValidationError({identifier: errors})
+            result = {"files": 1, "validated_ids": [identifier]}
+        else:
+            if not args.output:
+                raise ValueError("--output is required with --input-dir")
+            result = merge(
+                Path(args.input_dir).resolve(), Path(args.output).resolve(), key,
+                artifact_type=args.artifact_type, session_id=args.session_id,
+                code_root=code_root, design_root=design_root,
+            )
     except (OSError, ValueError) as exc:
-        print(json.dumps({"passed": False, "error": str(exc)}))
+        errors = exc.errors if isinstance(exc, HandoffValidationError) else [str(exc)]
+        invalid_ids = exc.invalid_ids if isinstance(exc, HandoffValidationError) else []
+        report = {
+            "passed": False, "artifact_type": args.artifact_type,
+            "invalid_ids": invalid_ids, "errors": errors,
+        }
+        if report_path:
+            ac.save_json(report_path, report)
+        if batch_gate_path:
+            ac.save_json(batch_gate_path, report)
+        print(json.dumps({
+            "passed": False, "invalid_ids": invalid_ids, "error_count": len(errors),
+            "errors": errors, "report": str(report_path) if report_path else "",
+        }))
         return 1
-    print(json.dumps({"passed": True, **result}))
+    report = {"passed": True, "artifact_type": args.artifact_type, "errors": [], **result}
+    if report_path:
+        ac.save_json(report_path, report)
+    if batch_gate_path:
+        ac.save_json(batch_gate_path, report)
+    print(json.dumps(report))
     return 0
 
 

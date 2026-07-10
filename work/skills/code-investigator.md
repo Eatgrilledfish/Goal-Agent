@@ -16,4 +16,15 @@
 
 每个 task 只调查其唯一 `claim_id` 和一个可独立裁决的行为；若问题文本意外包含多个独立义务，只完成与 `claim_id` 直接对应的义务并在 handoff 说明计划错误，不能生成无 claim 关联的宽泛结论。将一个符合 SKILL schema 的 JSON 对象写入 orchestrator 为本 task 指定的独立 handoff 路径；不得直接写共享 `investigation_findings.jsonl`。`assessment` 只能是 `contradiction_supported|uncertain|design_satisfied`，`recommendation` 只能是 `critic_review|probable|reject`，不能把说明句、`probable` 或 `critic_review` 填入 assessment。tool trace 的 kind 只能使用 SKILL 列出的枚举，禁止自创同义词。你不能自行 confirmed。
 
+## Finding handoff 协议
+
+orchestrator 必须同时给你一个由 `handoff_template.py` 生成的 pristine template、最终 handoff 路径和 self-check 命令。先读取 template，再把它复制为最终 handoff；只填充空值或追加同构数组项，不得改名、换类型或用自创同义字段。template 预填的 `finding_id/session_id/task_id/claim_id/expected_behavior/design_evidence/review_lenses` 必须原样保留。
+
+- `code_evidence[]` 只能包含 `file,line_start,line_end,symbol,snippet`，行号必须为正整数，snippet 必须逐字来自这些行。
+- `false_positive_checks[]` 至少两项，每项只能用 `question,method,target,result`。
+- `dynamic_probe_selection` 只能用 `disposition,reason`；disposition 只能是 `selected|not_selected|not_suitable|environment_limited`。
+- `tool_trace[]` 每项只能用 `seq,kind,tool,target,purpose,result`；seq 从 1 连续递增，至少覆盖 `design_read`、`code_search|code_navigation`、`code_read`、`reverse_check`。工具名称写在 `tool`，不能把 `read/grep/file_read` 当作 kind。
+
+写完后必须执行 orchestrator 提供的 `handoff_merge.py --check-file ... --report ...`。只有命令返回 0 且 report 的 `passed=true` 才能在聊天中返回 handoff 路径；失败时按 report 修订同一文件并重检，禁止把未校验 JSON 交给下一角色。
+
 当 orchestrator 明确把你作为 dynamic probe Task 调用时，不再改写 finding。逐字使用 claim.probe_oracle 的 preconditions、stimulus 和 expected_observation，只把它映射到已发现的真实接口。从 `review_code_root` 复制到 `${STATE_ROOT}/probes/<probe_id>/workspace` 后才允许生成 harness、构建或运行；不得写 review snapshot 或原目标、联网安装依赖或访问可变外部系统。先运行仓库已有的最小 baseline；baseline 不通过、执行环境缺失或无法证明目标路径已触达时，interpretation 必须是 `inconclusive`。把命令、退出码、实际观察、可达性证据和限制写入 orchestrator 指定的 `${STATE_ROOT}/handoffs/probes/<finding_id>.json`，不得直接写共享 ledger。测试失败本身不能把 uncertain finding 升级为 contradiction。

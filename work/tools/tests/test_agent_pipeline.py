@@ -15,6 +15,7 @@ sys.path.insert(0, str(SCRIPTS))
 import agent_common as ac  # noqa: E402
 import design_source_materializer  # noqa: E402
 import handoff_merge  # noqa: E402
+import handoff_template  # noqa: E402
 import verdict_validator  # noqa: E402
 
 
@@ -721,7 +722,10 @@ def test_handoff_merge_atomically_combines_isolated_subagent_outputs(tmp_path):
     metrics = handoff_merge.merge(handoffs, output, "finding_id")
     values, errors = ac.load_jsonl(output)
     assert errors == []
-    assert metrics == {"files": 2, "imported": 2, "ledger_entries": 2}
+    assert metrics == {
+        "files": 2, "imported": 2, "ledger_entries": 2,
+        "validated_ids": ["FINDING-A", "FINDING-B"],
+    }
     assert [item["finding_id"] for item in values] == ["FINDING-A", "FINDING-B"]
 
 
@@ -810,6 +814,148 @@ def test_handoff_merge_rejects_false_source_excerpt_before_shared_ledger(workspa
             session_id=str(workspace["session_id"]), code_root=workspace["code"], design_root=workspace["design"],
         )
     assert not output.exists()
+
+
+def test_finding_template_copies_only_task_and_claim_contract_fields(workspace, tmp_path):
+    populate_handoffs(workspace, count=1)
+    state = workspace["state"]
+    assert isinstance(state, Path)
+    tasks, _ = ac.load_jsonl(state / "investigation_tasks.jsonl")
+    claims, _ = ac.load_jsonl(state / "design_claims.jsonl")
+    template = handoff_template.finding_template(tasks[0], claims[0])
+    assert template["finding_id"] == "FINDING-TASK-001"
+    assert template["expected_behavior"] == claims[0]["behavior"]
+    assert template["design_evidence"] == [{
+        "document": claims[0]["document"], "path": claims[0]["path"],
+        "section": claims[0]["section"], "line_start": claims[0]["line_start"],
+        "line_end": claims[0]["line_end"], "quote": claims[0]["quote"],
+    }]
+    assert template["review_lenses"] == tasks[0]["review_lenses"]
+    assert template["false_positive_checks"] == [
+        {"question": "", "method": "", "target": "", "result": ""},
+        {"question": "", "method": "", "target": "", "result": ""},
+    ]
+    assert [step["kind"] for step in template["tool_trace"]] == [
+        "design_read", "code_search", "code_read", "reverse_check",
+    ]
+    assert template["assessment"] == ""
+
+
+def test_handoff_check_file_writes_machine_readable_failure_report(workspace, tmp_path):
+    bad = tmp_path / "bad-finding.json"
+    report = tmp_path / "finding-check.json"
+    ac.save_json(bad, {
+        "finding_id": "FINDING-BAD", "session_id": workspace["session_id"],
+        "task_id": "TASK-BAD", "claim_id": "CLAIM-BAD",
+    })
+    proc = subprocess.run([
+        sys.executable, str(SCRIPTS / "handoff_merge.py"),
+        "--check-file", str(bad), "--artifact-type", "finding",
+        "--session-id", str(workspace["session_id"]), "--report", str(report),
+    ], text=True, capture_output=True)
+    assert proc.returncode == 1
+    result = ac.load_json(report)
+    assert result["passed"] is False
+    assert result["invalid_ids"] == ["FINDING-BAD"]
+    assert result["errors"]
+
+
+def test_handoff_check_file_accepts_valid_finding_without_writing_ledger(workspace, tmp_path):
+    populate_handoffs(workspace, count=1)
+    state = workspace["state"]
+    assert isinstance(state, Path)
+    findings, _ = ac.load_jsonl(state / "investigation_findings.jsonl")
+    handoff = tmp_path / "finding.json"
+    report = tmp_path / "finding-check.json"
+    ac.save_json(handoff, findings[0])
+    proc = subprocess.run([
+        sys.executable, str(SCRIPTS / "handoff_merge.py"),
+        "--check-file", str(handoff), "--artifact-type", "finding",
+        "--session-id", str(workspace["session_id"]),
+        "--code-root", str(workspace["code"]), "--design-root", str(workspace["design"]),
+        "--report", str(report),
+    ], text=True, capture_output=True)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    result = ac.load_json(report)
+    assert result["passed"] is True
+    assert result["validated_ids"] == [findings[0]["finding_id"]]
+    assert list(tmp_path.glob("*.jsonl")) == []
+
+
+def test_finding_template_enforces_two_unmerged_items_and_failed_batch_lock(workspace):
+    populate_handoffs(workspace, count=4)
+    state = workspace["state"]
+    assert isinstance(state, Path)
+    template_root = state / "handoff-templates" / "investigators"
+
+    def generate(task_id: str, force: bool = False):
+        command = [
+            sys.executable, str(SCRIPTS / "handoff_template.py"),
+            "--tasks", str(state / "investigation_tasks.jsonl"),
+            "--claims", str(state / "design_claims.jsonl"),
+            "--task-id", task_id,
+            "--output", str(template_root / f"{task_id}.json"),
+        ]
+        if force:
+            command.append("--force")
+        return subprocess.run(command, text=True, capture_output=True)
+
+    assert generate("TASK-001").returncode == 0
+    assert generate("TASK-001").returncode == 2
+    assert generate("TASK-001", force=True).returncode == 0
+    assert generate("TASK-002").returncode == 0
+    blocked = generate("TASK-003")
+    assert blocked.returncode == 3
+    assert "two investigator templates are already unresolved" in blocked.stdout
+
+    ac.save_json(state / "investigator_batch_gate.json", {
+        "passed": True,
+        "validated_ids": ["FINDING-TASK-001", "FINDING-TASK-002"],
+        "errors": [],
+    })
+    assert generate("TASK-003").returncode == 0
+
+    ac.save_json(state / "investigator_batch_gate.json", {
+        "passed": False,
+        "invalid_ids": ["FINDING-TASK-003"],
+        "errors": ["invalid handoff"],
+    })
+    locked = generate("TASK-004")
+    assert locked.returncode == 3
+    assert "previous investigator batch has not passed merge" in locked.stdout
+
+
+def test_failed_finding_merge_writes_batch_gate_and_detailed_stdout(workspace, tmp_path):
+    handoffs = tmp_path / "handoffs"
+    state = tmp_path / "state"
+    handoffs.mkdir()
+    ac.save_json(handoffs / "bad.json", {
+        "finding_id": "FINDING-BAD", "session_id": workspace["session_id"],
+        "task_id": "TASK-BAD", "claim_id": "CLAIM-BAD",
+    })
+    proc = subprocess.run([
+        sys.executable, str(SCRIPTS / "handoff_merge.py"),
+        "--input-dir", str(handoffs),
+        "--output", str(state / "investigation_findings.jsonl"),
+        "--artifact-type", "finding", "--session-id", str(workspace["session_id"]),
+    ], text=True, capture_output=True)
+    assert proc.returncode == 1
+    stdout = json.loads(proc.stdout)
+    assert stdout["invalid_ids"] == ["FINDING-BAD"]
+    assert stdout["errors"]
+    gate = ac.load_json(state / "investigator_batch_gate.json")
+    assert gate["passed"] is False
+    assert gate["invalid_ids"] == ["FINDING-BAD"]
+
+
+def test_instruction_makes_successful_batch_report_a_hard_progression_gate():
+    instruction = (ROOT / "INSTRUCTION.md").read_text(encoding="utf-8")
+    assert "--check-file" in instruction
+    assert "--report" in instruction
+    assert "merge 返回非 0 时，**禁止启动下一批**" in instruction
+    assert "validated_ids" in instruction
+    assert "${REVIEW_CODE_ROOT}" in instruction
+    assert "investigator_batch_gate.json" in instruction
 
 
 def test_prepare_resumes_same_session_without_erasing_handoffs(workspace):

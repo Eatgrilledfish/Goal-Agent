@@ -32,7 +32,7 @@ critic → final judge 交接，再运行 `review`、`report` 和 `gate`。dynam
 - 每个 claim 都包含只由设计形成的 probe oracle；实现只能映射接口，不能改写预期。
 - 单点 probe 是可选证据增强，不是规则 fallback；测试失败不能单独确认 issue，测试通过作为反证交给 fresh critic。
 - final gate 会检查目标树未被修改、设计行为覆盖、独立 critic、输出完整性和 6 小时时限。
-- 自动测试共 44 项，覆盖 session-local 输入物化、resume 基线不可重置、目录 symlink/固定路径/Git 隔离标记完整性、设计产物前置 gate、handoff 类型污染拒绝、虚假引用前置拒绝、judge 证据改写拒绝、合法 probe 闭环、oracle 污染拒绝、环境失败强制 inconclusive、只读目标和通用性守卫。
+- 自动测试共 50 项，覆盖 session-local 输入物化、resume 基线不可重置、目录 symlink/固定路径/Git 隔离标记完整性、finding pristine template、单文件 self-check、批次 merge lock、结构化 repair report、设计产物前置 gate、handoff 类型污染拒绝、虚假引用前置拒绝、judge 证据改写拒绝、合法 probe 闭环、oracle 污染拒绝、环境失败强制 inconclusive、只读目标和通用性守卫。
 - `skill-creator` quick validation 已通过；核心路径项目特定词扫描和 `git diff --check` 已通过。
 - F-Stack 真实输入物化烟测纳入 27,033 个文件，原始与 review manifest 完全一致，耗时约 10 秒；final gate 的原目标与 review snapshot 完整性检查均通过。
 - 未设置 `OPENCODE_CONFIG_CONTENT` 或其他路径授权时，fresh OpenCode Task 已能读取 session-local snapshot 并正常返回，未再悬挂于外部目录审批。

@@ -88,24 +88,47 @@ python3 ${WORK_ROOT}/tools/scripts/goal_runner.py design-check \
 python3 ${WORK_ROOT}/tools/scripts/handoff_merge.py \
   --input-dir ${STATE_ROOT}/handoffs/plans \
   --output ${STATE_ROOT}/investigation_tasks.jsonl --key task_id \
-  --artifact-type task --session-id ${SESSION_ID}
+  --artifact-type task --session-id ${SESSION_ID} \
+  --report ${LOG_ROOT}/trace/task-handoff-merge.json
 ```
 
 合并失败时不得启动 investigator；只修复报错 task 的结构。
-4. 按不同 claim/边界启动 fresh investigator Task；每个 Task 先读 `work/skills/code-investigator.md`，只在 `REVIEW_CODE_ROOT`/`REVIEW_DESIGN_ROOT` 即时搜索、读调用链、配置、构建、平行实现和测试，并输出相对路径。为控制资源并让缺失 handoff 能按项恢复，**每批最多同时启动 2 个 Task**；一批取得完成事件或按恢复规则处理缺失 handoff 后，才启动下一批。每个 finding 都写 `dynamic_probe_selection`，但测试可用性不能降低静态证据要求。并行 Task 禁止写共享 JSONL：每项只写 `${STATE_ROOT}/handoffs/investigators/<task_id>.json`，聊天只返回路径。每批结束后执行下列命令；只有结构校验通过的 finding 才能进入 critic：
+4. 按不同 claim/边界启动 fresh investigator Task；每个 Task 先读 `work/skills/code-investigator.md`，只在 `REVIEW_CODE_ROOT`/`REVIEW_DESIGN_ROOT` 即时搜索、读调用链、配置、构建、平行实现和测试，并输出相对路径。为控制资源并让缺失 handoff 能按项恢复，**每批最多同时启动 2 个 Task**；一批取得完成事件或按恢复规则处理缺失 handoff 后，才启动下一批。每个 finding 都写 `dynamic_probe_selection`，但测试可用性不能降低静态证据要求。并行 Task 禁止写共享 JSONL：每项只写 `${STATE_ROOT}/handoffs/investigators/<task_id>.json`，聊天只返回路径。
+
+每个 Task 启动前先生成 pristine template（`BATCH_ID` 和 `TASK_ID` 由本轮模型计划决定，不是固定项目值）：
+
+```bash
+python3 ${WORK_ROOT}/tools/scripts/handoff_template.py \
+  --tasks ${STATE_ROOT}/investigation_tasks.jsonl \
+  --claims ${STATE_ROOT}/design_claims.jsonl --task-id ${TASK_ID} \
+  --output ${STATE_ROOT}/handoff-templates/investigators/${TASK_ID}.json --force
+```
+
+`--force` 只重建与最终 handoff 分离的 pristine template，供 provider retry 使用，不覆盖 investigator 证据。失败 merge 的 repair Task 不生成新模板，直接复用已有 pristine template。Task prompt 必须包含 template 路径、最终 handoff 路径，以及下面的 self-check 命令；Task 只有在 self-check report passed 后才能返回：
+
+```bash
+python3 ${WORK_ROOT}/tools/scripts/handoff_merge.py \
+  --check-file ${STATE_ROOT}/handoffs/investigators/${TASK_ID}.json \
+  --artifact-type finding --session-id ${SESSION_ID} \
+  --code-root ${REVIEW_CODE_ROOT} --design-root ${REVIEW_DESIGN_ROOT} \
+  --report ${LOG_ROOT}/trace/finding-check-${TASK_ID}.json
+```
+
+每批结束后执行原子 merge；只有 report 的 `passed=true` 且本批 finding ID 全部包含在 `validated_ids` 中，才能进入下一批：
 
 ```bash
 python3 ${WORK_ROOT}/tools/scripts/handoff_merge.py \
   --input-dir ${STATE_ROOT}/handoffs/investigators \
   --output ${STATE_ROOT}/investigation_findings.jsonl --key finding_id \
   --artifact-type finding --session-id ${SESSION_ID} \
-  --code-root ${CODE_ROOT} --design-root ${DESIGN_ROOT}
+  --code-root ${CODE_ROOT} --design-root ${DESIGN_ROOT} \
+  --report ${LOG_ROOT}/trace/finding-merge-${BATCH_ID}.json
 ```
 
-搜索命中或无命中本身不是结论。
+merge 返回非 0 时，**禁止启动下一批**；`investigator_batch_gate.json` 会同时锁住新的 template 创建。只为 report 的 `invalid_ids` 启动 fresh repair Task，给它原 handoff、pristine template、错误列表和相同 self-check；修复并重新 merge 到 passed 前不得推进。模板 helper 同时限制最多两个尚未通过 merge 的 finding。搜索命中或无命中本身不是结论。
    Task 因 provider timeout、stream timeout 或工具错误返回且没有 handoff 时，只为缺失项启动一次 fresh 重试；不得重跑已有有效 handoff，也不得让整批永久等待。第二次仍失败则在 task 写 `deferred` 和具体运行证据限制，继续其他任务，并由 coverage audit 保留缺口；这只是 session 恢复，不得改用规则/regex 或手工 verdict 兜底。
-5. 对 `contradiction_supported|uncertain` findings 做模型驱动的 dynamic probe triage。只选择高价值、可观察、低成本且当前环境已有依赖的少量候选；不是数量门槛，也不是 regex/rule fallback。对选中项启动 fresh Task，复用 `work/skills/code-investigator.md` 的 dynamic probe 流程：逐字继承 claim.probe_oracle，从 `REVIEW_CODE_ROOT` 复制到 `${STATE_ROOT}/probes/<probe_id>/workspace` 后复用已有 build/test/runtime 入口，禁止写 review snapshot 或原目标、联网安装依赖或调用可变外部系统。先跑最小 baseline；baseline/环境失败、未完成执行或无法证明目标路径已触达时一律 `inconclusive`。每项只写 `${STATE_ROOT}/handoffs/probes/<finding_id>.json`，批次结束后用 `handoff_merge.py` 合并到 `dynamic_probes.jsonl`，参数必须包含 `--artifact-type probe --session-id ${SESSION_ID}`。测试失败不能单独确认 issue；测试通过是反证但不自动证明全面一致。
-6. 对每个 `contradiction_supported` finding 启动新的 fresh critic Task。critic 先读 `work/skills/evidence-critic.md`，只接收 claim、finding、关联 probe（如有）和 review roots，不接收 investigator 的聊天推理；只在 review roots 独立重读设计/代码并至少做两项反证检查，同时写 `dynamic_probe_review`。每项只写 `${STATE_ROOT}/handoffs/critics/<finding_id>.json`，批次结束后用 `handoff_merge.py` 合并到 `critic_reviews.jsonl`，参数必须包含 `--artifact-type critic --session-id ${SESSION_ID}`。合并失败时只重做坏 handoff。每个 finding 只允许一个有效 critic；不得因为数量不足而对相同证据重复找 critic。只有 investigator 补充了新的可核验证据后，才可创建新的 critic revision。
+5. 对 `contradiction_supported|uncertain` findings 做模型驱动的 dynamic probe triage。只选择高价值、可观察、低成本且当前环境已有依赖的少量候选；不是数量门槛，也不是 regex/rule fallback。对选中项启动 fresh Task，复用 `work/skills/code-investigator.md` 的 dynamic probe 流程：逐字继承 claim.probe_oracle，从 `REVIEW_CODE_ROOT` 复制到 `${STATE_ROOT}/probes/<probe_id>/workspace` 后复用已有 build/test/runtime 入口，禁止写 review snapshot 或原目标、联网安装依赖或调用可变外部系统。先跑最小 baseline；baseline/环境失败、未完成执行或无法证明目标路径已触达时一律 `inconclusive`。每项只写 `${STATE_ROOT}/handoffs/probes/<finding_id>.json`，批次结束后用 `handoff_merge.py` 合并到 `dynamic_probes.jsonl`，参数必须包含 `--artifact-type probe --session-id ${SESSION_ID} --report ${LOG_ROOT}/trace/probe-handoff-merge.json`。测试失败不能单独确认 issue；测试通过是反证但不自动证明全面一致。
+6. 对每个 `contradiction_supported` finding 启动新的 fresh critic Task。critic 先读 `work/skills/evidence-critic.md`，只接收 claim、finding、关联 probe（如有）和 review roots，不接收 investigator 的聊天推理；只在 review roots 独立重读设计/代码并至少做两项反证检查，同时写 `dynamic_probe_review`。每项只写 `${STATE_ROOT}/handoffs/critics/<finding_id>.json`，批次结束后用 `handoff_merge.py` 合并到 `critic_reviews.jsonl`，参数必须包含 `--artifact-type critic --session-id ${SESSION_ID} --report ${LOG_ROOT}/trace/critic-handoff-merge.json`。合并失败时只重做 report 的 `invalid_ids`。每个 finding 只允许一个有效 critic；不得因为数量不足而对相同证据重复找 critic。只有 investigator 补充了新的可核验证据后，才可创建新的 critic revision。
 7. 启动 fresh final-judge Task，先完整读取 `work/skills/final-judge.md`。它只从通过结构校验的 claim、finding、critic 和 probe 生成 verdict。`design_evidence`、`code_evidence`、`expected_behavior`、`actual_behavior`、`false_positive_checks`、`tool_trace` 与 `critic_review` 必须逐值复制对应 handoff，禁止在 judge 阶段改写、补造或换行号。只有 investigator=`contradiction_supported` 且 critic=`confirm_contradiction` 才能 confirmed；实现满足设计必须 rejected。
 8. 启动 fresh coverage Task，先读 `work/skills/coverage-critic.md`，审计文档组、behavior families、execution planes、边界和三种 exploration mode，同时写 `semantic_coverage.json` 与 `coverage_audit.json`。audit 必须给出结构化 `next_round_tasks`（claim、lens、mode、boundary、plane、证据问题）；有高价值缺口时主 agent 必须执行这些任务或记录具体证据限制，不能只把 audit 改写成停止说明。明显可低成本动态复核却全部无理由跳过时属于证据缺口；不可构建、硬件依赖或不适合运行验证不属于失败。
 

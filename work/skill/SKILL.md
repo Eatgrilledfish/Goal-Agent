@@ -329,7 +329,7 @@ task/finding 的 `review_lenses` 必须精确，最多三个。不能把 contrac
 7. 反证与 critic 交接：确认前寻找替代实现、调用者、配置开关、测试和版本差异，并独立复核 probe oracle、环境和解释。
 8. coverage 反馈：从未覆盖 lens、未触达高风险边界/平行 plane、catalog capability 和缺失探索模式生成结构化下一轮任务。
 
-每类 handoff 合并时必须使用 `handoff_merge.py --artifact-type task|finding|probe|critic --session-id <当前 session>`；finding 另传原始 `--code-root` 与 `--design-root`，在进入共享 ledger 前按 review root 中使用的相同相对路径逐行核验 quote/snippet。所有 subagent 调用使用最多 2 个并发的有界批次，批次完成或按恢复规则处理缺失 handoff 后才继续；不得把整个 portfolio 一次性并发提交。结构或引用校验失败的对象不能进入共享 ledger；只修复报错对象，不重跑已经有效的 handoff。
+每类 handoff 合并时必须使用 `handoff_merge.py --artifact-type task|finding|probe|critic --session-id <当前 session> --report <trace-path>`；finding 的 Task self-check 只传 review roots，orchestrator 原子 merge 再传原始 `--code-root` 与 `--design-root`，按相同相对路径二次逐行验真。investigator 在写 finding 前使用 `handoff_template.py` 取得只复制 task/claim 元数据的语义中立模板，返回前用 `handoff_merge.py --check-file` 自检。所有 subagent 调用使用最多 2 个并发的有界批次；批次 merge report 未通过或本批 ID 未全部进入 `validated_ids` 时，`investigator_batch_gate.json` 锁住新的模板，只修复 report 的 `invalid_ids`。不得把整个 portfolio 一次性并发提交；结构或引用校验失败的对象不能进入共享 ledger，不重跑已经有效的 handoff。
 
 首轮 0 confirmed、所有 finding 被 reject、或 gate 失败时，必须触发 coverage-critic：检查是否只读了少数设计文档、是否把一条合规样本外推成整类合规、是否过度集中在核心目录、是否忽略导入/适配执行 plane、能力缺失和跨边界行为。只要仍在时间预算内，切换 exploration mode，并更换设计文档组、架构边界或审阅 lens 继续下一轮，不能把项目成熟度当作停止依据。
 

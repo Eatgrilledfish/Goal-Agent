@@ -35,6 +35,7 @@ ARTIFACT_NAMES = {
     "ledger": "agent_run_ledger.jsonl",
     "state": "agent_loop_state.json",
     "approval_events": "approval_events.jsonl",
+    "investigator_batch_gate": "investigator_batch_gate.json",
 }
 
 PORTFOLIO_LENSES = [
