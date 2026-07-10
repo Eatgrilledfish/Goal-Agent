@@ -1,14 +1,14 @@
 {
-  "_comment": "JSON Schema for /result/issues.json, conforming to section 7.4 of FIX-rfc-migration.md. final_detection_gate.py validates output against this.",
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "title": "RfcImplementationDiffResult",
+  "title": "GoalAgentDesignCodeDifferenceResult",
   "type": "object",
-  "required": ["generated_at", "tool", "code_root", "benchmark", "summary", "issues"],
+  "required": ["generated_at", "tool", "session_id", "code_root", "design_root", "summary", "issues"],
   "properties": {
     "generated_at": {"type": "string"},
-    "tool": {"type": "string", "const": "goal-agent-rfc-diff"},
-    "code_root": {"type": "string"},
-    "benchmark": {"type": "string"},
+    "tool": {"const": "goal-agent-design-code-diff"},
+    "session_id": {"type": "string", "minLength": 1},
+    "code_root": {"type": "string", "minLength": 1},
+    "design_root": {"type": "string", "minLength": 1},
     "summary": {
       "type": "object",
       "required": ["total", "confirmed", "probable", "high_confidence"],
@@ -21,72 +21,99 @@
     },
     "issues": {
       "type": "array",
-      "items": {"$ref": "#/definitions/Issue"}
+      "items": {"$ref": "#/definitions/issue"}
     }
   },
   "definitions": {
-    "Issue": {
+    "designEvidence": {
+      "type": "object",
+      "required": ["document", "path", "section", "line_start", "line_end", "quote"],
+      "properties": {
+        "document": {"type": "string", "minLength": 1},
+        "path": {"type": "string", "minLength": 1},
+        "section": {"type": "string"},
+        "line_start": {"type": "integer", "minimum": 1},
+        "line_end": {"type": "integer", "minimum": 1},
+        "quote": {"type": "string", "minLength": 1}
+      }
+    },
+    "codeEvidence": {
+      "type": "object",
+      "required": ["file", "line_start", "line_end", "symbol", "snippet"],
+      "properties": {
+        "file": {"type": "string", "minLength": 1},
+        "line_start": {"type": "integer", "minimum": 1},
+        "line_end": {"type": "integer", "minimum": 1},
+        "symbol": {"type": "string"},
+        "snippet": {"type": "string", "minLength": 1}
+      }
+    },
+    "falsePositiveCheck": {
+      "type": "object",
+      "required": ["question", "method", "target", "result"],
+      "properties": {
+        "question": {"type": "string", "minLength": 1},
+        "method": {"type": "string", "minLength": 1},
+        "target": {"type": "string", "minLength": 1},
+        "result": {"type": "string", "minLength": 1}
+      }
+    },
+    "dynamicValidation": {
+      "type": "object",
+      "required": ["status", "probe_id", "reason"],
+      "properties": {
+        "status": {"enum": ["not_run", "supports_contradiction", "disconfirms_contradiction", "inconclusive"]},
+        "probe_id": {"type": "string"},
+        "reason": {"type": "string", "minLength": 1}
+      }
+    },
+    "issue": {
       "type": "object",
       "required": [
-        "issue_id",
-        "title",
-        "status",
-        "confidence",
-        "normative_level",
-        "design_evidence",
-        "code_evidence",
-        "inconsistency",
-        "impact",
-        "false_positive_controls",
-        "related_files",
-        "report_path",
-        "agent_review"
+        "issue_id", "finding_id", "claim_id", "title", "status", "confidence", "severity",
+        "issue_type", "normative_strength", "design_evidence", "code_evidence", "expected_behavior", "actual_behavior", "inconsistency", "impact",
+        "scope_applicability", "false_positive_checks", "dynamic_validation", "report_path", "agent_review"
       ],
       "properties": {
-        "issue_id": {"type": "string"},
-        "title": {"type": "string"},
-        "status": {"type": "string", "enum": ["confirmed"]},
-        "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
-        "normative_level": {"type": "string"},
-        "design_evidence": {
-          "type": "object",
-          "required": ["rfc", "section", "doc_path", "quote"],
-          "properties": {
-            "rfc": {"type": "string"},
-            "section": {"type": "string"},
-            "doc_path": {"type": "string"},
-            "quote": {"type": "string"}
-          }
-        },
-        "code_evidence": {
-          "type": "array",
-          "minItems": 1,
-          "items": {
-            "type": "object",
-            "required": ["file", "line_start", "line_end", "symbol", "snippet"],
-            "properties": {
-              "file": {"type": "string"},
-              "line_start": {"type": "integer"},
-              "line_end": {"type": "integer"},
-              "symbol": {"type": "string"},
-              "snippet": {"type": "string"}
-            }
-          }
-        },
-        "inconsistency": {"type": "string"},
-        "impact": {"type": "string"},
-        "false_positive_controls": {"type": "array", "minItems": 1, "items": {"type": "string"}},
-        "related_files": {"type": "array", "items": {"type": "string"}},
-        "report_path": {"type": "string"},
+        "issue_id": {"type": "string", "minLength": 1},
+        "finding_id": {"type": "string", "minLength": 1},
+        "claim_id": {"type": "string", "minLength": 1},
+        "title": {"type": "string", "minLength": 1},
+        "status": {"const": "confirmed"},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "severity": {"enum": ["critical", "high", "medium", "low"]},
+        "issue_type": {"type": "string", "minLength": 1},
+        "normative_strength": {"enum": ["mandatory", "recommended", "optional", "declared_capability", "informational"]},
+        "design_evidence": {"type": "array", "minItems": 1, "items": {"$ref": "#/definitions/designEvidence"}},
+        "code_evidence": {"type": "array", "minItems": 1, "items": {"$ref": "#/definitions/codeEvidence"}},
+        "expected_behavior": {"type": "string", "minLength": 1},
+        "actual_behavior": {"type": "string", "minLength": 1},
+        "inconsistency": {"type": "string", "minLength": 1},
+        "impact": {"type": "string", "minLength": 1},
+        "scope_applicability": {"type": "string", "minLength": 1},
+        "false_positive_checks": {"type": "array", "minItems": 2, "items": {"$ref": "#/definitions/falsePositiveCheck"}},
+        "dynamic_validation": {"$ref": "#/definitions/dynamicValidation"},
+        "report_path": {"type": "string", "minLength": 1},
         "agent_review": {
           "type": "object",
-          "required": ["source", "agent_notes", "generalization_rationale", "tool_trace"],
+          "required": ["source", "session_id", "critic_review", "tool_trace", "generalization_rationale"],
           "properties": {
-            "source": {"type": "string", "const": "opencode"},
-            "candidate_id": {"type": "string"},
-            "agent_notes": {"type": "string"},
-            "generalization_rationale": {"type": "string"},
-            "tool_trace": {"type": "array", "minItems": 1}
+            "source": {"const": "opencode"},
+            "session_id": {"type": "string", "minLength": 1},
+            "critic_review": {
+              "type": "object",
+              "required": ["review_id", "decision", "challenges", "resolution", "review_context"],
+              "properties": {
+                "review_id": {"type": "string", "minLength": 1},
+                "decision": {"const": "confirm_contradiction"},
+                "challenges": {"type": "array", "minItems": 1},
+                "resolution": {"type": "string", "minLength": 1}
+                ,"review_context": {"const": "fresh_subagent"}
+              }
+            },
+            "tool_trace": {"type": "array", "minItems": 4},
+            "generalization_rationale": {"type": "string", "minLength": 1},
+            "agent_notes": {"type": "string"}
           }
         }
       }

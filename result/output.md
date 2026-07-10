@@ -1,111 +1,37 @@
-# 自验证输出记录
+# Goal-Agent 自验证记录
 
-## 作品形态
+## 作品入口
 
-- 入口文件：`/INSTRUCTION.md`
-- 可运行交付件目录：`/work`
-- 主 Skill：`/work/skills/goal-agent-spec-driven/SKILL.md`
-- 规格驱动 Subagents：`/work/skills/contract-builder.md`, `code-analyzer.md`, `consistency-checker.md`, `patch-generator.md`, `stability-verifier.md`
-- ShopHub Subagents：`/work/skills/shophub-*.md`
-- Helper scripts：`/work/tools/scripts/*.py`
-- Runtime config：`/work/tools/config/*.json`
-- Agent 根目录：`/work`
+评测平台加载仓库根目录的 `INSTRUCTION.md`，由运行中的 opencode 读取
+`work/skill/SKILL.md`、`work/skills/*.md` 和 `work/tools/` 后执行模型驱动的
+设计/实现一致性检视。目标代码与设计文档保持只读，正式结果写入 `/result`，
+session、handoff 和证据校验轨迹写入 `/logs`。
 
-当前交付不需要安装插件，不需要安装额外命令入口，也不需要把运行资产复制到题目仓库。平台加载 `/INSTRUCTION.md` 后，直接读取 `/work` 内资产并作用于目标题目仓库。
+## 本地验证方式
 
-## 规格驱动 Pipeline 架构
-
-```text
-Phase 0: Preflight
-Phase 1: Build Contracts (API + Business Rules)
-Phase 2: Scan Code (Controller/DTO/Service/Repository/Entity/Exception)
-Phase 3: Build Trace Matrix + Static Consistency Check
-Phase 4: Generate Spec-Driven Tests
-Phase 5: Baseline Test Run
-Phase 6: Localize & Prioritize Repair Tasks
-Phase 7: Fix Loop (patch-agent minimal fix → focused verification → review → optional sandbox)
-Phase 8: Stability Gate (3x rerun + contract re-check + forbidden-change guard)
-Phase 9: Report & Deliver
+```bash
+uv run --offline --with pytest python -m pytest -q work/tools/tests/test_agent_pipeline.py
+opencode run --auto --file INSTRUCTION.md "按照入口完整执行，持续到 final gate 通过"
 ```
 
-## 本地结构自检
+完整语义检视不是 helper-only pipeline：`prepare` 之后必须由 opencode 按
+`INSTRUCTION.md` 执行 spec analyst → investigator → 按需 dynamic probe → evidence
+critic → final judge 交接，再运行 `review`、`report` 和 `gate`。dynamic probe
+只在 session 隔离副本中运行；环境或 baseline 失败只能记录为 inconclusive。
 
-必选路径：
+## 当前自验证结论
 
-```text
-/INSTRUCTION.md
-/work
-/result
-/result/output.md
-/logs
-/logs/interaction.md
-/logs/trace
-```
+- 通用 helper 单元/集成测试已通过。
+- 正式链路不包含 regex 结论器、协议 domain map、项目名分支或公开答案调用。
+- task/finding/probe/critic 在进入共享 ledger 前经过类型与 session 校验；finding 同时提前回读真实设计/代码行。
+- spec analyst 产物在 investigation 前经过 `design-check`，逐项校验 coverage、claim schema、probe oracle 和真实设计行。
+- validator 要求 judge 逐值复制 investigator/critic 证据，并核对 claim → task → finding → critic → verdict。
+- subagent 采用最多 2 个并发的有界批次，避免突发长上下文 stream 阻塞整批 handoff。
+- 每个 claim 都包含只由设计形成的 probe oracle；实现只能映射接口，不能改写预期。
+- 单点 probe 是可选证据增强，不是规则 fallback；测试失败不能单独确认 issue，测试通过作为反证交给 fresh critic。
+- final gate 会检查目标树未被修改、设计行为覆盖、独立 critic、输出完整性和 6 小时时限。
+- 自动测试共 32 项，覆盖设计产物前置 gate、handoff 类型污染拒绝、虚假引用前置拒绝、judge 证据改写拒绝、合法 probe 闭环、oracle 污染拒绝、环境失败强制 inconclusive、只读目标和通用性守卫。
+- `skill-creator` quick validation 已通过；核心路径项目特定词扫描和 `git diff --check` 已通过。
 
-规格驱动新增文件：
-
-```text
-/work/skills/goal-agent-spec-driven/SKILL.md ← 主 Skill
-/work/skills/contract-builder.md       ← API Contract + Business Rule 抽取
-/work/skills/code-analyzer.md           ← Spring Boot 代码扫描
-/work/skills/consistency-checker.md     ← 静态一致性检查 + Trace Matrix
-/work/skills/patch-generator.md         ← 多候选补丁生成
-/work/skills/stability-verifier.md      ← 验证 + guard + 稳定性
-
-/work/tools/scripts/api_contract_builder.py
-/work/tools/scripts/business_rule_builder.py
-/work/tools/scripts/spring_scanner.py
-/work/tools/scripts/dto_analyzer.py
-/work/tools/scripts/exception_analyzer.py
-/work/tools/scripts/contract_checker.py
-/work/tools/scripts/spec_test_generator.py
-/work/tools/scripts/forbidden_change_guard.py
-/work/tools/scripts/stability_runner.py
-/work/tools/config/audit_priorities.json
-```
-
-## 运行成功后的预期输出
-
-在目标题目仓库中按 `/INSTRUCTION.md` 执行后，应生成：
-
-```text
-.agent-work/
-├── api_contract.json              ← Phase 1: 冻结 API 契约
-├── business_rules.json            ← Phase 1: 业务规则
-├── repo_map.json                  ← Phase 2: 代码结构地图
-├── dto_validation_report.json     ← Phase 2: DTO 校验覆盖
-├── exception_coverage.json        ← Phase 2: 异常处理覆盖
-├── trace_matrix.json              ← Phase 3: 需求→代码追踪
-├── consistency_report.json        ← Phase 3: 一致性检查报告
-├── repair_tasks.json              ← Phase 6: 修复任务
-├── repair_tasks.jsonl             ← Phase 6: 修复任务队列
-├── candidate_validation.jsonl     ← Phase 7: 可选，仅高风险 issue 启用 candidate sandbox 时生成
-├── forbidden_change_report.json   ← Phase 8: 禁止修改检查
-├── stability_report.json          ← Phase 8: 稳定性报告
-├── goal_status.json               ← Phase 9: 目标状态
-└── final_goal_report.json         ← Phase 9: 机器 gate 报告
-
-.tmp/generated-tests/              ← Phase 4: 生成测试（不提交）
-修复报告.md                         ← Phase 9: 最终修复报告
-```
-
-最终输出应报告 `DONE`、`BLOCKED` 或 `STOPPED_BY_SAFETY`，并列出：
-- Issue 发现/修复/剩余数量
-- API 契约状态
-- Forbidden-change guard 状态
-- Stability rerun 状态
-- 验证命令及结果
-- 剩余风险
-
-## 最新自检补充
-
-- 当前提交采用 subagent-first 主链路。
-- `shophub_goal_runner.py` 保留为 helper toolkit，仅通过显式 subcommands 被 orchestrator/subagents 调用。
-- 主修复 actor 为 `shophub-patch-agent`。
-- 外部命令式补丁执行链和生成式补丁提示文件不参与主链路。
-- Preflight 按 `/INSTRUCTION.md` 要求检查 `code/pom.xml` 与 `test-cases/pom.xml`，不再只检查目录存在。
-- Final gate 会用本次 gate 结果同步 `.agent-work/state.json`，避免旧的 `done=true` 报告污染新运行。
-- Skill 中的脚本命令统一使用 `<SUBMISSION_ROOT>/work/tools/scripts/...`，避免在目标题库 cwd 下解析到不存在的相对路径。
-- 本地验证：
-  - `python3 -m pytest work/tools/tests -q`
-  - `python3 -m compileall -q work/tools/scripts work/tools/tests`
+完整 F-Stack 语义自验结果将在更新后的 opencode 单次运行完成后写入本节。运行中的评测产物
+`issues.json`、`issues.jsonl`、`00-summary.md` 和单 issue 报告由 report 阶段生成。

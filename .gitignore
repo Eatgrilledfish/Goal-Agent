@@ -1,9 +1,15 @@
 __pycache__/
 .pytest_cache/
 *.py[cod]
+/.agent-work/
+/.goal-agent/
+/local-sim/
 
-local-sim/
-prompt*.md
-opencode-prompt.md
-FIX-rfc-*.md
-*copy.md
+# Runtime output is ignored except for competition-required self-check files.
+/logs/*
+!/logs/interaction.md
+!/logs/trace/
+/logs/trace/*
+!/logs/trace/README.md
+/result/*
+!/result/output.md

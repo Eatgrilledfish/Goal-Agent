@@ -1,251 +1,143 @@
-# 设计/代码实现差异检视入口说明
+# Goal-Agent：一次运行的通用设计/实现一致性检视
 
-本文件是比赛作品入口。评分平台加载本 Markdown 后，应由运行中的 opencode CLI 作为主 agent 执行检视：读取设计文档与目标代码仓，使用 `work/` 下的 helper 脚本生成索引、候选、证据包，然后由 opencode 自己做语义调查和最终裁决。
+你是评测平台正在运行的 opencode 主 agent。只执行一次本入口，并在同一 session 内持续工作到 final gate 通过或 6 小时硬上限。不要询问用户，不要等待人工续跑，不要启动规则/regex 检测器，也不要修改目标代码或设计文档。
 
-本系统不修改目标代码，只识别设计文档与实现之间的不一致问题，输出 issues 与证据链报告。
+只允许从本次 `prepare` 创建的 `${STATE_ROOT}`、赛事输入和 `/work` 角色/工具取证。禁止读取 `.goal-agent`、旧 result/log archive、缓存/pyc、历史自验输出或其他 session artifact；它们不是设计依据，会污染独立评测。
 
-## 1. 定位目录
-
-先确定以下目录：
-
-- `SUBMISSION_ROOT`：本提交包根目录，包含 `INSTRUCTION.md` 和 `work/`。
-- `WORK_ROOT`：固定为 `${SUBMISSION_ROOT}/work`。
-
-比赛评测环境中，赛事资产根目录通常为：
+## 1. 固定路径与输入发现
 
 ```text
+SUBMISSION_ROOT=<包含本文件的目录>
+WORK_ROOT=${SUBMISSION_ROOT}/work
 ASSET_ROOT=/app/code/judge-assets/01_03_ai_implementation_design_difference_detection
+RESULT_ROOT=${SUBMISSION_ROOT}/result
+LOG_ROOT=${SUBMISSION_ROOT}/logs
+STATE_ROOT=${LOG_ROOT}/state
 ```
 
-公共样例结构为：
+从 `${ASSET_ROOT}/code` 自动选择目标代码仓：只有一个项目目录就直接使用；有多个时阅读设计入口、README 和构建清单后自主匹配。设计材料位于 `${ASSET_ROOT}` 的非 `code` 目录。不得按项目名、语言、框架或协议做选择。
 
-```text
-01_03_ai_implementation_design_difference_detection/
-├── code/
-│   └── f-stack/
-└── Difference/
-    └── benchmark.md
-```
-
-隐藏评测可能把不同内部工程放在 `code/` 下。不要写死 `f-stack`：若 `code/f-stack` 存在则使用它；否则使用 `code/` 下唯一的项目目录；若存在多个目录，由 opencode 检查设计入口并选择真正的目标代码仓。
-
-推荐派生路径：
-
-```text
-CODE_ROOT=<ASSET_ROOT>/code/<target-project>
-DESIGN_ROOT=<ASSET_ROOT>/Difference        # 若不存在，检查 design/、design-docs/、docs/
-BENCHMARK=<DESIGN_ROOT>/benchmark.md       # 若不存在，选择设计入口 markdown/txt
-RESULT_ROOT=/result
-LOG_ROOT=/logs
-```
-
-本地调试时可以显式传入：
-
-```text
---code-root <path>
---design-root <path>
---benchmark <path>
---result-root <path>
---log-root <path>
-```
-
-## 2. 必须加载的作品资产
-
-opencode 启动后必须读取：
-
-```text
-${WORK_ROOT}/skills/rfc-implementation-diff-detection/SKILL.md
-${WORK_ROOT}/agents/rfc-diff-orchestrator.md
-${WORK_ROOT}/agents/rfc-evidence-reviewer.md
-${WORK_ROOT}/agents/*.md
-${WORK_ROOT}/tools/scripts/*.py
-${WORK_ROOT}/tools/config/*.json
-```
-
-角色边界：
-
-- Python helper scripts：索引、召回、证据包生成、schema 校验、报告生成。
-- opencode agent：读取设计与代码、按需 `rg`/读文件/追调用链、判断是否真有设计实现不一致。
-- `evidence_validator.py`：只消费 opencode verdict 并校验证据形状，不用规则或权重决定 confirmed。
-
-## 3. 主执行路径
-
-不要把 `run-all` 当作最终 agent loop。正式执行时先初始化，再运行 `prepare-review`。`prepare-review` 会刷新确定性召回链路：
-
-```text
-load-docs -> scope-plan -> extract-spec -> index-code -> map -> detect -> bundle
-```
-
-之后必须暂停 helper-only pipeline，由 opencode 完成语义审阅；没有 opencode verdict 时不得进入正式结果。
-
-```bash
-python3 ${WORK_ROOT}/tools/scripts/rfc_goal_runner.py \
-  --code-root ${CODE_ROOT} \
-  --design-root ${DESIGN_ROOT} \
-  --benchmark ${BENCHMARK} \
-  --result-root ${RESULT_ROOT} \
-  --log-root ${LOG_ROOT} \
-  init
-
-python3 ${WORK_ROOT}/tools/scripts/rfc_goal_runner.py --code-root ${CODE_ROOT} --design-root ${DESIGN_ROOT} --benchmark ${BENCHMARK} --result-root ${RESULT_ROOT} --log-root ${LOG_ROOT} prepare-review
-```
-
-`prepare-review` 会生成：
-
-```text
-${AGENT_WORK}/agent_review_queue.json
-${AGENT_WORK}/agent_loop_contract.json
-${AGENT_WORK}/agent_loop_state.json
-${AGENT_WORK}/agent_run_ledger.jsonl
-${AGENT_WORK}/agent-review/*.json
-${LOG_ROOT}/trace/agent_review_queue_summary.json
-```
-
-其中 `AGENT_WORK` 由 runner 写入 queue 的 `agent_work` 字段，通常是 `CODE_ROOT` 同级目录下的 `.agent-work`。随后 opencode 必须读取 `agent_review_queue.json`、`agent_loop_state.json` 和每个 item 的 `bundle_abs_path`，执行语义调查。候选只是召回提示，不是完整搜索空间；若设计文档描述了候选未覆盖的问题，opencode 可以新增 `AGENT-DISCOVERED-*` verdict。
-
-`agent_review_queue.json` 内嵌以下 machine-readable contract：
-
-- `session`：当前 opencode review session、`verdict_output`、`agent_loop_state.json`、`agent_run_ledger.jsonl` 和恢复策略。
-- `agent_loop_contract`：模型驱动 loop 的阶段、停止条件和 review contract。
-- `handoffs`：helper recall → opencode semantic review → validator/ranker/report/gate 的交接物与验收条件。
-- `guardrails`：只读目标仓、禁止硬编码、禁止把 regex/权重当 final evidence。
-- `approval_flows`：默认自动批准只读搜索和 helper 脚本；目标代码/设计文档写入、破坏性命令和无关长任务必须跳过或需要外部批准。
-- `tracing`：每个 confirmed verdict 必须写非空 `tool_trace`，全局状态写入 loop state、ledger 和 `/logs/trace`。
-
-opencode 审阅时应把增量进展追加到 `${AGENT_WORK}/agent_run_ledger.jsonl`，至少记录本轮假设、已查设计区域/代码区域、确认/拒绝原因、失败样本、下一步待办和停止原因。长任务恢复时先读 ledger 和既有 `agent_review_verdicts.jsonl`，跳过已经 review 的 `candidate_id`。
-
-opencode 审阅完成后写入：
-
-```text
-${AGENT_WORK}/agent_review_verdicts.jsonl
-```
-
-每行一个 JSON object，字段至少包含：
+若设计目录包含完整正文，直接作为 `DESIGN_ROOT`。若只有 catalog/链接清单，先由你阅读 catalog 并写 `${STATE_ROOT}/design_source_plan.json`：
 
 ```json
 {
-  "candidate_id": "candidate id or AGENT-DISCOVERED-001",
-  "status": "confirmed",
-  "confidence": 0.9,
-  "title": "short issue title",
-  "normative_level": "MUST/SHOULD/MAY/design-requirement/unknown",
-  "design_evidence": {
-    "rfc": "RFC id or design document id",
-    "section": "section or heading",
-    "doc_path": "design document path",
-    "quote": "short design quote"
-  },
-  "code_evidence": [
-    {
-      "file": "repo-relative source file",
+  "catalog_path": "相对 --source-root 的入口文件",
+  "sources": [{
+    "source_id": "稳定ID",
+    "kind": "local|url",
+    "location": "本地相对路径或完整 https URL",
+    "output_path": "sources/稳定文件名.txt",
+    "catalog_evidence": {
+      "path": "相对 --source-root 的入口文件",
       "line_start": 1,
-      "line_end": 2,
-      "symbol": "function/class/module",
-      "snippet": "source excerpt"
+      "line_end": 1,
+      "quote": "这些行中可逐字核验的来源描述"
     }
-  ],
-  "inconsistency": "why design and implementation differ",
-  "impact": "runtime/protocol/user-visible impact",
-  "false_positive_controls": ["reverse checks performed"],
-  "related_files": ["repo-relative files"],
-  "agent_notes": "concise reasoning and tool trail",
-  "tool_trace": [
-    {
-      "tool": "rg/read_file/shell/analysis",
-      "target": "file, symbol, command, or design section inspected",
-      "purpose": "why this step was needed",
-      "result": "short observation used in the verdict"
-    }
-  ],
-  "generalization_rationale": "why this is not project-name hardcoding"
+  }]
 }
 ```
 
-只允许 `status` 为 `confirmed`、`probable`、`rejected`。正式结果只输出 `confirmed`；`probable` 进入 review queue。
-
-最后运行：
+catalog 中列为设计依据、relevant、in-scope 或 required 的条目必须全部物化；不得先看代码或项目类型后只挑“关键”来源。只有 catalog 自身明确标为非设计/排除项时才可跳过，并在 plan 记录证据。只物化 catalog 明确提供的来源：
 
 ```bash
-python3 ${WORK_ROOT}/tools/scripts/rfc_goal_runner.py --code-root ${CODE_ROOT} --design-root ${DESIGN_ROOT} --benchmark ${BENCHMARK} --result-root ${RESULT_ROOT} --log-root ${LOG_ROOT} review
-python3 ${WORK_ROOT}/tools/scripts/rfc_goal_runner.py --code-root ${CODE_ROOT} --design-root ${DESIGN_ROOT} --benchmark ${BENCHMARK} --result-root ${RESULT_ROOT} --log-root ${LOG_ROOT} report
-python3 ${WORK_ROOT}/tools/scripts/rfc_goal_runner.py --code-root ${CODE_ROOT} --design-root ${DESIGN_ROOT} --benchmark ${BENCHMARK} --result-root ${RESULT_ROOT} --log-root ${LOG_ROOT} gate
+python3 ${WORK_ROOT}/tools/scripts/design_source_materializer.py \
+  --source-root <catalog 所在目录> \
+  --plan ${STATE_ROOT}/design_source_plan.json \
+  --output-root ${STATE_ROOT}/design-sources \
+  --manifest ${LOG_ROOT}/trace/design_source_materialization.json \
+  --approval-log ${STATE_ROOT}/approval_events.jsonl \
+  --allow-network
 ```
 
-## 4. opencode 审阅准则
+helper 只做 HTTPS/大小限制、只读获取、HTML 可见文本规范化、哈希和 approval trace，不提取需求或生成 issue。成功后令 `DESIGN_ROOT=${STATE_ROOT}/design-sources`，`SOURCE_MANIFEST=${LOG_ROOT}/trace/design_source_materialization.json`。
 
-确认一个 issue 必须同时满足：
+## 2. 准备 session
 
-1. 设计文档/RFC 明确描述行为、约束、能力或禁止事项。
-2. 代码证据位于相关实现路径，包含具体文件、行号、符号和片段。
-3. 代码证据与设计要求存在真实语义矛盾、遗漏或不完整实现。
-4. 至少做一次反向误报检查，例如检查调用路径、宏使用、邻近分支、配置开关、替代实现或测试代码混淆。
-5. `tool_trace` 至少记录一次真实文件阅读、搜索、命令或分析步骤，说明该步骤如何支撑结论。
-6. 结论不能依赖项目名或已知答案；应能迁移到其他设计文档和代码仓。
-
-Feature gap 和 MAY/SHOULD 行为也可以作为 confirmed issue，但必须更严格：
-
-- Feature gap 必须给代码证据，例如相邻实现注释、入口函数缺失分支、构建配置缺失、全局搜索摘要或显式 unsupported/not implemented 证据。
-- MAY/SHOULD 必须说明遗漏为什么产生互操作、功能或设计一致性差异，并检查没有其他路径提供该行为。
-
-禁止行为：
-
-- 不得把 regex 命中、权重分数、`semantic_detection` 标记当最终结论。
-- 不得针对 F-Stack 或公开 gold issue 硬编码标题、文件或 RFC。
-- 不得伪造缺失证据；证据不足写 `probable` 或 `rejected`。
-- 不得修改 `code/**`、`Difference/**`、`benchmark.md` 或目标设计文档。
-
-## 5. 结果获取方式
-
-裁判读取：
-
-```text
-/result/issues.json
-/result/issues.jsonl
-/result/00-summary.md
-/result/*.md
-```
-
-日志与可接续状态：
-
-```text
-/logs/trace/**
-${AGENT_WORK}/pipeline_state.json
-${AGENT_WORK}/agent_review_queue.json
-${AGENT_WORK}/agent_loop_contract.json
-${AGENT_WORK}/agent_loop_state.json
-${AGENT_WORK}/agent_run_ledger.jsonl
-${AGENT_WORK}/agent_review_verdicts.jsonl
-${AGENT_WORK}/validated_issues.json
-${AGENT_WORK}/ranked_issues.json
-${AGENT_WORK}/probable_review_queue.json
-```
-
-## 6. 完成判定
-
-满足以下全部条件即视为完成：
-
-1. opencode 已写入 `${AGENT_WORK}/agent_review_verdicts.jsonl`。
-2. `review`、`report`、`gate` 阶段已执行。
-3. `/result/issues.json`、`/result/00-summary.md`、`/logs/trace/final_detection_gate.json` 已生成。
-4. `/result/issues.json` 中只包含 `confirmed` issue。
-5. 若 confirmed 少于 4 个，报告必须说明证据不足原因，不得补造。
-
-评价目标：
-
-```text
-识别 confirmed issues 数量 >= 4
-误报率 <= 50%
-总检视时长 <= 6 小时
-```
-
-## 7. 公开样例回归检查（可选）
-
-公共 F-Stack 样例可以用以下命令检查最终 confirmed 输出是否覆盖公开已知问题：
+完整读取 `work/skill/SKILL.md` 和 `work/skills/orchestrator.md`，然后运行：
 
 ```bash
-python3 ${WORK_ROOT}/tools/scripts/public_fstack_gold_evaluator.py \
-  --result ${RESULT_ROOT}/issues.json \
-  --output ${LOG_ROOT}/trace/public_fstack_gold_eval.json
+python3 ${WORK_ROOT}/tools/scripts/goal_runner.py prepare \
+  --code-root ${CODE_ROOT} --design-root ${DESIGN_ROOT} \
+  --result-root ${RESULT_ROOT} --log-root ${LOG_ROOT} --state-root ${STATE_ROOT} \
+  [--source-manifest ${SOURCE_MANIFEST}]
 ```
 
-这是本地回归 oracle，不是正式检测逻辑。它不得被 `prepare-review`、detector、validator、ranker、report 或 gate 自动调用；隐藏评测项目仍必须依赖 opencode 对设计文档和代码的通用语义审阅。
+再读 `workspace_manifest.json`、`agent_loop_contract.json`、`agent_loop_state.json` 和 ledger。`prepare` 只做清单、只读快照和 session 契约，不做语义判断。
+
+## 3. 强制模型驱动 handoff
+
+必须使用 opencode Task/子 agent。Task 缺失是平台阻塞；禁止主 agent 模拟多个角色、手工填 verdict 或用规则兜底。
+
+1. 主 agent 作为 orchestrator 阅读仓库入口、构建/注册/配置和目录边界，写 `architecture_map.json`。明确 owned、adapter、imported、generated、fast/slow execution planes，以及同一设计行为的平行实现；从真实代码语义记录值得反查设计的风险观察，例如集合容量/提前终止、链式推进、同步与延迟副作用、分类/分派/所有权变化、配置分支和平行路径差异。观察必须引用代码位置，不用 regex 命中直接下结论。同时只依据仓库和当前环境证据记录已有 build/test/runtime surface 与 dynamic probe 约束，不安装依赖。
+2. 启动 fresh Task，要求它先完整读取 `work/skills/spec-analyst.md`，只读 `DESIGN_ROOT` 与 catalog provenance，禁止读代码。为避免长 handoff 被截断，Task 直接写 `${STATE_ROOT}/design_coverage.json` 与 `${STATE_ROOT}/design_claims.jsonl`，聊天只返回计数和路径。Task 返回后立刻运行下列 gate；返回非 0 时不得创建 investigation task，必须让 fresh spec-analyst repair Task 按 `logs/trace/design_validation.json` 重写两个 artifact 并再次校验：
+
+```bash
+python3 ${WORK_ROOT}/tools/scripts/goal_runner.py design-check \
+  --code-root ${CODE_ROOT} --design-root ${DESIGN_ROOT} \
+  --result-root ${RESULT_ROOT} --log-root ${LOG_ROOT} --state-root ${STATE_ROOT}
+```
+
+通过后主 agent 再随机重读来源核验。claims 是面向差异检视的有界 portfolio，不是穷举规范的每句话；每个适用 behavior family 至少一个独立 claim。不同角色、分支、数量边界、时序阶段、主动/被动行为或首项/全部元素语义不能压成同一个 claim，也不能只抽容易验证的 MUST。每个 claim 的 `probe_oracle` 必须是 SKILL 定义的对象，且在不读代码的前提下由设计产生；不适合单点运行验证时明确标记，不得编造测试。
+3. 主 agent 把 claims、架构边界和风险观察变成 `investigation_tasks.jsonl`。**每个 task 必须只有一个 `claim_id` 和一个可独立裁决的行为问题**；同一章节里的不同分支或平行 execution plane 要拆成不同 task，禁止一题打包多个 claim 后省略 `claim_id`。首轮不是按 priority 顺序抽前若干条：必须先形成一个跨设计组、跨 execution plane 的组合，使 8 个当前适用 lens 各有独立 task，并覆盖每个 `parallel_behavior_paths`、每个 high-risk boundary，以及仓库中存在的 adapter/glue/imported/fast/slow plane。优先调查适用且外部可见的 mandatory/recommended 行为；能力缺失必须结合 catalog scope、产品角色、构建/注册/入口证据判断，不因“可选”自动确认或拒绝。将任务写入 `${STATE_ROOT}/handoffs/plans/<round_id>.json` 后先执行：
+
+```bash
+python3 ${WORK_ROOT}/tools/scripts/handoff_merge.py \
+  --input-dir ${STATE_ROOT}/handoffs/plans \
+  --output ${STATE_ROOT}/investigation_tasks.jsonl --key task_id \
+  --artifact-type task --session-id ${SESSION_ID}
+```
+
+合并失败时不得启动 investigator；只修复报错 task 的结构。
+4. 按不同 claim/边界启动 fresh investigator Task；每个 Task 先读 `work/skills/code-investigator.md`，再即时搜索、读调用链、配置、构建、平行实现和测试。为避免 provider 突发并发导致整批 stream 悬挂，**每批最多同时启动 2 个 Task**；一批取得完成事件或按恢复规则处理缺失 handoff 后，才启动下一批。每个 finding 都写 `dynamic_probe_selection`，但测试可用性不能降低静态证据要求。并行 Task 禁止写共享 JSONL：每项只写 `${STATE_ROOT}/handoffs/investigators/<task_id>.json`，聊天只返回路径。每批结束后执行下列命令；只有结构校验通过的 finding 才能进入 critic：
+
+```bash
+python3 ${WORK_ROOT}/tools/scripts/handoff_merge.py \
+  --input-dir ${STATE_ROOT}/handoffs/investigators \
+  --output ${STATE_ROOT}/investigation_findings.jsonl --key finding_id \
+  --artifact-type finding --session-id ${SESSION_ID} \
+  --code-root ${CODE_ROOT} --design-root ${DESIGN_ROOT}
+```
+
+搜索命中或无命中本身不是结论。
+   Task 因 provider timeout、stream timeout 或工具错误返回且没有 handoff 时，只为缺失项启动一次 fresh 重试；不得重跑已有有效 handoff，也不得让整批永久等待。第二次仍失败则在 task 写 `deferred` 和具体运行证据限制，继续其他任务，并由 coverage audit 保留缺口；这只是 session 恢复，不得改用规则/regex 或手工 verdict 兜底。
+5. 对 `contradiction_supported|uncertain` findings 做模型驱动的 dynamic probe triage。只选择高价值、可观察、低成本且当前环境已有依赖的少量候选；不是数量门槛，也不是 regex/rule fallback。对选中项启动 fresh Task，复用 `work/skills/code-investigator.md` 的 dynamic probe 流程：逐字继承 claim.probe_oracle，在 `${STATE_ROOT}/probes/<probe_id>/workspace` 的目标仓隔离副本中复用已有 build/test/runtime 入口，禁止写原目标、联网安装依赖或调用可变外部系统。先跑最小 baseline；baseline/环境失败、未完成执行或无法证明目标路径已触达时一律 `inconclusive`。每项只写 `${STATE_ROOT}/handoffs/probes/<finding_id>.json`，批次结束后用 `handoff_merge.py` 合并到 `dynamic_probes.jsonl`，参数必须包含 `--artifact-type probe --session-id ${SESSION_ID}`。测试失败不能单独确认 issue；测试通过是反证但不自动证明全面一致。
+6. 对每个 `contradiction_supported` finding 启动新的 fresh critic Task。critic 先读 `work/skills/evidence-critic.md`，只接收 claim、finding、关联 probe（如有）和源路径，不接收 investigator 的聊天推理；独立重读设计/代码并至少做两项反证检查，同时写 `dynamic_probe_review`。每项只写 `${STATE_ROOT}/handoffs/critics/<finding_id>.json`，批次结束后用 `handoff_merge.py` 合并到 `critic_reviews.jsonl`，参数必须包含 `--artifact-type critic --session-id ${SESSION_ID}`。合并失败时只重做坏 handoff。每个 finding 只允许一个有效 critic；不得因为数量不足而对相同证据重复找 critic。只有 investigator 补充了新的可核验证据后，才可创建新的 critic revision。
+7. 启动 fresh final-judge Task，先完整读取 `work/skills/final-judge.md`。它只从通过结构校验的 claim、finding、critic 和 probe 生成 verdict。`design_evidence`、`code_evidence`、`expected_behavior`、`actual_behavior`、`false_positive_checks`、`tool_trace` 与 `critic_review` 必须逐值复制对应 handoff，禁止在 judge 阶段改写、补造或换行号。只有 investigator=`contradiction_supported` 且 critic=`confirm_contradiction` 才能 confirmed；实现满足设计必须 rejected。
+8. 启动 fresh coverage Task，先读 `work/skills/coverage-critic.md`，审计文档组、behavior families、execution planes、边界和三种 exploration mode，同时写 `semantic_coverage.json` 与 `coverage_audit.json`。audit 必须给出结构化 `next_round_tasks`（claim、lens、mode、boundary、plane、证据问题）；有高价值缺口时主 agent 必须执行这些任务或记录具体证据限制，不能只把 audit 改写成停止说明。明显可低成本动态复核却全部无理由跳过时属于证据缺口；不可构建、硬件依赖或不适合运行验证不属于失败。
+
+每轮追加 `investigation_rounds.jsonl`，字段固定为 `round_id,session_id,strategy,exploration_modes,document_groups,architecture_boundaries,implementation_planes,lenses,claim_ids,task_ids,finding_ids,outcome,next_strategy`；每个交接用 `session_event.py` 写 checkpoint。候选和下一步必须由模型根据当前设计与代码证据选择；不得使用项目特例、固定文件/符号、关键词表、domain map、分数或公开答案。
+
+在约 40% 时间点前，让当前适用的通用 lens 都有独立调查：集合/隐藏上限、时序/延迟/主动副作用、推荐/可选行为、能力完全缺失、链/嵌套/重复元素、跨边界分派/所有权、导入与平行路径、错误/状态/配置。连续两个同类 finding 合规时切换文档组、plane 或 lens。
+
+详细 artifact schema、证据标准和时间分配只以 `work/skill/SKILL.md` 为准。
+
+## 4. 校验、输出、继续循环
+
+一轮 judge 后运行：
+
+```bash
+python3 ${WORK_ROOT}/tools/scripts/goal_runner.py review \
+  --code-root ${CODE_ROOT} --design-root ${DESIGN_ROOT} \
+  --result-root ${RESULT_ROOT} --log-root ${LOG_ROOT} --state-root ${STATE_ROOT}
+python3 ${WORK_ROOT}/tools/scripts/goal_runner.py report \
+  --code-root ${CODE_ROOT} --design-root ${DESIGN_ROOT} \
+  --result-root ${RESULT_ROOT} --log-root ${LOG_ROOT} --state-root ${STATE_ROOT}
+python3 ${WORK_ROOT}/tools/scripts/goal_runner.py gate \
+  --code-root ${CODE_ROOT} --design-root ${DESIGN_ROOT} \
+  --result-root ${RESULT_ROOT} --log-root ${LOG_ROOT} --state-root ${STATE_ROOT}
+```
+
+review 必须在 judge handoff 后立即运行，不能先做 coverage 或追求更多数量。失败时启动一次 fresh evidence-repair Task：只接收 `evidence_validation.json`、关联 claim/finding/critic/probe 和源路径；修订 verdict 必须复制已有 handoff 的精确值，若原 finding/critic 本身错误则回到对应角色修复后重新合并，禁止主 agent 手工拼装。gate 失败就按 `final_gate.json` 从最早缺口开始下一轮。最后必须运行同参数的 `goal_runner.py finalize`；只有该命令返回 0 且 `final_gate.json` 的 `passed=true` 才能向平台回答完成。只要未到 6 小时上限，就不得把 gate 失败、零 finding、候选耗尽或成熟项目当作完成。
+
+成功条件：至少 4 个真实 confirmed issue；只发布 confirmed；每个 issue 有设计原文与章节、代码文件与行号、expected/actual、差异原因、功能影响、两项误报排除、dynamic validation disposition、独立 critic、置信度和 tool trace；目标树哈希未变化；coverage 闭环；总时长不超过 6 小时。
+
+最终必须生成：
+
+```text
+result/issues.json
+result/issues.jsonl
+result/00-summary.md
+result/01-*.md
+logs/trace/evidence_validation.json
+logs/trace/final_gate.json
+```
