@@ -69,6 +69,9 @@ def review_workspace(tmp_path: Path) -> dict[str, object]:
     (design / "contract.md").write_text(
         "The component must retain each accepted item.\n", encoding="utf-8",
     )
+    (design / "status.md").write_text(
+        "The component should expose a status indication.\n", encoding="utf-8",
+    )
     session_id = "session-claim-review"
     ac.save_json(state / "agent_loop_state.json", {"session_id": session_id})
     workspace_manifest = {
@@ -83,11 +86,12 @@ def review_workspace(tmp_path: Path) -> dict[str, object]:
             "review_design_root": str(design.resolve()),
         },
         "design": {
-            "document_count": 1,
-            "document_group_count": 1,
+            "document_count": 2,
+            "document_group_count": 2,
             "documents": [],
             "document_groups": [
                 {"document_key": "contract", "members": ["contract.md"]},
+                {"document_key": "status", "members": ["status.md"]},
             ],
             "source_manifest": None,
         },
@@ -120,37 +124,63 @@ def review_workspace(tmp_path: Path) -> dict[str, object]:
     _write_jsonl(state / "design_claims.jsonl", claims)
     ac.save_json(state / "design_coverage.json", {
         "session_id": session_id,
-        "document_groups": [{
-            "document_key": "contract", "members": ["contract.md"],
-            "claim_ids": ["CLAIM-1", "CLAIM-2"],
-        }],
+        "document_groups": [
+            {
+                "document_key": "contract", "members": ["contract.md"],
+                "claim_ids": ["CLAIM-1"],
+            },
+            {
+                "document_key": "status", "members": ["status.md"],
+                "claim_ids": ["CLAIM-2"],
+            },
+        ],
     })
     values: dict[str, object] = {
         "code": code, "design": design, "result": result, "logs": logs,
         "state": state, "session_id": session_id,
     }
+    write_scope(values, ["CLAIM-1"])
     write_valid_review(values)
     return values
+
+
+def write_scope(values: dict[str, object], claim_ids: list[str]) -> None:
+    state = values["state"]
+    assert isinstance(state, Path)
+    ac.save_json(state / "claim_review_scope.json", {
+        "session_id": str(values["session_id"]),
+        "round_id": "ROUND-001",
+        "design_claims_sha256": ac.sha256_file(state / "design_claims.jsonl"),
+        "claim_ids": claim_ids,
+    })
 
 
 def write_valid_review(values: dict[str, object]) -> None:
     state = values["state"]
     assert isinstance(state, Path)
     session_id = str(values["session_id"])
+    scope = ac.load_json(state / "claim_review_scope.json")
+    strengths = {"CLAIM-1": "mandatory", "CLAIM-2": "recommended"}
+    claim_groups = {"CLAIM-1": "contract", "CLAIM-2": "status"}
+    scope_claim_ids = scope["claim_ids"]
     ac.save_json(state / "design_claim_review.json", {
         "session_id": session_id,
         "input_digests": {
             "design_claims.jsonl": ac.sha256_file(state / "design_claims.jsonl"),
             "design_coverage.json": ac.sha256_file(state / "design_coverage.json"),
             "design_agent_manifest.json": ac.sha256_file(state / "design_agent_manifest.json"),
+            "claim_review_scope.json": ac.sha256_file(state / "claim_review_scope.json"),
         },
         "claim_reviews": [
-            _accepted_claim(session_id, "CLAIM-1", "mandatory"),
-            _accepted_claim(session_id, "CLAIM-2", "recommended"),
+            _accepted_claim(session_id, claim_id, strengths[claim_id])
+            for claim_id in scope_claim_ids
         ],
-        "group_reviews": [_accepted_group(session_id, "contract")],
+        "group_reviews": [
+            _accepted_group(session_id, document_key)
+            for document_key in sorted({claim_groups[claim_id] for claim_id in scope_claim_ids})
+        ],
         "decision": "accept",
-        "summary": "Both claims and the document group passed semantic review.",
+        "summary": "The scoped claims and their document groups passed semantic review.",
     })
 
 
@@ -173,24 +203,42 @@ def test_valid_complete_review_passes_and_writes_bound_trace(review_workspace):
     assert code == 0
     assert trace["passed"] is True
     assert trace["metrics"] == {
-        "claims": 2, "claim_reviews": 2, "document_groups": 1,
+        "claims": 2, "claim_reviews": 1, "document_groups": 2,
         "group_reviews": 1, "repairs": 0,
     }
     assert trace["input_digests"] == load_review(review_workspace)["input_digests"]
+    assert trace["scope_digest"] == ac.sha256_file(
+        Path(review_workspace["state"]) / "claim_review_scope.json"
+    )
+    assert trace["accepted_claim_ids"] == ["CLAIM-1"]
 
 
 def test_review_requires_exact_claim_and_group_id_coverage(review_workspace):
     review = load_review(review_workspace)
-    review["claim_reviews"] = [review["claim_reviews"][0], copy.deepcopy(review["claim_reviews"][0])]
-    review["group_reviews"][0]["document_key"] = "unknown-group"
+    review["claim_reviews"] = [
+        _accepted_claim(str(review_workspace["session_id"]), "CLAIM-2", "recommended"),
+    ]
+    review["group_reviews"] = [
+        _accepted_group(str(review_workspace["session_id"]), "status"),
+    ]
+    ac.save_json(Path(review_workspace["state"]) / "design_claim_review.json", review)
+
+    code, trace = run_validator(review_workspace)
+    assert code == 1
+    assert any("missing claim reviews: ['CLAIM-1']" in error for error in trace["errors"])
+    assert any("out-of-scope claim reviews: ['CLAIM-2']" in error for error in trace["errors"])
+    assert any("missing group reviews: ['contract']" in error for error in trace["errors"])
+    assert any("out-of-scope group reviews: ['status']" in error for error in trace["errors"])
+
+
+def test_review_rejects_duplicate_scoped_claim_reviews(review_workspace):
+    review = load_review(review_workspace)
+    review["claim_reviews"].append(copy.deepcopy(review["claim_reviews"][0]))
     ac.save_json(Path(review_workspace["state"]) / "design_claim_review.json", review)
 
     code, trace = run_validator(review_workspace)
     assert code == 1
     assert any("duplicate claim reviews" in error for error in trace["errors"])
-    assert any("missing claim reviews: ['CLAIM-2']" in error for error in trace["errors"])
-    assert any("missing group reviews: ['contract']" in error for error in trace["errors"])
-    assert any("unknown group reviews: ['unknown-group']" in error for error in trace["errors"])
 
 
 def test_review_is_bound_to_current_session_and_all_input_digests(review_workspace):
@@ -204,6 +252,57 @@ def test_review_is_bound_to_current_session_and_all_input_digests(review_workspa
     assert code == 1
     assert any("session_id does not match current session" in error for error in trace["errors"])
     assert any("input_digests do not match current inputs" in error for error in trace["errors"])
+
+
+def test_scope_requires_current_session_round_and_claim_digest(review_workspace):
+    state = Path(review_workspace["state"])
+    scope = ac.load_json(state / "claim_review_scope.json")
+    scope["session_id"] = "old-session"
+    scope["round_id"] = ""
+    scope["design_claims_sha256"] = "0" * 64
+    ac.save_json(state / "claim_review_scope.json", scope)
+
+    code, trace = run_validator(review_workspace)
+    assert code == 1
+    assert any("scope.json session_id does not match" in error for error in trace["errors"])
+    assert any("scope.json round_id must be a non-empty string" in error for error in trace["errors"])
+    assert any("design_claims_sha256 does not match current claims" in error for error in trace["errors"])
+    assert any("input_digests do not match current inputs" in error for error in trace["errors"])
+
+
+@pytest.mark.parametrize(
+    ("claim_ids", "message"),
+    [
+        ([], "claim_ids must not be empty"),
+        (["CLAIM-1", "CLAIM-1"], "duplicate claim_ids"),
+        (["CLAIM-UNKNOWN"], "unknown claim_ids"),
+        ([""], "claim_ids entries must be non-empty strings"),
+    ],
+)
+def test_scope_claim_ids_must_be_nonempty_unique_and_known(
+    review_workspace, claim_ids, message,
+):
+    write_scope(review_workspace, claim_ids)
+
+    code, trace = run_validator(review_workspace)
+    assert code == 1
+    assert any(message in error for error in trace["errors"])
+
+
+def test_scoped_claims_must_belong_to_a_design_coverage_group(review_workspace):
+    state = Path(review_workspace["state"])
+    coverage = ac.load_json(state / "design_coverage.json")
+    coverage["document_groups"][0]["claim_ids"] = []
+    ac.save_json(state / "design_coverage.json", coverage)
+    review = load_review(review_workspace)
+    review["input_digests"]["design_coverage.json"] = ac.sha256_file(
+        state / "design_coverage.json"
+    )
+    ac.save_json(state / "design_claim_review.json", review)
+
+    code, trace = run_validator(review_workspace)
+    assert code == 1
+    assert any("not assigned to a design_coverage document group" in error for error in trace["errors"])
 
 
 def test_design_agent_manifest_must_match_design_only_workspace_projection(review_workspace):

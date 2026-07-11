@@ -307,6 +307,189 @@ def _validate_tasks_typed(
         ))
 
 
+def _validated_claim_review_scope(
+    root: Path,
+    session_id: str,
+    claims: dict[str, dict[str, Any]],
+    tasks: dict[str, dict[str, Any]],
+    errors: list[str],
+) -> set[str]:
+    """Bind the task frontier to the currently accepted design-only claim review."""
+    scope_object = _load_object(
+        root / "claim_review_scope.json", "claim_review_scope.json", errors,
+    )
+    _validate_session_owner(scope_object, session_id, "claim_review_scope.json", errors)
+    claims_path = root / "design_claims.jsonl"
+    claims_digest = ac.sha256_file(claims_path) if claims_path.is_file() else ""
+    if scope_object.get("design_claims_sha256") != claims_digest:
+        errors.append("claim_review_scope.json: design_claims_sha256 does not match current claims")
+    raw_scope = scope_object.get("claim_ids")
+    if not isinstance(raw_scope, list) or not raw_scope:
+        errors.append("claim_review_scope.json: claim_ids must be a non-empty array")
+        raw_scope = []
+    scope_ids = [value for value in raw_scope if isinstance(value, str) and value.strip()]
+    if len(scope_ids) != len(raw_scope):
+        errors.append("claim_review_scope.json: claim_ids entries must be non-empty strings")
+    if len(set(scope_ids)) != len(scope_ids):
+        errors.append("claim_review_scope.json: claim_ids must not contain duplicates")
+    scope = set(scope_ids)
+    unknown_scope = scope - set(claims)
+    if unknown_scope:
+        errors.append(f"claim_review_scope.json: unknown claim_ids {sorted(unknown_scope)}")
+
+    review = _load_object(
+        root / "design_claim_review.json", "design_claim_review.json", errors,
+    )
+    _validate_session_owner(review, session_id, "design_claim_review.json", errors)
+    expected_digests = {
+        name: ac.sha256_file(root / name) if (root / name).is_file() else ""
+        for name in (
+            "design_claims.jsonl", "design_coverage.json", "design_agent_manifest.json",
+            "claim_review_scope.json",
+        )
+    }
+    if review.get("input_digests") != expected_digests:
+        errors.append("design_claim_review.json: input_digests do not match current design artifacts")
+    if review.get("decision") != "accept":
+        errors.append("design_claim_review.json: current claim review must be accepted before task planning")
+
+    raw_reviews = review.get("claim_reviews")
+    if not isinstance(raw_reviews, list):
+        errors.append("design_claim_review.json: claim_reviews must be an array")
+        raw_reviews = []
+    reviewed_scope: set[str] = set()
+    for index, item in enumerate(raw_reviews, start=1):
+        label = f"design_claim_review.json claim_reviews[{index}]"
+        if not isinstance(item, dict):
+            errors.append(f"{label}: must be an object")
+            continue
+        _validate_session_owner(item, session_id, label, errors)
+        claim_id = item.get("claim_id")
+        if not isinstance(claim_id, str) or not claim_id.strip():
+            errors.append(f"{label}: missing/non-string claim_id")
+            continue
+        if claim_id in reviewed_scope:
+            errors.append(f"{label}: duplicate claim_id {claim_id}")
+        reviewed_scope.add(claim_id)
+        if claim_id not in claims:
+            errors.append(f"{label}: unknown claim_id {claim_id}")
+        if claim_id not in scope:
+            errors.append(f"{label}: claim_id {claim_id} is outside claim_review_scope.json")
+        if item.get("decision") != "accept":
+            errors.append(f"{label}: claim must have decision='accept' to enter task scope")
+    if reviewed_scope != scope:
+        errors.append(
+            "design_claim_review.json: accepted claim review membership does not exactly match "
+            f"claim_review_scope.json; missing={sorted(scope - reviewed_scope)}, "
+            f"extra={sorted(reviewed_scope - scope)}"
+        )
+
+    manifest = _load_object(root / "workspace_manifest.json", "workspace_manifest.json", errors)
+    log_root_value = manifest.get("paths", {}).get("log_root") if isinstance(manifest, dict) else None
+    trace_path = (
+        Path(log_root_value).resolve() / "trace" / "claim_review_validation.json"
+        if isinstance(log_root_value, str) and log_root_value else None
+    )
+    if trace_path is None:
+        errors.append("workspace_manifest.json: paths.log_root is required for claim review validation")
+        claim_trace: dict[str, Any] = {}
+    else:
+        claim_trace = _load_object(trace_path, "claim_review_validation.json", errors)
+    if claim_trace.get("passed") is not True or claim_trace.get("decision") != "accept":
+        errors.append("claim_review_validation.json: current scoped claim review has not passed")
+    if claim_trace.get("session_id") != session_id:
+        errors.append("claim_review_validation.json: session_id does not match current session")
+    if claim_trace.get("input_digests") != expected_digests:
+        errors.append("claim_review_validation.json: input digests are stale")
+    scope_path = root / "claim_review_scope.json"
+    scope_digest = ac.sha256_file(scope_path) if scope_path.is_file() else ""
+    if claim_trace.get("scope_digest") != scope_digest:
+        errors.append("claim_review_validation.json: scope digest is stale")
+    accepted_claim_ids = claim_trace.get("accepted_claim_ids")
+    if not isinstance(accepted_claim_ids, list) or any(
+        not isinstance(value, str) or not value.strip() for value in accepted_claim_ids
+    ):
+        errors.append("claim_review_validation.json: accepted_claim_ids must be an array of strings")
+        accepted_claim_id_set: set[str] = set()
+    else:
+        accepted_claim_id_set = set(accepted_claim_ids)
+    if accepted_claim_id_set != scope:
+        errors.append("claim_review_validation.json: accepted claim IDs do not match current scope")
+
+    tasks_by_claim: dict[str, list[str]] = {}
+    for task_id, task in tasks.items():
+        claim_id = str(task.get("claim_id") or "")
+        tasks_by_claim.setdefault(claim_id, []).append(task_id)
+        if claim_id not in scope:
+            errors.append(
+                f"investigation task {task_id}: claim_id {claim_id!r} is outside accepted claim review scope"
+            )
+    for claim_id in sorted(scope):
+        if not tasks_by_claim.get(claim_id):
+            errors.append(f"accepted claim review scope claim {claim_id}: missing investigation task")
+    return scope
+
+
+def _validate_round_frontier(
+    tasks: dict[str, dict[str, Any]],
+    rounds: list[dict[str, Any]],
+    max_tasks_per_round: int,
+    errors: list[str],
+) -> tuple[list[list[str]], str]:
+    """Freeze task membership and require rounds to drain in JSONL order."""
+    memberships: dict[str, list[int]] = {task_id: [] for task_id in tasks}
+    ordered_task_ids: list[list[str]] = []
+    round_ids: list[str] = []
+    for round_index, item in enumerate(rounds, start=1):
+        round_id = str(item.get("round_id") or f"#{round_index}")
+        round_ids.append(round_id)
+        label = f"investigation round {round_id}"
+        task_ids, item_errors = _string_array(
+            item, "task_ids", label, allow_empty=False,
+        )
+        errors.extend(item_errors)
+        if len(task_ids) > max_tasks_per_round:
+            errors.append(
+                f"{label}: task_ids exceeds max_tasks_per_round={max_tasks_per_round}"
+            )
+        ordered_task_ids.append(task_ids)
+        for task_id in task_ids:
+            if task_id not in tasks:
+                errors.append(f"{label}: unknown task_id {task_id}")
+                continue
+            memberships[task_id].append(round_index - 1)
+
+    for task_id, positions in memberships.items():
+        if len(positions) != 1:
+            errors.append(
+                f"investigation task {task_id}: must belong to exactly one investigation round; "
+                f"found {len(positions)}"
+            )
+
+    earliest_open = ""
+    for round_index, task_ids in enumerate(ordered_task_ids):
+        statuses = {
+            task_id: tasks[task_id].get("status")
+            for task_id in task_ids if task_id in tasks
+        }
+        open_ids = [
+            task_id for task_id, status in statuses.items()
+            if status in {"pending", "in_progress"}
+        ]
+        if not open_ids:
+            continue
+        if not earliest_open:
+            earliest_open = round_ids[round_index]
+        for later_index in range(round_index + 1, len(ordered_task_ids)):
+            later_round_id = round_ids[later_index]
+            if ordered_task_ids[later_index]:
+                errors.append(
+                    f"investigation round {later_round_id}: cannot exist while earlier round "
+                    f"{round_ids[round_index]} has open tasks {open_ids}"
+                )
+    return ordered_task_ids, earliest_open
+
+
 def _validate_task_finding_lifecycle(
     tasks: dict[str, dict[str, Any]], findings: dict[str, dict[str, Any]],
     session_id: str, errors: list[str],
@@ -364,7 +547,8 @@ def _first_portfolio(
 
 def _validate_first_portfolio(
     portfolio: dict[str, dict[str, Any]], contract: dict[str, Any],
-    architecture_indexes: dict[str, dict[str, dict[str, Any]]], errors: list[str],
+    architecture_indexes: dict[str, dict[str, dict[str, Any]]],
+    risks: dict[str, dict[str, Any]], errors: list[str],
 ) -> None:
     coverage_contract = contract.get("coverage_contract")
     if not isinstance(coverage_contract, dict):
@@ -382,31 +566,26 @@ def _validate_first_portfolio(
         boundary_id for boundary_id, boundary in architecture_indexes["boundaries"].items()
         if boundary.get("risk") == "high"
     }
+    risk_backtracking_tasks = [
+        task for task in portfolio.values()
+        if task.get("exploration_mode") == "code-to-design risk backtracking"
+    ]
     covered_boundaries = {
-        boundary for task in portfolio.values()
-        for boundary in task.get("architecture_boundaries", []) if isinstance(boundary, str)
-    }
-    missing_boundaries = high_boundaries - covered_boundaries
-    if missing_boundaries:
-        errors.append(
-            f"first-round portfolio misses high-risk boundaries {sorted(missing_boundaries)}"
+        boundary
+        for task in risk_backtracking_tasks
+        for boundary in task.get("architecture_boundaries", [])
+        if isinstance(boundary, str)
+        and any(
+            boundary in risks[risk_id].get("architecture_boundaries", [])
+            for risk_id in task.get("risk_observation_ids", [])
+            if risk_id in risks
         )
-
-    for path_id, path in architecture_indexes["parallel_paths"].items():
-        required_planes = set(path.get("plane_ids", []))
-        covering = [
-            task for task in portfolio.values()
-            if path_id in task.get("parallel_path_ids", [])
-        ]
-        covered_planes = {
-            plane for task in covering for plane in task.get("implementation_planes", [])
-            if isinstance(plane, str)
-        }
-        missing_planes = required_planes - covered_planes
-        if missing_planes:
-            errors.append(
-                f"first-round portfolio path {path_id} misses planes {sorted(missing_planes)}"
-            )
+    }
+    if high_boundaries and not high_boundaries.intersection(covered_boundaries):
+        errors.append(
+            "first-round portfolio needs at least one risk-backed code-to-design task "
+            "on a high-risk boundary"
+        )
 
 
 def validate_task_stage(
@@ -419,12 +598,30 @@ def validate_task_stage(
     _validate_claim_sessions(claims, session_id, errors)
     _validate_risks(risks, session_id, root, code_root, errors)
     _validate_tasks_typed(tasks, session_id, root, errors)
+    claim_scope = _validated_claim_review_scope(
+        root, session_id, claims, tasks, errors,
+    )
+    iteration_policy = contract.get("iteration_policy", {})
+    max_tasks_per_round = iteration_policy.get("max_tasks_per_round")
+    if (
+        not isinstance(max_tasks_per_round, int)
+        or isinstance(max_tasks_per_round, bool)
+        or max_tasks_per_round < 1
+    ):
+        errors.append("agent_loop_contract.json: max_tasks_per_round must be a positive integer")
+        max_tasks_per_round = 1
+    _, earliest_open_round = _validate_round_frontier(
+        tasks, rounds, max_tasks_per_round, errors,
+    )
     _validate_task_finding_lifecycle(tasks, findings, session_id, errors)
     portfolio = _first_portfolio(tasks, rounds, errors)
-    _validate_first_portfolio(portfolio, contract, architecture_indexes, errors)
+    _validate_first_portfolio(portfolio, contract, architecture_indexes, risks, errors)
     return errors, {
         "claims": len(claims), "risks": len(risks), "tasks": len(tasks),
         "findings": len(findings), "first_round_tasks": len(portfolio),
+        "claim_review_scope": len(claim_scope),
+        "investigation_rounds": len(rounds),
+        "earliest_open_round": earliest_open_round,
     }
 
 
@@ -693,6 +890,7 @@ def _validate_coverage_audit(
     risks: dict[str, dict[str, Any]], tasks: dict[str, dict[str, Any]],
     findings: dict[str, dict[str, Any]], rounds: dict[str, dict[str, Any]],
     observed_modes: set[str], modes: set[str], lenses: set[str],
+    scoped_claim_ids: set[str],
     architecture_indexes: dict[str, dict[str, dict[str, Any]]], errors: list[str],
 ) -> list[dict[str, Any]]:
     label = "coverage_audit.json"
@@ -700,7 +898,7 @@ def _validate_coverage_audit(
         "session_id", "design_documents_reviewed", "claims_total", "claims_investigated",
         "rounds_completed", "exploration_modes_completed", "document_groups_total",
         "document_groups_accounted", "code_areas_reviewed", "architecture_boundaries",
-        "remaining_high_priority_claims", "deferred_claims",
+        "remaining_scoped_claims", "deferred_claims",
         "false_positive_samples_rechecked", "next_round_tasks", "stop_reason",
     )
     errors.extend(_require_fields(coverage, required, label, nonempty=False))
@@ -807,6 +1005,8 @@ def _validate_coverage_audit(
             deferred_claims.add(claim_id)
         if claim_id not in claims:
             errors.append(f"{item_label}: unknown claim_id {claim_id!r}")
+        elif claim_id not in scoped_claim_ids:
+            errors.append(f"{item_label}: deferred claim is outside current accepted scope")
         task = tasks.get(task_id)
         if task is None:
             errors.append(f"{item_label}: unknown task_id {task_id!r}")
@@ -817,13 +1017,13 @@ def _validate_coverage_audit(
         else:
             errors.extend(hm.validate_task_defer_evidence(task, item_label))
 
-    remaining_values = coverage.get("remaining_high_priority_claims")
+    remaining_values = coverage.get("remaining_scoped_claims")
     if not isinstance(remaining_values, list):
-        errors.append(f"{label}: remaining_high_priority_claims must be an array")
+        errors.append(f"{label}: remaining_scoped_claims must be an array")
         remaining_values = []
     remaining_claims: set[str] = set()
     for index, item in enumerate(remaining_values, start=1):
-        item_label = f"{label} remaining_high_priority_claims[{index}]"
+        item_label = f"{label} remaining_scoped_claims[{index}]"
         if not isinstance(item, dict):
             errors.append(f"{item_label}: must be an object")
             continue
@@ -835,30 +1035,28 @@ def _validate_coverage_audit(
             errors.append(f"{item_label}: duplicate claim_id {claim_id}")
         elif claim_id:
             remaining_claims.add(claim_id)
-        claim = claims.get(claim_id)
-        if claim is None or claim.get("priority") != "high":
-            errors.append(f"{item_label}: claim must reference a known high-priority claim")
+        if claim_id not in scoped_claim_ids:
+            errors.append(f"{item_label}: claim must reference the current accepted scope")
 
     findings_by_task: dict[str, list[dict[str, Any]]] = {}
     for finding in findings.values():
         findings_by_task.setdefault(str(finding.get("task_id") or ""), []).append(finding)
-    investigated_high: set[str] = set()
+    investigated_scoped: set[str] = set()
     for task_id, task in tasks.items():
         claim_id = str(task.get("claim_id") or "")
         if (
-            claim_id in claims and claims[claim_id].get("priority") == "high"
+            claim_id in scoped_claim_ids
             and task.get("status") == "complete" and findings_by_task.get(task_id)
         ):
-            investigated_high.add(claim_id)
+            investigated_scoped.add(claim_id)
     expected_remaining = {
-        claim_id for claim_id, claim in claims.items()
-        if claim.get("priority") == "high"
-        and claim_id not in investigated_high and claim_id not in deferred_claims
+        claim_id for claim_id in scoped_claim_ids
+        if claim_id not in investigated_scoped and claim_id not in deferred_claims
     }
     if remaining_claims != expected_remaining:
         errors.append(
-            f"{label}: remaining_high_priority_claims must equal uninvestigated, "
-            f"non-deferred high claims {sorted(expected_remaining)}"
+            f"{label}: remaining_scoped_claims must equal uninvestigated, "
+            f"non-deferred scoped claims {sorted(expected_remaining)}"
         )
 
     next_tasks = _validate_next_tasks(
@@ -870,8 +1068,37 @@ def _validate_coverage_audit(
     next_claims = {str(item.get("claim_id") or "") for item in next_tasks}
     if remaining_claims - next_claims:
         errors.append(
-            f"{label}: remaining high claims lack next_round_tasks "
+            f"{label}: remaining scoped claims lack next_round_tasks "
             f"{sorted(remaining_claims - next_claims)}"
+        )
+
+    missing_modes = modes - observed_modes
+    planned_modes = {
+        str(item.get("exploration_mode") or "") for item in next_tasks
+    }
+    if missing_modes - planned_modes:
+        errors.append(
+            f"{label}: missing exploration modes lack next_round_tasks "
+            f"{sorted(missing_modes - planned_modes)}"
+        )
+
+    completed_boundaries = {
+        boundary
+        for task_id, task in tasks.items()
+        if task.get("status") == "complete" and findings_by_task.get(task_id)
+        for boundary in task.get("architecture_boundaries", [])
+        if isinstance(boundary, str)
+    }
+    planned_boundaries = {
+        boundary for item in next_tasks
+        for boundary in item.get("architecture_boundaries", [])
+        if isinstance(boundary, str)
+    }
+    missing_high_boundaries = high_boundaries - completed_boundaries
+    if missing_high_boundaries - planned_boundaries:
+        errors.append(
+            f"{label}: high-risk boundaries lack completed or planned evidence "
+            f"{sorted(missing_high_boundaries - planned_boundaries)}"
         )
 
     for path_id, path in architecture_indexes["parallel_paths"].items():
@@ -908,6 +1135,21 @@ def validate_coverage_stage(
     _validate_claim_sessions(claims, session_id, errors)
     _validate_risks(risks, session_id, root, code_root, errors)
     _validate_tasks_typed(tasks, session_id, root, errors)
+    scoped_claim_ids = _validated_claim_review_scope(
+        root, session_id, claims, tasks, errors,
+    )
+    iteration_policy = contract.get("iteration_policy", {})
+    max_tasks_per_round = iteration_policy.get("max_tasks_per_round")
+    if (
+        not isinstance(max_tasks_per_round, int)
+        or isinstance(max_tasks_per_round, bool)
+        or max_tasks_per_round < 1
+    ):
+        errors.append("agent_loop_contract.json: max_tasks_per_round must be a positive integer")
+        max_tasks_per_round = 1
+    _validate_round_frontier(
+        tasks, list(rounds.values()), max_tasks_per_round, errors,
+    )
     _validate_task_finding_lifecycle(tasks, findings, session_id, errors)
     for finding_id, finding in findings.items():
         errors.extend(hm.validate_item(
@@ -982,13 +1224,65 @@ def validate_coverage_stage(
         coverage, session_id=session_id, manifest=manifest, design_groups=design_groups,
         claims=claims, risks=risks, tasks=tasks, findings=findings, rounds=rounds,
         observed_modes=observed_modes, modes=expected_modes, lenses=expected_lenses,
+        scoped_claim_ids=scoped_claim_ids,
         architecture_indexes=architecture_indexes, errors=errors,
+    )
+    findings_by_task = {
+        str(finding.get("task_id") or "") for finding in findings.values()
+        if finding.get("task_id")
+    }
+    unfinished_tasks = {
+        task_id for task_id, task in tasks.items()
+        if task.get("status") in {"pending", "in_progress"}
+    }
+    completed_boundaries = {
+        str(boundary)
+        for task_id, task in tasks.items()
+        if task.get("status") == "complete" and task_id in findings_by_task
+        for boundary in task.get("architecture_boundaries", []) if boundary
+    }
+    high_boundaries = {
+        boundary_id for boundary_id, item in architecture_indexes["boundaries"].items()
+        if item.get("risk") == "high"
+    }
+    audit_boundaries = {
+        str(item.get("boundary_id") or ""): item
+        for item in coverage.get("architecture_boundaries", [])
+        if isinstance(item, dict) and item.get("boundary_id")
+    }
+    high_boundaries_closed = all(
+        boundary_id in completed_boundaries
+        and audit_boundaries.get(boundary_id, {}).get("status") == "investigated"
+        for boundary_id in high_boundaries
+    )
+    parallel_paths_closed = True
+    for path_id, path in architecture_indexes["parallel_paths"].items():
+        completed_planes = {
+            str(plane)
+            for task_id, task in tasks.items()
+            if task.get("status") == "complete" and task_id in findings_by_task
+            and path_id in task.get("parallel_path_ids", [])
+            for plane in task.get("implementation_planes", []) if plane
+        }
+        if set(path.get("plane_ids", [])) - completed_planes:
+            parallel_paths_closed = False
+    remaining_scoped = coverage.get("remaining_scoped_claims")
+    closed = (
+        isinstance(remaining_scoped, list) and not remaining_scoped
+        and not next_tasks
+        and not unfinished_tasks
+        and observed_modes == expected_modes
+        and high_boundaries_closed
+        and parallel_paths_closed
     )
     return errors, {
         "claims": len(claims), "risks": len(risks), "tasks": len(tasks),
         "findings": len(findings), "rounds": len(rounds),
         "semantic_lenses": len(semantic.get("lenses", [])) if isinstance(semantic.get("lenses"), list) else 0,
         "next_round_tasks": len(next_tasks),
+        "scoped_claims": len(scoped_claim_ids),
+        "unfinished_tasks": len(unfinished_tasks),
+        "closed": closed,
     }
 
 
@@ -1000,14 +1294,16 @@ def _stage_inputs(root: Path, stage: str) -> list[Path]:
     if stage == "architecture":
         return common
     common.extend([
-        root / "design_claims.jsonl", root / "risk_observations.jsonl",
+        root / "design_agent_manifest.json", root / "design_coverage.json",
+        root / "claim_review_scope.json", root / "design_claim_review.json",
+        root / "design_claims.jsonl",
+        root / "risk_observations.jsonl",
         root / "investigation_tasks.jsonl", root / "investigation_findings.jsonl",
         root / "investigation_rounds.jsonl",
     ])
     if stage == "coverage":
         common.extend([
-            root / "design_coverage.json", root / "semantic_coverage.json",
-            root / "coverage_audit.json",
+            root / "semantic_coverage.json", root / "coverage_audit.json",
         ])
     return common
 
@@ -1109,6 +1405,10 @@ def run(args: argparse.Namespace) -> int:
         "session_id": session_id,
         "validated_at": ac.now_iso(),
         "passed": not errors,
+        "closed": (
+            not errors and bool(metrics.get("closed"))
+            if args.stage == "coverage" else None
+        ),
         "input_digests": input_digests,
         "combined_input_sha256": combined_digest,
         "metrics": metrics,

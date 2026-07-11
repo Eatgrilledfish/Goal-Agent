@@ -16,6 +16,22 @@ from typing import Any
 import agent_common as ac
 
 
+EVIDENCE_INPUT_NAMES = (
+    "design_claims.jsonl",
+    "investigation_findings.jsonl",
+    "critic_reviews.jsonl",
+    "dynamic_probes.jsonl",
+    "agent_review_verdicts.jsonl",
+)
+
+
+def evidence_input_digests(root: Path) -> dict[str, str]:
+    return {
+        name: ac.sha256_file(root / name) if (root / name).is_file() else ""
+        for name in EVIDENCE_INPUT_NAMES
+    }
+
+
 VALID_STATUSES = {"confirmed", "probable", "rejected"}
 VALID_SEVERITIES = {"critical", "high", "medium", "low"}
 TRACE_KINDS = {
@@ -405,12 +421,14 @@ def run(args: argparse.Namespace) -> int:
     )
     if path_errors:
         ac.save_json(log_root / "trace" / "evidence_validation.json", {
-            "session_id": "", "passed": False, "metrics": {}, "errors": path_errors,
+            "session_id": "", "passed": False, "input_digests": {},
+            "validated_issues_sha256": "", "metrics": {}, "errors": path_errors,
         })
         print(json.dumps({"confirmed": 0, "probable": 0, "invalid": 0, "errors": len(path_errors)}))
         return 2
     state = ac.load_json(root / "agent_loop_state.json")
     session_id = str(state.get("session_id") or "")
+    input_digests = evidence_input_digests(root)
 
     claims, artifact_errors = _artifact_index(root / "design_claims.jsonl", "claim_id")
     findings, finding_errors = _artifact_index(root / "investigation_findings.jsonl", "finding_id")
@@ -472,9 +490,12 @@ def run(args: argparse.Namespace) -> int:
         "rejected_verdicts": rejected,
     }
     ac.save_json(root / "validated_issues.json", output)
+    validated_issues_sha256 = ac.sha256_file(root / "validated_issues.json")
     ac.save_json(log_root / "trace" / "evidence_validation.json", {
         "session_id": session_id,
         "passed": not validation_errors,
+        "input_digests": input_digests,
+        "validated_issues_sha256": validated_issues_sha256,
         "metrics": {"verdicts": len(latest), "confirmed": confirmed, "probable": probable, "invalid": len(rejected)},
         "errors": validation_errors,
     })

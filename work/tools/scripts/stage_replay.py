@@ -50,7 +50,7 @@ PROMPTS = {
         "Write design_coverage.json and design_claims.jsonl only under the replay state root."
     ),
     "claim-review": (
-        "Independently re-review only the frozen design claims against the supplied design "
+        "Independently re-review only the frozen scoped design claims against the supplied design "
         "documents. Write design_claim_review.json only under the replay state root."
     ),
     "risk": (
@@ -75,7 +75,7 @@ PROMPTS = {
     ),
     "coverage": (
         "Re-run only the coverage audit from the frozen architecture, claims, risks, tasks, "
-        "findings, verdicts, and rounds. Write semantic_coverage.json and coverage_audit.json only."
+        "findings, scope, and rounds. Write semantic_coverage.json and coverage_audit.json only."
     ),
     "gate": (
         "Replay the existing deterministic validation and final gate against the isolated copied "
@@ -93,6 +93,7 @@ GATE_STATE_FILES = (
     "architecture_map.json",
     "design_agent_manifest.json",
     "design_coverage.json",
+    "claim_review_scope.json",
     "semantic_coverage.json",
     "design_claims.jsonl",
     "design_claim_review.json",
@@ -317,6 +318,7 @@ def _rewrite_claim_review(
         name: ac.sha256_file(state_root / name) if (state_root / name).is_file() else ""
         for name in (
             "design_claims.jsonl", "design_coverage.json", "design_agent_manifest.json",
+            "claim_review_scope.json",
         )
     }
     ac.save_json(destination, value)
@@ -443,10 +445,11 @@ def _prepare_stage_inputs(
     if stage == "claim-review":
         _copy_named(copier, [
             ("design_agent_manifest.json", True), ("design_coverage.json", True),
-            ("design_claims.jsonl", True),
+            ("design_claims.jsonl", True), ("claim_review_scope.json", True),
+            ("design_claim_review.json", False),
         ])
-        if run_local:
-            _copy_named(copier, [("design_claim_review.json", True)])
+        if run_local and not (copier.state_root / "design_claim_review.json").is_file():
+            raise ReplayError("local claim-review replay needs an existing review artifact")
         return selection
 
     if stage == "risk":
@@ -492,19 +495,20 @@ def _prepare_stage_inputs(
     if stage == "plan":
         _copy_named(copier, [
             ("architecture_map.json", True), ("design_coverage.json", True),
-            ("design_claims.jsonl", True), ("risk_observations.jsonl", False),
+            ("design_claims.jsonl", True), ("claim_review_scope.json", True),
+            ("risk_observations.jsonl", False),
             ("coverage_audit.json", False), ("semantic_coverage.json", False),
         ])
         return selection
 
     if stage == "coverage":
         _copy_named(copier, [
-            ("architecture_map.json", True), ("design_coverage.json", True),
-            ("design_claims.jsonl", True), ("risk_observations.jsonl", True),
+            ("architecture_map.json", True), ("design_agent_manifest.json", True),
+            ("design_coverage.json", True), ("design_claims.jsonl", True),
+            ("claim_review_scope.json", True), ("design_claim_review.json", True),
+            ("risk_observations.jsonl", True),
             ("investigation_tasks.jsonl", True),
             ("investigation_findings.jsonl", True),
-            ("dynamic_probes.jsonl", False), ("critic_reviews.jsonl", False),
-            ("agent_review_verdicts.jsonl", False),
             ("investigation_rounds.jsonl", True),
         ])
         if run_local:
@@ -754,13 +758,14 @@ def _prompt_inputs(stage: str, records: list[dict[str, Any]]) -> list[str]:
         },
         "claim-review": {
             "state/design_agent_manifest.json", "state/design_coverage.json",
-            "state/design_claims.jsonl",
+            "state/design_claims.jsonl", "state/claim_review_scope.json",
+            "state/design_claim_review.json",
         },
         "risk": {"state/agent_loop_contract.json", "state/architecture_map.json"},
         "plan": {
             "state/agent_loop_contract.json", "state/architecture_map.json",
             "state/design_coverage.json", "state/design_claims.jsonl",
-            "state/risk_observations.jsonl", "state/coverage_audit.json",
+            "state/claim_review_scope.json", "state/risk_observations.jsonl", "state/coverage_audit.json",
             "state/semantic_coverage.json",
         },
         "investigator": {
@@ -780,11 +785,12 @@ def _prompt_inputs(stage: str, records: list[dict[str, Any]]) -> list[str]:
         },
         "coverage": {
             "state/agent_loop_contract.json", "state/workspace_manifest.json",
-            "state/architecture_map.json", "state/design_coverage.json",
-            "state/design_claims.jsonl", "state/risk_observations.jsonl",
+            "state/architecture_map.json", "state/design_agent_manifest.json",
+            "state/design_coverage.json", "state/design_claims.jsonl",
+            "state/claim_review_scope.json", "state/design_claim_review.json",
+            "state/risk_observations.jsonl",
             "state/investigation_tasks.jsonl", "state/investigation_findings.jsonl",
-            "state/dynamic_probes.jsonl", "state/critic_reviews.jsonl",
-            "state/agent_review_verdicts.jsonl", "state/investigation_rounds.jsonl",
+            "state/investigation_rounds.jsonl",
         },
     }
     if stage == "gate":
@@ -995,6 +1001,7 @@ def run_local(replay_root: Path) -> int:
         "--log-root", str((replay_root / "logs").resolve()),
         "--state-root", str((replay_root / "state").resolve()),
     ]
+    preflight_command: list[str] | None = None
     if stage == "claims":
         command = [sys.executable, str(SCRIPT_DIR / "design_artifact_validator.py"), *base]
         kind = "design_schema_validation"
@@ -1002,6 +1009,9 @@ def run_local(replay_root: Path) -> int:
         command = [sys.executable, str(SCRIPT_DIR / "claim_review_validator.py"), *base]
         kind = "claim_review_validation"
     elif stage == "coverage":
+        preflight_command = [
+            sys.executable, str(SCRIPT_DIR / "claim_review_validator.py"), *base,
+        ]
         command = [
             sys.executable, str(SCRIPT_DIR / "goal_runner.py"), "coverage-check", *base,
         ]
@@ -1009,14 +1019,34 @@ def run_local(replay_root: Path) -> int:
     else:
         command = [sys.executable, str(SCRIPT_DIR / "goal_runner.py"), "gate", *base]
         kind = "final_gate"
-    completed = subprocess.run(command, capture_output=True, text=True, check=False)
+    preflight_execution = None
+    executed_command = command
+    if preflight_command is not None:
+        preflight = subprocess.run(
+            preflight_command, capture_output=True, text=True, check=False,
+        )
+        preflight_execution = {
+            "command": preflight_command,
+            "returncode": preflight.returncode,
+            "stdout": preflight.stdout,
+            "stderr": preflight.stderr,
+        }
+        completed = (
+            subprocess.run(command, capture_output=True, text=True, check=False)
+            if preflight.returncode == 0 else preflight
+        )
+        if preflight.returncode != 0:
+            executed_command = preflight_command
+    else:
+        completed = subprocess.run(command, capture_output=True, text=True, check=False)
     execution = {
         "executed_at": ac.now_iso(),
         "kind": kind,
-        "command": command,
+        "command": executed_command,
         "returncode": completed.returncode,
         "stdout": completed.stdout,
         "stderr": completed.stderr,
+        "preflight": preflight_execution,
     }
     trace_path = replay_root / "logs" / "trace" / "stage_replay_local.json"
     ac.save_json(trace_path, execution)

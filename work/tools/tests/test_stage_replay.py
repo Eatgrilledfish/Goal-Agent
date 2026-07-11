@@ -96,7 +96,7 @@ def replay_source(tmp_path: Path) -> dict[str, Path | str]:
         "state": str(state / "agent_loop_state.json"),
     }
     ac.save_json(state / "agent_loop_contract.json", {
-        "contract_version": 10,
+        "contract_version": 11,
         "execution_model": "opencode-owned-model-driven-loop",
         "session": {"session_id": session_id, "artifacts": artifacts},
         "coverage_contract": {
@@ -183,6 +183,12 @@ def replay_source(tmp_path: Path) -> dict[str, Path | str]:
             "behavior_families": ["input acceptance", "adapter acceptance"],
         }],
     })
+    ac.save_json(state / "claim_review_scope.json", {
+        "session_id": session_id,
+        "round_id": "ROUND-001",
+        "design_claims_sha256": ac.sha256_file(state / "design_claims.jsonl"),
+        "claim_ids": ["CLAIM-1", "CLAIM-2"],
+    })
     claim_reviews = []
     for claim in claims:
         claim_reviews.append({
@@ -211,6 +217,7 @@ def replay_source(tmp_path: Path) -> dict[str, Path | str]:
             name: ac.sha256_file(state / name)
             for name in (
                 "design_claims.jsonl", "design_coverage.json", "design_agent_manifest.json",
+                "claim_review_scope.json",
             )
         },
         "claim_reviews": claim_reviews,
@@ -318,7 +325,7 @@ def test_claims_prepare_writes_frozen_manifest_and_no_llm(replay_source, tmp_pat
     assert manifest["development_only"] is True
     assert manifest["llm_invoked"] is False
     assert manifest["runtime"] == {"provider": "provider-a", "model": "model-b"}
-    assert manifest["schema"]["contract_version"] == 10
+    assert manifest["schema"]["contract_version"] == 11
     assert len(manifest["source_digest"]) == 64
     assert len(manifest["replay_input_digest"]) == 64
     assert len(manifest["prompt"]["sha256"]) == 64
@@ -349,7 +356,7 @@ def test_claim_review_and_risk_replays_enforce_opposite_source_boundaries(
     }
     assert (claim_replay / "state" / "design_claims.jsonl").is_file()
     assert not (claim_replay / "state" / "architecture_map.json").exists()
-    assert not (claim_replay / "state" / "design_claim_review.json").exists()
+    assert (claim_replay / "state" / "design_claim_review.json").is_file()
 
     risk_replay = tmp_path / "replay-risk"
     stage_replay.prepare_replay(
@@ -391,9 +398,10 @@ def test_claim_review_local_validation_rebinds_frozen_input_digests(
     review = ac.load_json(replay / "state" / "design_claim_review.json")
     assert review["input_digests"] == {
         name: ac.sha256_file(replay / "state" / name)
-        for name in (
-            "design_claims.jsonl", "design_coverage.json", "design_agent_manifest.json",
-        )
+            for name in (
+                "design_claims.jsonl", "design_coverage.json", "design_agent_manifest.json",
+                "claim_review_scope.json",
+            )
     }
 
 
@@ -419,6 +427,17 @@ def test_investigator_replay_copies_only_selected_task_context(replay_source, tm
     assert not (replay / "state" / "investigation_findings.jsonl").exists()
     assert not (replay / "state" / "unrelated-evaluation-data.json").exists()
     assert (replay / "state" / "handoff-templates" / "investigators" / "TASK-2.json").is_file()
+
+
+def test_plan_replay_includes_current_claim_scope(replay_source, tmp_path):
+    replay = tmp_path / "replay-plan"
+    stage_replay.prepare_replay(
+        source_state=replay_source["state"], replay_root=replay, stage="plan",
+    )
+
+    assert (replay / "state" / "claim_review_scope.json").is_file()
+    envelope = ac.load_json(replay / "prompt_envelope.json")
+    assert "state/claim_review_scope.json" in envelope["inputs"]
 
 
 @pytest.mark.parametrize(
@@ -507,14 +526,20 @@ def test_coverage_local_replay_uses_coverage_gate_only(
 
     def fake_run(command, **kwargs):
         calls.append(command)
+        if Path(command[1]).name == "claim_review_validator.py":
+            return SimpleNamespace(returncode=0, stdout="claim review ok", stderr="")
         return SimpleNamespace(returncode=1, stdout="coverage output", stderr="")
 
     monkeypatch.setattr(stage_replay.subprocess, "run", fake_run)
     assert stage_replay.run_local(replay) == 1
-    assert Path(calls[0][1]).name == "goal_runner.py"
-    assert calls[0][2] == "coverage-check"
+    assert Path(calls[0][1]).name == "claim_review_validator.py"
+    assert Path(calls[1][1]).name == "goal_runner.py"
+    assert calls[1][2] == "coverage-check"
     envelope = ac.load_json(replay / "prompt_envelope.json")
     assert envelope["read_only_source_roots"] == {}
+    assert "state/claim_review_scope.json" in envelope["inputs"]
+    assert "state/design_claim_review.json" in envelope["inputs"]
+    assert "state/dynamic_probes.jsonl" not in envelope["inputs"]
     execution = ac.load_json(replay / "logs" / "trace" / "stage_replay_local.json")
     assert execution["kind"] == "coverage_validation"
 

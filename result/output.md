@@ -1,61 +1,43 @@
 # Goal-Agent 自验证记录
 
-## 作品入口
+## 运行入口
 
-评测平台加载根目录 `INSTRUCTION.md`，由运行中的 OpenCode 主 agent 读取
-`work/skill/SKILL.md`、角色定义和 deterministic helpers，执行通用设计/实现语义
-一致性检视。目标代码与设计文档只读，结果写入 `/result`，session、handoff 与验证
-轨迹写入 `/logs`。正式链路不需要 `opencode.json` 或人工参数。
+评测平台由运行中的 OpenCode CLI 读取根目录 `INSTRUCTION.md`，再调用 `work/skill/SKILL.md`、角色定义和 deterministic helpers。系统自动发现赛事代码与设计材料，只读目标树，只在 `result`、`logs` 和 session state 中写产物；正式链路不需要 `opencode.json`、注册步骤或人工参数。
 
-## 本地验证命令
+语义判断由模型角色完成。脚本只负责输入隔离、schema/reference/lifecycle 校验、证据逐行验真、原子 merge、报告和 final gate，不使用项目名、固定路径、协议表、关键词命中、regex 或公开答案决定 issue。
+
+## 当前流程
+
+1. `prepare` 建立只读快照和 session；主 agent 生成 architecture map。
+2. design-only spec analyst 与 code-only risk explorer 在 architecture-check 后并行运行。design claims 是检索索引，不是必须逐条证明的任务队列。
+3. orchestrator 从真实 risk、外部设计义务和 capability surface 选择小范围 `claim_review_scope`；fresh spec critic 只深审新增范围，可在设计输入 digest 未变化时复用旧 accepted review。
+4. 每轮最多 4 个 task、最多 2 个并发 investigator。首轮只要求一个 risk-backed 高风险锚点；当前轮未 drain 前，validator 拒绝创建后轮或跳到容易候选。
+5. 每轮调查结束先运行 coverage critic。只有具体 scope、lens、mode、boundary、parallel plane 或 risk 缺口才能创建下一轮；coverage closed 前不运行 evidence critic 或 judge。
+6. coverage closed 后才选择少量 design-grounded probe、为每个候选启动 fresh critic，并对当前闭环 frontier 做 final judge。probe 的环境失败或不可达只能是 `inconclusive`。
+7. `review` 将 claims/findings/critics/probes/verdicts 的 digest 绑定到 `validated_issues.json`；report 和 final gate 都拒绝 stale revision。最终只发布 confirmed issue。
+
+## 验证结果
+
+执行命令：
 
 ```bash
-python3 -m pytest -q work/tools/tests
+python3 -m pytest -q work/tools/tests --tb=short
 python3 -m py_compile work/tools/scripts/*.py
 git diff --check
 ```
 
-当前结果：`107 passed in 21.42s`；脚本编译与 diff whitespace 检查通过。
+结果：
 
-开发期单阶段回放（不属于比赛入口，也不会调用 LLM）：
-
-```bash
-python3 work/tools/scripts/stage_replay.py claims \
-  --source-state logs/state --replay-root .agent-work/replays/old-claims \
-  --run-local --force
-python3 work/tools/scripts/stage_replay.py risk \
-  --source-state logs/state --replay-root .agent-work/replays/old-risk --force
+```text
+140 passed in 46.43s
+py_compile: passed
+git diff --check: passed
 ```
 
-冻结旧 session 的 claims gate 在约 0.5 秒内稳定定位 36 个上游 claim/coverage
-契约缺口；risk replay 只暴露 architecture、contract 中的 lens 和代码 review root，
-不暴露设计、旧 finding 或结果。测试还验证了一个完整 session 可复制到隔离目录并
-重新执行真实 final gate，结果通过。
+测试覆盖 scoped claim review、claim repair、四任务 round 上限、FIFO handoff、禁止提前创建后轮、risk/task 引用、coverage closed、critic 严格 schema、evidence freshness、报告/final gate、一阶段 plan/coverage replay，以及完整 session 的隔离 gate replay。运行资产的项目特例扫描只命中测试中的禁止词回归清单，未命中正式 instruction、skill、role 或 helper。
 
-## 当前实现结论
+## 当前状态与风险
 
-- helper 只负责输入物化、schema/reference/lifecycle 校验、证据逐行验真、报告和 gate；
-  不用 regex、关键词、项目名、协议表或公开答案决定 issue。
-- `design_agent_manifest.json` 是设计侧脱敏输入；spec analyst/critic 看不到代码清单。
-- fresh code-only risk explorer 从真实边界、执行 plane、配置与平行路径反查设计问题，
-  observation 不包含 verdict。
-- claim review 在 investigation 前独立检查 quote entailment、normative strength、
-  atomicity、applicability 及文档组遗漏，并绑定当前输入 digest。
-- architecture、task portfolio 和 coverage 都有早期 gate；三种 exploration mode 必须由
-  completed task/finding 证明，不能只写 round 标签。
-- 每个 reviewable finding 必须进入 fresh critic，每个 finding 都必须有 final-judge
-  verdict；候选不能因未发布而无声消失。
-- finding merge 自动完成关联 task 并刷新 digest-bound provenance；typed handoff 使用
-  独立文件、最多两个并发任务和原子 merge。
-- 单点动态测试只用于增强或反驳已有语义证据；baseline、环境或可达性失败一律
-  `inconclusive`，不能单独确认不一致。
-- final gate 绑定 JSON/JSONL/Markdown、唯一 finding、完整 handoff、覆盖闭环、目标树
-  未修改和六小时时限。
-- `stage_replay.py` 仅用于本地冻结阶段调试，未被 `INSTRUCTION.md` 或正式
-  `goal_runner.py` 调用；它会拒绝位于代码、设计、结果、日志或 review root 内的
-  replay 目录，`--force` 不能删除输入。
+本轮修改前正在运行的后台 OpenCode 已主动发送 SIGTERM 停止，退出码 143；日志和 session state 保留，未在修改后重新启动全量模型验证。因此当前结论是 deterministic 契约与测试已通过，公共基准的最新端到端召回仍需下一次独立全量运行验证。
 
-项目主 Skill 的 frontmatter 已用等价只读校验通过；Skill Creator 自带
-`quick_validate.py` 在当前 Mac Python 环境缺少 PyYAML，因此未安装额外依赖。
-正式 F-Stack 全量 OpenCode 自验尚未在本次修改后重跑；启动时将使用后台进程、持久
-日志、PID 与退出码记录，由人工消息触发进度读取，不进行高频轮询。
+`review_context=fresh_subagent` 只是 handoff 策略声明，同一可写文件系统无法由作品自身提供平台级 Task 身份证明；当前防线是强制角色 Task、严格字段/引用/digest 契约、独立 handoff 和禁止 orchestrator 补语义字段。最终 confirmed 配额只存在于比赛 final gate，不传给 investigator、critic 或 judge，也不参与 issue 判定。

@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any
 
 import agent_common as ac
+import stage_artifact_validator as sav
+import verdict_validator as vv
 
 
 SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
@@ -107,13 +109,6 @@ def render_summary(result: dict[str, Any], probable_count: int) -> str:
             f"{issue.get('title', '')} | `{location}` |"
         )
     lines.append("")
-    if len(result["issues"]) < 4:
-        lines.extend([
-            "## Completion Gap", "",
-            "Fewer than four findings passed semantic review, independent critique, and source verification. "
-            "The agent must continue evidence-led investigation; no finding may be fabricated to satisfy the count target.",
-            "",
-        ])
     return "\n".join(lines)
 
 
@@ -129,8 +124,47 @@ def run(args: argparse.Namespace) -> int:
     if path_errors:
         print(json.dumps({"reported": False, "errors": path_errors}))
         return 2
+    state = ac.load_json(root / "agent_loop_state.json")
+    session_id = str(state.get("session_id") or "")
+    coverage_trace_path = log_root / "trace" / "coverage_validation.json"
+    coverage_trace = (
+        ac.load_json(coverage_trace_path) if coverage_trace_path.is_file() else {}
+    )
+    expected_inputs, expected_combined = sav._input_digests(
+        root, sav._stage_inputs(root, "coverage"),
+    )
+    coverage_errors: list[str] = []
+    if coverage_trace.get("passed") is not True or coverage_trace.get("closed") is not True:
+        coverage_errors.append("coverage validation is not closed")
+    if coverage_trace.get("session_id") != session_id:
+        coverage_errors.append("coverage validation belongs to a different session")
+    if coverage_trace.get("input_digests") != expected_inputs:
+        coverage_errors.append("coverage validation input digests are stale")
+    if coverage_trace.get("combined_input_sha256") != expected_combined:
+        coverage_errors.append("coverage validation combined digest is stale")
+    if coverage_errors:
+        print(json.dumps({"reported": False, "errors": coverage_errors}))
+        return 2
+    evidence_trace_path = log_root / "trace" / "evidence_validation.json"
+    evidence_trace = (
+        ac.load_json(evidence_trace_path) if evidence_trace_path.is_file() else {}
+    )
+    validated_path = root / "validated_issues.json"
+    evidence_errors: list[str] = []
+    if evidence_trace.get("passed") is not True:
+        evidence_errors.append("evidence validation has not passed")
+    if evidence_trace.get("session_id") != session_id:
+        evidence_errors.append("evidence validation belongs to a different session")
+    if evidence_trace.get("input_digests") != vv.evidence_input_digests(root):
+        evidence_errors.append("evidence validation input digests are stale")
+    validated_digest = ac.sha256_file(validated_path) if validated_path.is_file() else ""
+    if evidence_trace.get("validated_issues_sha256") != validated_digest:
+        evidence_errors.append("validated_issues.json is stale or changed after review")
+    if evidence_errors:
+        print(json.dumps({"reported": False, "errors": evidence_errors}))
+        return 2
     ac.ensure_dir(result_root)
-    validated = ac.load_json(root / "validated_issues.json")
+    validated = ac.load_json(validated_path)
     confirmed = sorted_confirmed(validated.get("issues", []))
     probable = [issue for issue in validated.get("issues", []) if issue.get("status") == "probable"]
     for index, issue in enumerate(confirmed, start=1):
@@ -139,7 +173,6 @@ def run(args: argparse.Namespace) -> int:
 
     for old in result_root.glob("[0-9][0-9]-*.md"):
         old.unlink()
-    state = ac.load_json(root / "agent_loop_state.json")
     result = {
         "generated_at": ac.now_iso(),
         "tool": "goal-agent-design-code-diff",

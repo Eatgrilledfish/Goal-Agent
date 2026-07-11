@@ -24,6 +24,7 @@ ARTIFACT_NAMES = {
     "architecture_map": "architecture_map.json",
     "design_agent_manifest": "design_agent_manifest.json",
     "design_coverage": "design_coverage.json",
+    "claim_review_scope": "claim_review_scope.json",
     "design_claim_review": "design_claim_review.json",
     "semantic_coverage": "semantic_coverage.json",
     "design_claims": "design_claims.jsonl",
@@ -307,7 +308,7 @@ def loop_contract(paths: dict[str, str], session_id: str) -> dict[str, Any]:
     state_root = Path(paths["state_root"])
     artifacts = {name: str(state_root / filename) for name, filename in ARTIFACT_NAMES.items()}
     return {
-        "contract_version": 10,
+        "contract_version": 11,
         "execution_model": "opencode-owned-model-driven-loop",
         "session": {
             "session_id": session_id,
@@ -338,21 +339,21 @@ def loop_contract(paths: dict[str, str], session_id: str) -> dict[str, Any]:
                 "done_when": "Every manifest document group has an evidence-backed disposition and a bounded difference-oriented claim portfolio with exact source locations.",
             },
             {
-                "id": "design_claim_review",
-                "owner": "spec_critic",
-                "output": artifacts["design_claim_review"],
-                "done_when": (
-                    "A fresh design-only critic accepted complete claim/group coverage, quote entailment, "
-                    "normative strength, atomicity, and applicability against the current artifact digests."
-                ),
-            },
-            {
                 "id": "code_risk_backtracking",
                 "owner": "risk_explorer",
                 "output": artifacts["risk_observations"],
                 "done_when": (
                     "Fresh code-only agents have inspected architecture planes and boundaries through generic semantic "
                     "lenses, handing off exact code observations and design lookup questions without issuing verdicts."
+                ),
+            },
+            {
+                "id": "scoped_design_claim_review",
+                "owner": "orchestrator_then_spec_critic",
+                "output": [artifacts["claim_review_scope"], artifacts["design_claim_review"]],
+                "done_when": (
+                    "A fresh design-only critic accepted the cumulative investigation scope for quote entailment, "
+                    "normative strength, atomicity, and applicability against current artifact digests."
                 ),
             },
             {
@@ -368,31 +369,30 @@ def loop_contract(paths: dict[str, str], session_id: str) -> dict[str, Any]:
                 "done_when": "Each investigated claim has code evidence, reverse checks, and a real tool trace.",
             },
             {
+                "id": "coverage_audit",
+                "owner": "coverage_critic_then_orchestrator",
+                "output": [artifacts["semantic_coverage"], artifacts["coverage_audit"]],
+                "done_when": "All exploration modes ran; lens, high-risk boundary, parallel-plane, and capability dispositions have referenced evidence or an explicit evidence limitation.",
+            },
+            {
                 "id": "dynamic_probe",
                 "owner": "orchestrator_then_code_investigator",
                 "output": artifacts["dynamic_probes"],
                 "done_when": (
-                    "Every candidate finding records a probe selection disposition; selected low-cost probes use a "
-                    "design-derived oracle and an isolated session copy, while unavailable environments remain inconclusive."
+                    "Coverage is closed and selected low-cost probes use a design-derived oracle in an isolated copy."
                 ),
             },
             {
                 "id": "adversarial_critique",
                 "owner": "evidence_critic",
                 "output": artifacts["critic_reviews"],
-                "done_when": "A fresh-context critic has challenged scope, alternate paths, configuration, and evidence sufficiency.",
+                "done_when": "Coverage is closed and a fresh-context critic challenged each candidate.",
             },
             {
                 "id": "final_judgement",
                 "owner": "final_judge",
                 "output": artifacts["verdicts"],
-                "done_when": "Every final finding references a design claim, investigator finding, and critic decision.",
-            },
-            {
-                "id": "coverage_audit",
-                "owner": "coverage_critic_then_orchestrator",
-                "output": [artifacts["semantic_coverage"], artifacts["coverage_audit"]],
-                "done_when": "All exploration modes ran; lens, high-risk boundary, parallel-plane, and capability dispositions have referenced evidence or an explicit evidence limitation.",
+                "done_when": "Closed coverage and every finding have one evidence-bound final verdict.",
             },
         ],
         "handoffs": [
@@ -405,7 +405,7 @@ def loop_contract(paths: dict[str, str], session_id: str) -> dict[str, Any]:
                 "from": "spec_analyst", "to": "spec_critic",
                 "inputs": [
                     artifacts["design_agent_manifest"], artifacts["design_coverage"],
-                    artifacts["design_claims"],
+                    artifacts["design_claims"], artifacts["claim_review_scope"],
                 ],
                 "read_roots": [paths["review_design_root"]],
             },
@@ -444,10 +444,10 @@ def loop_contract(paths: dict[str, str], session_id: str) -> dict[str, Any]:
                     str(state_root / "workspace_manifest.json"),
                     str(state_root / "agent_loop_contract.json"),
                     artifacts["architecture_map"], artifacts["design_coverage"],
-                    artifacts["design_claims"], artifacts["risk_observations"],
+                    artifacts["design_claims"], artifacts["claim_review_scope"],
+                    artifacts["risk_observations"],
                     artifacts["investigation_tasks"], artifacts["investigation_findings"],
-                    artifacts["dynamic_probes"], artifacts["critic_reviews"],
-                    artifacts["verdicts"], artifacts["rounds"],
+                    artifacts["rounds"],
                 ],
                 "read_roots": [],
             },
@@ -533,9 +533,10 @@ def loop_contract(paths: dict[str, str], session_id: str) -> dict[str, Any]:
                 "and architecture boundaries plus a counterfactual explanation. Listing a lens only in a round is insufficient."
             ),
             "claim_rule": (
-                "Use a risk-diverse portfolio rather than treating every extracted sentence as mandatory work. A compliant finding is valid coverage but cannot be published. "
+                "Design claims form a searchable index; only the cumulative accepted claim-review scope is the executable session frontier. "
+                "Use a risk-diverse portfolio rather than treating every extracted sentence or every high label as mandatory work. A compliant finding is valid coverage but cannot be published. "
                 "Optional/recommended behavior and completely absent capabilities remain eligible design claims; normative strength affects "
-                "classification and severity, not whether the behavior is inspected. Each behavior family declared for an applicable design "
+                "classification and severity. Each behavior family declared for an applicable design "
                 "group must be represented by at least one claim before that group is considered covered."
             ),
             "boundary_rule": "A high-risk integration boundary must be investigated, not merely deferred, for a successful gate.",
@@ -567,13 +568,13 @@ def loop_contract(paths: dict[str, str], session_id: str) -> dict[str, Any]:
         },
         "iteration_policy": {
             "round_artifact": artifacts["rounds"],
+            "max_tasks_per_round": 4,
             "on_failed_gate": (
-                "If time remains, do not answer the user or declare completion. Start another round using unreviewed document groups, "
-                "unvisited architecture boundaries, and a materially different portfolio lens."
+                "If time remains, start another frozen round only from a concrete uncovered design behavior, risk observation, "
+                "architecture boundary, execution plane, or critic evidence request; never choose work from a count target."
             ),
             "zero_finding_response": (
-                "Treat zero confirmed findings as a recall warning. Run a coverage-critic pass and broaden to integration/capability boundaries "
-                "before considering an evidence-limited stop."
+                "Finding counts are not a coverage input. Run coverage after every investigation round and follow its evidence-backed gaps."
             ),
             "minimum_strategy_change": (
                 "A retry must change an exploration mode and at least one of document group, architecture boundary, or portfolio lens."
@@ -588,10 +589,9 @@ def loop_contract(paths: dict[str, str], session_id: str) -> dict[str, Any]:
             "success": [
                 "Coverage audit explains remaining gaps and completes the required lens, mode, boundary, and execution-plane portfolio.",
                 "Every confirmed finding passed independent critique and source verification.",
-                "At least four confirmed findings exist for the competition target.",
                 "The final gate passes within the time budget.",
             ],
-            "never": "Do not fabricate or lower evidence standards to reach the issue-count target.",
+            "never": "Do not use a candidate or issue count to select tasks, stop coverage, or lower evidence standards.",
             "failed_gate": "A failed gate is an iteration signal, not a completed run, while the hard time limit has not been reached.",
         },
     }
@@ -780,8 +780,8 @@ def prepare(args: argparse.Namespace) -> int:
         "metrics": {"claims": 0, "investigations": 0, "critic_reviews": 0, "confirmed": 0},
         "next_actions": [
             "Read INSTRUCTION.md, the skill, workspace_manifest.json, and agent_loop_contract.json.",
-            "Map repository architecture and integration boundaries before extracting design claims.",
-            "Account for every design document group, then start claim-driven investigation.",
+            "Map repository architecture and integration boundaries.",
+            "After architecture-check, start design indexing and code-only risk sweeps in parallel.",
         ],
         "stop_reason": "",
     }

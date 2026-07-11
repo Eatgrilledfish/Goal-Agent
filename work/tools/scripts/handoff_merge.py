@@ -33,6 +33,15 @@ FINDING_TEMPLATE_FIELDS = (
     "finding_id", "session_id", "task_id", "claim_id", "hypothesis", "expected_behavior",
     "design_evidence", "review_lenses",
 )
+CRITIC_ALLOWED_KEYS = {
+    "review_id", "session_id", "finding_id", "claim_id", "decision", "challenges",
+    "checks_performed", "dynamic_probe_review", "review_context", "resolution",
+    "remaining_risks",
+}
+DYNAMIC_PROBE_REVIEW_ALLOWED_KEYS = {
+    "status", "probe_id", "oracle_validity", "environment_validity", "reachability",
+    "effect_on_decision",
+}
 
 
 class HandoffValidationError(ValueError):
@@ -49,6 +58,29 @@ def _present(value: Any) -> bool:
 
 def _require(item: dict[str, Any], fields: tuple[str, ...], label: str) -> list[str]:
     return [f"{label}: missing/empty {field}" for field in fields if not _present(item.get(field))]
+
+
+def _validate_concrete_string_list(
+    item: dict[str, Any], field: str, label: str, *, minimum: int,
+) -> list[str]:
+    value = item.get(field)
+    if not isinstance(value, list) or len(value) < minimum:
+        return [
+            f"{label}: {field} must contain at least {minimum} concrete non-empty strings"
+        ]
+    errors = [
+        f"{label}: {field}[{index}] must be a concrete non-empty string"
+        for index, entry in enumerate(value, start=1)
+        if not isinstance(entry, str) or not entry.strip()
+    ]
+    normalized = {
+        entry.strip() for entry in value if isinstance(entry, str) and entry.strip()
+    }
+    if len(normalized) < minimum:
+        errors.append(
+            f"{label}: {field} must contain at least {minimum} distinct concrete entries"
+        )
+    return errors
 
 
 def _validate_trace(item: dict[str, Any], label: str) -> list[str]:
@@ -230,6 +262,9 @@ def validate_artifact(item: dict[str, Any], artifact_type: str, label: str) -> l
         return errors
 
     if artifact_type == "critic":
+        unexpected = sorted(set(item) - CRITIC_ALLOWED_KEYS)
+        if unexpected:
+            errors.append(f"{label}: unsupported fields {unexpected}")
         errors.extend(_require(item, (
             "review_id", "session_id", "finding_id", "claim_id", "decision", "challenges",
             "checks_performed", "dynamic_probe_review", "review_context", "resolution",
@@ -238,15 +273,33 @@ def validate_artifact(item: dict[str, Any], artifact_type: str, label: str) -> l
             "confirm_contradiction", "probable_contradiction", "reject_issue", "needs_more_evidence",
         }:
             errors.append(f"{label}: invalid decision")
+        # This is a policy declaration in the handoff, not proof of Task identity.
         if item.get("review_context") != "fresh_subagent":
             errors.append(f"{label}: review_context must be fresh_subagent")
-        checks = item.get("checks_performed")
-        if not isinstance(checks, list) or len(checks) < 2:
-            errors.append(f"{label}: checks_performed must contain at least two independent checks")
+        errors.extend(_validate_concrete_string_list(
+            item, "challenges", label, minimum=2,
+        ))
+        errors.extend(_validate_concrete_string_list(
+            item, "checks_performed", label, minimum=2,
+        ))
+        if "remaining_risks" not in item:
+            errors.append(f"{label}: missing remaining_risks")
+        elif not isinstance(item.get("remaining_risks"), list):
+            errors.append(f"{label}: remaining_risks must be an array")
         probe_review = item.get("dynamic_probe_review")
         if not isinstance(probe_review, dict):
             errors.append(f"{label}: dynamic_probe_review must be an object")
         else:
+            unexpected_probe_fields = sorted(
+                set(probe_review) - DYNAMIC_PROBE_REVIEW_ALLOWED_KEYS
+            )
+            if unexpected_probe_fields:
+                errors.append(
+                    f"{label}: dynamic_probe_review has unsupported fields "
+                    f"{unexpected_probe_fields}"
+                )
+            if "probe_id" not in probe_review:
+                errors.append(f"{label}: dynamic_probe_review missing probe_id")
             errors.extend(_require(probe_review, (
                 "status", "oracle_validity", "environment_validity", "reachability", "effect_on_decision",
             ), f"{label}: dynamic_probe_review"))
@@ -256,6 +309,8 @@ def validate_artifact(item: dict[str, Any], artifact_type: str, label: str) -> l
                 errors.append(f"{label}: invalid dynamic_probe_review.status")
             if probe_review.get("status") != "not_run" and not _present(probe_review.get("probe_id")):
                 errors.append(f"{label}: executed dynamic probe review needs probe_id")
+            if probe_review.get("status") == "not_run" and _present(probe_review.get("probe_id")):
+                errors.append(f"{label}: not_run dynamic probe review must not reference probe_id")
         return errors
 
     if artifact_type == "probe":
@@ -367,9 +422,66 @@ def _load_index(path: Path, key: str) -> tuple[dict[str, dict[str, Any]], list[s
 def _context_errors(
     item: dict[str, Any], artifact_type: str, state_root: Path, label: str,
 ) -> list[str]:
-    """Validate typed references against current session artifacts before a round starts."""
-    if artifact_type not in {"task", "risk"}:
+    """Validate typed references against current session artifacts."""
+    if artifact_type not in {"task", "risk", "critic"}:
         return []
+    if artifact_type == "critic":
+        findings, finding_errors = _load_index(
+            state_root / "investigation_findings.jsonl", "finding_id",
+        )
+        claims, claim_errors = _load_index(
+            state_root / "design_claims.jsonl", "claim_id",
+        )
+        errors: list[str] = []
+        if finding_errors:
+            errors.append(
+                f"{label}: finding ledger is invalid: {'; '.join(finding_errors)}"
+            )
+        if claim_errors:
+            errors.append(
+                f"{label}: design claim ledger is invalid: {'; '.join(claim_errors)}"
+            )
+
+        finding_id = str(item.get("finding_id") or "")
+        claim_id = str(item.get("claim_id") or "")
+        finding = findings.get(finding_id)
+        claim = claims.get(claim_id)
+        if finding is None:
+            errors.append(f"{label}: unknown finding_id {finding_id!r}")
+        else:
+            if str(finding.get("claim_id") or "") != claim_id:
+                errors.append(f"{label}: finding/critic claim mismatch for {finding_id}")
+            if finding.get("session_id") != item.get("session_id"):
+                errors.append(f"{label}: finding belongs to a different session")
+        if claim is None:
+            errors.append(f"{label}: unknown claim_id {claim_id!r}")
+        elif claim.get("session_id") != item.get("session_id"):
+            errors.append(f"{label}: claim belongs to a different session")
+
+        probe_review = item.get("dynamic_probe_review")
+        probe_id = str(probe_review.get("probe_id") or "") if isinstance(
+            probe_review, dict
+        ) else ""
+        if probe_id:
+            probes, probe_errors = _load_index(
+                state_root / "dynamic_probes.jsonl", "probe_id",
+            )
+            if probe_errors:
+                errors.append(
+                    f"{label}: dynamic probe ledger is invalid: {'; '.join(probe_errors)}"
+                )
+            probe = probes.get(probe_id)
+            if probe is None:
+                errors.append(f"{label}: unknown probe_id {probe_id!r}")
+            else:
+                if str(probe.get("finding_id") or "") != finding_id:
+                    errors.append(f"{label}: probe/finding mismatch for {probe_id}")
+                if str(probe.get("claim_id") or "") != claim_id:
+                    errors.append(f"{label}: probe/claim mismatch for {probe_id}")
+                if probe.get("session_id") != item.get("session_id"):
+                    errors.append(f"{label}: probe belongs to a different session")
+        return errors
+
     contract_path = state_root / "agent_loop_contract.json"
     architecture_path = state_root / "architecture_map.json"
     if not contract_path.is_file() or not architecture_path.is_file():

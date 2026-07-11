@@ -23,6 +23,7 @@ APPLICABILITY = {"supported", "unsupported", "ambiguous"}
 GROUP_ASSESSMENTS = {"complete", "gaps_found", "ambiguous"}
 INPUT_NAMES = (
     "design_claims.jsonl", "design_coverage.json", "design_agent_manifest.json",
+    "claim_review_scope.json",
 )
 
 
@@ -284,7 +285,8 @@ def run(args: argparse.Namespace) -> int:
     if path_errors:
         ac.save_json(trace_path, {
             "validated_at": ac.now_iso(), "session_id": "", "passed": False,
-            "input_digests": {}, "metrics": {}, "errors": path_errors,
+            "input_digests": {}, "scope_digest": "", "accepted_claim_ids": [],
+            "metrics": {}, "errors": path_errors,
         })
         print(json.dumps({"passed": False, "errors": len(path_errors)}))
         return 2
@@ -298,6 +300,7 @@ def run(args: argparse.Namespace) -> int:
     claims_path = root / "design_claims.jsonl"
     coverage_path = root / "design_coverage.json"
     manifest_path = root / "design_agent_manifest.json"
+    scope_path = root / "claim_review_scope.json"
     workspace_path = root / "workspace_manifest.json"
     claims, claim_errors = ac.load_jsonl(claims_path)
     errors.extend(claim_errors)
@@ -306,6 +309,48 @@ def run(args: argparse.Namespace) -> int:
         str(item.get("claim_id")): item
         for item in claims if _nonempty_string(item.get("claim_id"))
     }
+    claims_digest = _digest(claims_path)
+
+    try:
+        scope = ac.load_json(scope_path)
+    except (OSError, json.JSONDecodeError) as exc:
+        errors.append(f"claim_review_scope.json: cannot load JSON: {exc}")
+        scope = {}
+    if not isinstance(scope, dict):
+        errors.append("claim_review_scope.json must be an object")
+        scope = {}
+    if scope.get("session_id") != session_id:
+        errors.append("claim_review_scope.json session_id does not match current session")
+    if not _nonempty_string(scope.get("round_id")):
+        errors.append("claim_review_scope.json round_id must be a non-empty string")
+    if scope.get("design_claims_sha256") != claims_digest:
+        errors.append("claim_review_scope.json design_claims_sha256 does not match current claims")
+
+    raw_scope_claim_ids = scope.get("claim_ids")
+    if not isinstance(raw_scope_claim_ids, list):
+        errors.append("claim_review_scope.json claim_ids must be an array")
+        raw_scope_claim_ids = []
+    elif not raw_scope_claim_ids:
+        errors.append("claim_review_scope.json claim_ids must not be empty")
+    scope_claim_id_values = [
+        value for value in raw_scope_claim_ids if _nonempty_string(value)
+    ]
+    if len(scope_claim_id_values) != len(raw_scope_claim_ids):
+        errors.append("claim_review_scope.json claim_ids entries must be non-empty strings")
+    duplicate_scope_claim_ids = sorted({
+        claim_id for claim_id in scope_claim_id_values
+        if scope_claim_id_values.count(claim_id) > 1
+    })
+    if duplicate_scope_claim_ids:
+        errors.append(
+            f"claim_review_scope.json has duplicate claim_ids: {duplicate_scope_claim_ids}"
+        )
+    scope_claim_ids = set(scope_claim_id_values)
+    unknown_scope_claim_ids = sorted(scope_claim_ids - claim_ids)
+    if unknown_scope_claim_ids:
+        errors.append(
+            f"claim_review_scope.json has unknown claim_ids: {unknown_scope_claim_ids}"
+        )
 
     try:
         coverage = ac.load_json(coverage_path)
@@ -325,6 +370,42 @@ def run(args: argparse.Namespace) -> int:
     )
     if any(not isinstance(item, dict) for item in groups):
         errors.append("design_coverage.json.document_groups entries must be objects")
+    group_claim_ids: dict[str, set[str]] = {}
+    for index, item in enumerate(groups, start=1):
+        if not isinstance(item, dict):
+            continue
+        document_key = item.get("document_key")
+        if not _nonempty_string(document_key):
+            continue
+        raw_group_claim_ids = item.get("claim_ids")
+        if not isinstance(raw_group_claim_ids, list):
+            errors.append(
+                f"design_coverage.json.document_groups:{index}: claim_ids must be an array"
+            )
+            continue
+        if any(not _nonempty_string(value) for value in raw_group_claim_ids):
+            errors.append(
+                f"design_coverage.json.document_groups:{index}: "
+                "claim_ids entries must be non-empty strings"
+            )
+        group_claim_ids[str(document_key)] = {
+            str(value) for value in raw_group_claim_ids if _nonempty_string(value)
+        }
+    scoped_group_ids = {
+        document_key for document_key, member_claim_ids in group_claim_ids.items()
+        if member_claim_ids.intersection(scope_claim_ids)
+    }
+    mapped_scope_claim_ids = {
+        claim_id
+        for document_key in scoped_group_ids
+        for claim_id in group_claim_ids.get(document_key, set())
+    }
+    unmapped_scope_claim_ids = sorted(scope_claim_ids - mapped_scope_claim_ids)
+    if unmapped_scope_claim_ids:
+        errors.append(
+            "claim_review_scope.json claim_ids are not assigned to a design_coverage "
+            f"document group: {unmapped_scope_claim_ids}"
+        )
 
     if not manifest_path.is_file():
         errors.append("missing artifact: design_agent_manifest.json")
@@ -366,9 +447,10 @@ def run(args: argparse.Namespace) -> int:
         )
 
     expected_digests = {
-        "design_claims.jsonl": _digest(claims_path),
+        "design_claims.jsonl": claims_digest,
         "design_coverage.json": _digest(coverage_path),
         "design_agent_manifest.json": _digest(manifest_path),
+        "claim_review_scope.json": _digest(scope_path),
     }
     review_path = root / "design_claim_review.json"
     try:
@@ -391,6 +473,7 @@ def run(args: argparse.Namespace) -> int:
         errors.append("design_claim_review.json claim_reviews must be an array")
         claim_reviews = []
     reviewed_claim_ids: list[str] = []
+    accepted_reviewed_claim_ids: list[str] = []
     child_decisions: list[str] = []
     for index, item in enumerate(claim_reviews, start=1):
         identifier, decision = _validate_claim_review(
@@ -398,6 +481,8 @@ def run(args: argparse.Namespace) -> int:
         )
         if identifier:
             reviewed_claim_ids.append(identifier)
+            if decision == "accept":
+                accepted_reviewed_claim_ids.append(identifier)
         if decision:
             child_decisions.append(decision)
     reviewed_claim_set = set(reviewed_claim_ids)
@@ -406,12 +491,12 @@ def run(args: argparse.Namespace) -> int:
     })
     if duplicate_claim_reviews:
         errors.append(f"design_claim_review.json has duplicate claim reviews: {duplicate_claim_reviews}")
-    missing_claims = sorted(claim_ids - reviewed_claim_set)
-    extra_claims = sorted(reviewed_claim_set - claim_ids)
+    missing_claims = sorted(scope_claim_ids - reviewed_claim_set)
+    extra_claims = sorted(reviewed_claim_set - scope_claim_ids)
     if missing_claims:
         errors.append(f"design_claim_review.json missing claim reviews: {missing_claims}")
     if extra_claims:
-        errors.append(f"design_claim_review.json has unknown claim reviews: {extra_claims}")
+        errors.append(f"design_claim_review.json has out-of-scope claim reviews: {extra_claims}")
 
     group_reviews = review.get("group_reviews")
     if not isinstance(group_reviews, list):
@@ -432,12 +517,12 @@ def run(args: argparse.Namespace) -> int:
     })
     if duplicate_group_reviews:
         errors.append(f"design_claim_review.json has duplicate group reviews: {duplicate_group_reviews}")
-    missing_groups = sorted(group_ids - reviewed_group_set)
-    extra_groups = sorted(reviewed_group_set - group_ids)
+    missing_groups = sorted(scoped_group_ids - reviewed_group_set)
+    extra_groups = sorted(reviewed_group_set - scoped_group_ids)
     if missing_groups:
         errors.append(f"design_claim_review.json missing group reviews: {missing_groups}")
     if extra_groups:
-        errors.append(f"design_claim_review.json has unknown group reviews: {extra_groups}")
+        errors.append(f"design_claim_review.json has out-of-scope group reviews: {extra_groups}")
 
     overall_decision = _assessment(
         review.get("decision"), allowed=DECISIONS,
@@ -461,6 +546,10 @@ def run(args: argparse.Namespace) -> int:
         "decision": overall_decision,
         "repair_required": not errors and overall_decision == "repair",
         "input_digests": expected_digests,
+        "scope_digest": expected_digests["claim_review_scope.json"],
+        "accepted_claim_ids": sorted(
+            set(accepted_reviewed_claim_ids).intersection(scope_claim_ids)
+        ),
         "metrics": {
             "claims": len(claim_ids),
             "claim_reviews": len(claim_reviews),

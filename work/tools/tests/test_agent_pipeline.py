@@ -188,7 +188,10 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
                 "non_testable_reason": "",
             },
         })
-        task_lenses = lenses[(index - 1) * 2:index * 2]
+        task_lenses = (
+            lenses[index - 1::count]
+            if count >= 3 else lenses[(index - 1) * 2:index * 2]
+        )
         append(state / "investigation_tasks.jsonl", {
             "task_id": task_id,
             "session_id": workspace["session_id"],
@@ -200,12 +203,12 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
             "status": "complete",
             "defer_reason": "",
             "review_lenses": task_lenses,
-            "exploration_mode": contract["coverage_contract"]["exploration_modes"][(index - 1) % 3],
+            "exploration_mode": contract["coverage_contract"]["exploration_modes"][index % 3],
             "architecture_boundaries": ["BOUNDARY-API"],
             "implementation_planes": ["PLANE-SERVICE"],
             "parallel_path_ids": [],
             "risk_observation_ids": ["RISK-API-001"] if (
-                contract["coverage_contract"]["exploration_modes"][(index - 1) % 3]
+                contract["coverage_contract"]["exploration_modes"][index % 3]
                 == "code-to-design risk backtracking"
             ) else [],
         })
@@ -252,7 +255,10 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
             "finding_id": finding_id,
             "claim_id": claim_id,
             "decision": "confirm_contradiction",
-            "challenges": ["Could another reachable path enforce the claim?"],
+            "challenges": [
+                "Could another reachable path enforce the claim?",
+                "Could configuration or scope make the cited branch inapplicable?",
+            ],
             "checks_performed": ["Reviewed callers and adjacent implementation.", "Re-read the cited contract lines."],
             "review_context": "fresh_subagent",
             "dynamic_probe_review": {
@@ -331,12 +337,19 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
             "behavior_families": ["externally visible service contract"],
         }],
     })
+    ac.save_json(state / "claim_review_scope.json", {
+        "session_id": workspace["session_id"],
+        "round_id": "ROUND-001",
+        "design_claims_sha256": ac.sha256_file(state / "design_claims.jsonl"),
+        "claim_ids": [f"CLAIM-{index:03d}" for index in range(1, count + 1)],
+    })
     ac.save_json(state / "design_claim_review.json", {
         "session_id": workspace["session_id"],
         "input_digests": {
             "design_claims.jsonl": ac.sha256_file(state / "design_claims.jsonl"),
             "design_coverage.json": ac.sha256_file(state / "design_coverage.json"),
             "design_agent_manifest.json": ac.sha256_file(state / "design_agent_manifest.json"),
+            "claim_review_scope.json": ac.sha256_file(state / "claim_review_scope.json"),
         },
         "claim_reviews": [{
             "session_id": workspace["session_id"],
@@ -377,14 +390,18 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
         "decision": "accept",
         "summary": "All fixture claims and the document group passed design-only review.",
     })
+    lens_task_ids = {
+        lens: str(task["task_id"])
+        for task in tasks_for_templates for lens in task.get("review_lenses", [])
+    }
     ac.save_json(state / "semantic_coverage.json", {
         "session_id": workspace["session_id"],
         "lenses": [{
             "lens": lens,
             "disposition": "investigated",
             "evidence": "The service fixture exposes this concern at its public API boundary.",
-            "task_ids": [f"TASK-{index // 2 + 1:03d}"],
-            "finding_ids": [f"FINDING-TASK-{index // 2 + 1:03d}"],
+            "task_ids": [lens_task_ids.get(lens, "TASK-001")],
+            "finding_ids": [f"FINDING-{lens_task_ids.get(lens, 'TASK-001')}"],
             "design_group_refs": ["contract"],
             "boundary_refs": ["BOUNDARY-API"],
             "counterfactual": "",
@@ -419,7 +436,7 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
             "boundary_id": "BOUNDARY-API", "status": "investigated",
             "evidence": "All public service entry points were inspected.",
         }],
-        "remaining_high_priority_claims": [],
+        "remaining_scoped_claims": [],
         "deferred_claims": [],
         "false_positive_samples_rechecked": [f"FINDING-TASK-{index:03d}" for index in range(1, count + 1)],
         "next_round_tasks": [],
@@ -466,6 +483,16 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
             "report_sha256": ac.sha256_file(report_path),
             "ledger_sha256": ac.sha256_file(ledger_path),
         })
+    validation_commands = [
+        "architecture-check", "design-check", "claim-check", "task-check",
+    ]
+    if count >= 3:
+        validation_commands.append("coverage-check")
+    for command in validation_commands:
+        run_runner(
+            command, Path(workspace["code"]), Path(workspace["design"]),
+            Path(workspace["result"]), Path(workspace["logs"]),
+        )
 
 
 def attach_dynamic_probe(
@@ -603,6 +630,10 @@ def attach_dynamic_probe(
         "scope": str(state / "probes"), "decision": "auto_approved",
         "rationale": "The fixture probe is confined to a session-owned copy.",
     })
+    run_runner(
+        "coverage-check", Path(workspace["code"]), Path(workspace["design"]),
+        Path(workspace["result"]), Path(workspace["logs"]),
+    )
     return probe
 
 
@@ -621,14 +652,14 @@ def test_prepare_is_semantic_neutral_and_writes_agent_contract(workspace):
     assert "paths" not in design_manifest
     assert "code_root" not in json.dumps(design_manifest)
     assert contract["execution_model"] == "opencode-owned-model-driven-loop"
-    assert contract["contract_version"] == 10
+    assert contract["contract_version"] == 11
     assert contract["handoff_integrity"]["max_concurrent_subagent_tasks"] == 2
     assert len(contract["coverage_contract"]["exploration_modes"]) == 3
     assert "dynamic_probe" in contract["coverage_contract"]
     assert [phase["owner"] for phase in contract["phases"]][:9] == [
-        "orchestrator", "spec_analyst", "spec_critic", "risk_explorer",
-        "orchestrator", "code_investigator", "orchestrator_then_code_investigator",
-        "evidence_critic", "final_judge",
+        "orchestrator", "spec_analyst", "risk_explorer", "orchestrator_then_spec_critic",
+        "orchestrator", "code_investigator", "coverage_critic_then_orchestrator",
+        "orchestrator_then_code_investigator", "evidence_critic",
     ]
     assert (state / "risk_observations.jsonl").is_file()
     assert (state / "dynamic_probes.jsonl").is_file()
@@ -1204,6 +1235,23 @@ def test_finding_template_enforces_two_unmerged_items_and_failed_batch_lock(work
     populate_handoffs(workspace, count=4)
     state = workspace["state"]
     assert isinstance(state, Path)
+    tasks, _ = ac.load_jsonl(state / "investigation_tasks.jsonl")
+    original_findings, _ = ac.load_jsonl(state / "investigation_findings.jsonl")
+    for task in tasks:
+        task["status"] = "pending"
+    (state / "investigation_tasks.jsonl").write_text(
+        "".join(json.dumps(task) + "\n" for task in tasks), encoding="utf-8",
+    )
+    (state / "investigation_findings.jsonl").write_text("", encoding="utf-8")
+    rounds, _ = ac.load_jsonl(state / "investigation_rounds.jsonl")
+    rounds[0]["finding_ids"] = []
+    (state / "investigation_rounds.jsonl").write_text(
+        "".join(json.dumps(item) + "\n" for item in rounds), encoding="utf-8",
+    )
+    run_runner(
+        "task-check", Path(workspace["code"]), Path(workspace["design"]),
+        Path(workspace["result"]), Path(workspace["logs"]),
+    )
     template_root = state / "handoff-templates" / "investigators"
     for path in template_root.glob("*.json"):
         path.unlink()
@@ -1233,6 +1281,25 @@ def test_finding_template_enforces_two_unmerged_items_and_failed_batch_lock(work
         "validated_ids": ["FINDING-TASK-001", "FINDING-TASK-002"],
         "errors": [],
     })
+    for task in tasks[:2]:
+        task["status"] = "complete"
+    (state / "investigation_tasks.jsonl").write_text(
+        "".join(json.dumps(task) + "\n" for task in tasks), encoding="utf-8",
+    )
+    (state / "investigation_findings.jsonl").write_text(
+        "".join(json.dumps(item) + "\n" for item in original_findings[:2]),
+        encoding="utf-8",
+    )
+    rounds[0]["finding_ids"] = [
+        "FINDING-TASK-001", "FINDING-TASK-002",
+    ]
+    (state / "investigation_rounds.jsonl").write_text(
+        "".join(json.dumps(item) + "\n" for item in rounds), encoding="utf-8",
+    )
+    run_runner(
+        "task-check", Path(workspace["code"]), Path(workspace["design"]),
+        Path(workspace["result"]), Path(workspace["logs"]),
+    )
     assert generate("TASK-003").returncode == 0
 
     ac.save_json(state / "investigator_batch_gate.json", {
@@ -1336,8 +1403,9 @@ def test_finding_merge_rejects_missing_expected_batch_handoff_before_unlock(work
     assert recovered_report["deferred_ids"] == ["FINDING-TASK-002"]
     assert recovered_report["validated_ids"] == ["FINDING-TASK-001"]
     allowed = subprocess.run(blocked.args, text=True, capture_output=True)
-    assert allowed.returncode == 0, allowed.stdout + allowed.stderr
-    (templates / "TASK-003.json").unlink()
+    assert allowed.returncode == 3
+    assert "current passed task validation is required" in allowed.stdout
+    (templates / "TASK-003.json").unlink(missing_ok=True)
 
     finding_before = (state / "investigation_findings.jsonl").read_bytes()
     task_before = (state / "investigation_tasks.jsonl").read_bytes()
@@ -1580,6 +1648,93 @@ def test_full_handoff_review_report_and_gate(workspace):
     assert gate["checks"]["handoff_chain_complete"] is True
 
 
+def test_coverage_passed_is_not_closed_while_next_round_tasks_exist(workspace):
+    populate_handoffs(workspace)
+    state = workspace["state"]
+    assert isinstance(state, Path)
+    contract = ac.load_json(state / "agent_loop_contract.json")
+    coverage = ac.load_json(state / "coverage_audit.json")
+    coverage["next_round_tasks"] = [{
+        "claim_id": "CLAIM-001",
+        "question": "Recheck the claim through a different evidence path.",
+        "exploration_mode": "design-to-code obligation tracing",
+        "review_lenses": [contract["coverage_contract"]["portfolio_lenses"][0]],
+        "architecture_boundaries": ["BOUNDARY-API"],
+        "implementation_planes": ["PLANE-SERVICE"],
+        "parallel_path_ids": [],
+        "risk_observation_ids": [],
+        "priority_reason": "The coverage critic identified a concrete alternate-path gap.",
+    }]
+    ac.save_json(state / "coverage_audit.json", coverage)
+    run_runner(
+        "coverage-check", Path(workspace["code"]), Path(workspace["design"]),
+        Path(workspace["result"]), Path(workspace["logs"]),
+    )
+    trace = ac.load_json(Path(workspace["logs"]) / "trace" / "coverage_validation.json")
+    assert trace["passed"] is True
+    assert trace["closed"] is False
+    report = run_runner(
+        "report", Path(workspace["code"]), Path(workspace["design"]),
+        Path(workspace["result"]), Path(workspace["logs"]), check=False,
+    )
+    assert report.returncode != 0
+
+
+def test_unselected_high_claim_remains_design_index_not_mandatory_frontier(workspace):
+    populate_handoffs(workspace)
+    state = workspace["state"]
+    assert isinstance(state, Path)
+    append(state / "design_claims.jsonl", {
+        "claim_id": "CLAIM-INDEX-ONLY",
+        "session_id": workspace["session_id"],
+        "document": "Service contract",
+        "path": "contract.md",
+        "section": "Service contract",
+        "line_start": 3,
+        "line_end": 3,
+        "quote": "The service must reject negative amounts.",
+        "behavior": "Negative amounts are rejected.",
+        "behavior_family": "externally visible service contract",
+        "normative_strength": "mandatory",
+        "applicability": "service implementation",
+        "priority": "high",
+        "ambiguities": [],
+        "probe_oracle": {
+            "testability": "candidate",
+            "preconditions": ["The service accepts an amount input."],
+            "stimulus": "Call the service with a negative amount.",
+            "expected_observation": "The request is rejected.",
+            "non_testable_reason": "",
+        },
+    })
+    design_coverage = ac.load_json(state / "design_coverage.json")
+    design_coverage["document_groups"][0]["claim_ids"].append("CLAIM-INDEX-ONLY")
+    ac.save_json(state / "design_coverage.json", design_coverage)
+    scope = ac.load_json(state / "claim_review_scope.json")
+    scope["design_claims_sha256"] = ac.sha256_file(state / "design_claims.jsonl")
+    ac.save_json(state / "claim_review_scope.json", scope)
+    review = ac.load_json(state / "design_claim_review.json")
+    review["input_digests"] = {
+        "design_claims.jsonl": ac.sha256_file(state / "design_claims.jsonl"),
+        "design_coverage.json": ac.sha256_file(state / "design_coverage.json"),
+        "design_agent_manifest.json": ac.sha256_file(state / "design_agent_manifest.json"),
+        "claim_review_scope.json": ac.sha256_file(state / "claim_review_scope.json"),
+    }
+    ac.save_json(state / "design_claim_review.json", review)
+    coverage = ac.load_json(state / "coverage_audit.json")
+    coverage["claims_total"] = 5
+    ac.save_json(state / "coverage_audit.json", coverage)
+    for command in ("design-check", "claim-check", "task-check", "coverage-check"):
+        run_runner(
+            command, Path(workspace["code"]), Path(workspace["design"]),
+            Path(workspace["result"]), Path(workspace["logs"]),
+        )
+    trace = ac.load_json(Path(workspace["logs"]) / "trace" / "coverage_validation.json")
+    assert trace["passed"] is True
+    assert trace["closed"] is True
+    assert trace["metrics"]["scoped_claims"] == 4
+
+
 def test_complete_session_gate_can_be_replayed_in_isolation(workspace, tmp_path):
     populate_handoffs(workspace)
     run_runner("review", workspace["code"], workspace["design"], workspace["result"], workspace["logs"])
@@ -1596,6 +1751,23 @@ def test_complete_session_gate_can_be_replayed_in_isolation(workspace, tmp_path)
     assert ac.load_json(replay / "logs" / "trace" / "stage_replay_local.json")[
         "returncode"
     ] == 0
+
+
+def test_complete_coverage_stage_can_be_replayed_in_isolation(workspace, tmp_path):
+    populate_handoffs(workspace)
+    replay = tmp_path / "coverage-replay"
+    stage_replay.prepare_replay(
+        source_state=Path(workspace["state"]), replay_root=replay,
+        stage="coverage", run_local=True,
+    )
+
+    assert stage_replay.run_local(replay) == 0
+    assert ac.load_json(replay / "logs" / "trace" / "claim_review_validation.json")[
+        "passed"
+    ] is True
+    assert ac.load_json(replay / "logs" / "trace" / "coverage_validation.json")[
+        "passed"
+    ] is True
 
 
 def test_gate_revalidates_verdicts_instead_of_trusting_stale_validated_issues(workspace):
@@ -1618,6 +1790,26 @@ def test_gate_revalidates_verdicts_instead_of_trusting_stale_validated_issues(wo
     gate = ac.load_json(Path(workspace["logs"]) / "trace" / "final_gate.json")
     assert validated["confirmed"] == 3
     assert any("published finding IDs do not exactly match" in error for error in gate["errors"])
+
+
+def test_report_refuses_stale_evidence_validation_after_verdict_change(workspace):
+    populate_handoffs(workspace)
+    run_runner("review", workspace["code"], workspace["design"], workspace["result"], workspace["logs"])
+    state = workspace["state"]
+    assert isinstance(state, Path)
+    verdicts, errors = ac.load_jsonl(state / "agent_review_verdicts.jsonl")
+    assert errors == []
+    verdicts[0]["title"] = "Changed after evidence validation"
+    (state / "agent_review_verdicts.jsonl").write_text(
+        "".join(json.dumps(item) + "\n" for item in verdicts), encoding="utf-8",
+    )
+
+    proc = run_runner(
+        "report", workspace["code"], workspace["design"],
+        workspace["result"], workspace["logs"], check=False,
+    )
+    assert proc.returncode == 2
+    assert "evidence validation input digests are stale" in proc.stdout
 
 
 def test_gate_rejects_approval_policy_events_from_another_session(workspace):
@@ -1679,6 +1871,10 @@ def test_parallel_path_can_be_covered_by_linked_split_plane_tasks(workspace):
     tasks[0]["parallel_path_ids"] = ["PARALLEL-SERVICE-CONTRACT"]
     tasks[1]["parallel_path_ids"] = ["PARALLEL-SERVICE-CONTRACT"]
     tasks[1]["implementation_planes"] = ["PLANE-ALTERNATE"]
+    tasks[1]["exploration_mode"] = "code-to-design risk backtracking"
+    tasks[1]["risk_observation_ids"] = ["RISK-API-001"]
+    tasks[3]["exploration_mode"] = "capability-absence reconciliation"
+    tasks[3]["risk_observation_ids"] = []
     (state / "investigation_tasks.jsonl").write_text(
         "\n".join(json.dumps(item) for item in tasks) + "\n", encoding="utf-8"
     )
@@ -1711,6 +1907,11 @@ def test_parallel_path_can_be_covered_by_linked_split_plane_tasks(workspace):
         "report_sha256": ac.sha256_file(risk_report_path),
         "ledger_sha256": ac.sha256_file(state / "risk_observations.jsonl"),
     })
+    for command in ("architecture-check", "task-check", "coverage-check"):
+        run_runner(
+            command, Path(workspace["code"]), Path(workspace["design"]),
+            Path(workspace["result"]), Path(workspace["logs"]),
+        )
     run_runner("review", workspace["code"], workspace["design"], workspace["result"], workspace["logs"])
     run_runner("report", workspace["code"], workspace["design"], workspace["result"], workspace["logs"])
     run_runner("gate", workspace["code"], workspace["design"], workspace["result"], workspace["logs"])
@@ -1858,11 +2059,15 @@ def test_gate_rejects_one_finding_claiming_every_review_lens(workspace):
         "\n".join(json.dumps(item) for item in findings) + "\n", encoding="utf-8"
     )
     run_runner("review", workspace["code"], workspace["design"], workspace["result"], workspace["logs"])
-    run_runner("report", workspace["code"], workspace["design"], workspace["result"], workspace["logs"])
+    report = run_runner(
+        "report", workspace["code"], workspace["design"], workspace["result"],
+        workspace["logs"], check=False,
+    )
+    assert report.returncode != 0
     proc = run_runner("gate", workspace["code"], workspace["design"], workspace["result"], workspace["logs"], check=False)
     assert proc.returncode == 1
     gate = ac.load_json(workspace["logs"] / "trace" / "final_gate.json")
-    assert sum("focused to at most three" in error for error in gate["errors"]) >= 2
+    assert any("focused to at most three" in error for error in gate["errors"])
 
 
 def test_gate_rejects_semantic_lens_refs_unrelated_to_task_and_finding(workspace):
@@ -1875,7 +2080,11 @@ def test_gate_rejects_semantic_lens_refs_unrelated_to_task_and_finding(workspace
         entry["finding_ids"] = ["FINDING-TASK-001"]
     ac.save_json(state / "semantic_coverage.json", semantic)
     run_runner("review", workspace["code"], workspace["design"], workspace["result"], workspace["logs"])
-    run_runner("report", workspace["code"], workspace["design"], workspace["result"], workspace["logs"])
+    report = run_runner(
+        "report", workspace["code"], workspace["design"], workspace["result"],
+        workspace["logs"], check=False,
+    )
+    assert report.returncode != 0
     proc = run_runner(
         "gate", workspace["code"], workspace["design"], workspace["result"], workspace["logs"], check=False
     )
@@ -1901,7 +2110,11 @@ def test_gate_rejects_uninvestigated_parallel_execution_path(workspace):
     }]
     ac.save_json(state / "architecture_map.json", architecture)
     run_runner("review", workspace["code"], workspace["design"], workspace["result"], workspace["logs"])
-    run_runner("report", workspace["code"], workspace["design"], workspace["result"], workspace["logs"])
+    report = run_runner(
+        "report", workspace["code"], workspace["design"], workspace["result"],
+        workspace["logs"], check=False,
+    )
+    assert report.returncode != 0
     proc = run_runner(
         "gate", workspace["code"], workspace["design"], workspace["result"], workspace["logs"], check=False
     )
@@ -1910,7 +2123,7 @@ def test_gate_rejects_uninvestigated_parallel_execution_path(workspace):
     assert any("parallel behavior path" in error for error in gate["errors"])
 
 
-def test_gate_rejects_actionable_uninvestigated_high_priority_claim(workspace):
+def test_gate_rejects_actionable_uninvestigated_scoped_claim(workspace):
     populate_handoffs(workspace)
     state = workspace["state"]
     assert isinstance(state, Path)
@@ -1940,6 +2153,10 @@ def test_gate_rejects_actionable_uninvestigated_high_priority_claim(workspace):
     design_coverage = ac.load_json(state / "design_coverage.json")
     design_coverage["document_groups"][0]["claim_ids"].append("CLAIM-UNINVESTIGATED")
     ac.save_json(state / "design_coverage.json", design_coverage)
+    scope = ac.load_json(state / "claim_review_scope.json")
+    scope["claim_ids"].append("CLAIM-UNINVESTIGATED")
+    scope["design_claims_sha256"] = ac.sha256_file(state / "design_claims.jsonl")
+    ac.save_json(state / "claim_review_scope.json", scope)
     claim_review = ac.load_json(state / "design_claim_review.json")
     claim_review["claim_reviews"].append({
         "session_id": workspace["session_id"],
@@ -1964,11 +2181,12 @@ def test_gate_rejects_actionable_uninvestigated_high_priority_claim(workspace):
         "design_claims.jsonl": ac.sha256_file(state / "design_claims.jsonl"),
         "design_coverage.json": ac.sha256_file(state / "design_coverage.json"),
         "design_agent_manifest.json": ac.sha256_file(state / "design_agent_manifest.json"),
+        "claim_review_scope.json": ac.sha256_file(state / "claim_review_scope.json"),
     }
     ac.save_json(state / "design_claim_review.json", claim_review)
     coverage = ac.load_json(state / "coverage_audit.json")
     coverage["claims_total"] = 5
-    coverage["remaining_high_priority_claims"] = [{
+    coverage["remaining_scoped_claims"] = [{
         "claim_id": "CLAIM-UNINVESTIGATED",
         "reason": "Outside the completed risk-diverse portfolio for this bounded review.",
     }]
@@ -1986,14 +2204,18 @@ def test_gate_rejects_actionable_uninvestigated_high_priority_claim(workspace):
     }]
     ac.save_json(state / "coverage_audit.json", coverage)
     run_runner("review", workspace["code"], workspace["design"], workspace["result"], workspace["logs"])
-    run_runner("report", workspace["code"], workspace["design"], workspace["result"], workspace["logs"])
+    report = run_runner(
+        "report", workspace["code"], workspace["design"], workspace["result"],
+        workspace["logs"], check=False,
+    )
+    assert report.returncode != 0
     proc = run_runner(
         "gate", workspace["code"], workspace["design"], workspace["result"], workspace["logs"], check=False
     )
     assert proc.returncode == 1
     gate = ac.load_json(workspace["logs"] / "trace" / "final_gate.json")
     assert gate["passed"] is False
-    assert any("high-priority design claims remain uninvestigated" in error for error in gate["errors"])
+    assert any("scoped design claims remain uninvestigated" in error for error in gate["errors"])
 
 
 def test_gate_rejects_unsupported_inapplicable_lens(workspace):
@@ -2008,7 +2230,11 @@ def test_gate_rejects_unsupported_inapplicable_lens(workspace):
     })
     ac.save_json(state / "semantic_coverage.json", semantic)
     run_runner("review", workspace["code"], workspace["design"], workspace["result"], workspace["logs"])
-    run_runner("report", workspace["code"], workspace["design"], workspace["result"], workspace["logs"])
+    report = run_runner(
+        "report", workspace["code"], workspace["design"], workspace["result"],
+        workspace["logs"], check=False,
+    )
+    assert report.returncode != 0
     proc = run_runner("gate", workspace["code"], workspace["design"], workspace["result"], workspace["logs"], check=False)
     assert proc.returncode == 1
     gate = ac.load_json(workspace["logs"] / "trace" / "final_gate.json")

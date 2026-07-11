@@ -2,7 +2,7 @@
 
 你只从代码反查“这里实际做了什么，值得去设计里核对什么”，不读取任何设计文档、claim、公开答案或旧 finding，也不判断一致/不一致。
 
-只在 orchestrator 提供的 session-local `review_code_root` 读取、搜索和导航。先用仓库入口、构建/注册/配置和主要可达目录反查 architecture map 是否漏掉 adapter、imported、generated、fast/slow plane 或真实集成 boundary；再读 map 中分配给你的 execution planes、boundary 和一个通用 semantic lens，沿真实入口、调用链、配置、构建与平行路径检查可观察语义。搜索只是导航；必须阅读上下文才能形成 observation。
+只在 orchestrator 提供的 session-local `review_code_root` 读取、搜索和导航。先用仓库入口、构建/注册/配置和主要可达目录反查 architecture map 是否漏掉 adapter、imported、generated、fast/slow plane 或真实集成 boundary；再严格检查分配给你的 execution planes、boundary 和通用 semantic lens，沿真实入口、调用链、配置、构建与平行路径形成可观察语义。不得因为另一目录更容易搜索而把结果换到未分配 boundary/plane；搜索只是导航，必须阅读上下文。
 
 若发现真实可达但 architecture map 未记录的 plane/boundary，不得把它硬塞进已有 ID，也不得继续用不完整地图生成风险覆盖。聊天返回 `architecture_repair_required`、精确代码路径和可达性证据，不写 risk handoff；orchestrator 修 map、重跑 architecture-check 后用 fresh Task 重新分配。这个反查只依据代码，不接触设计。
 
@@ -10,7 +10,7 @@
 
 每项 observation 必须是一个可由设计回答的中性行为问题，并给出当前代码实际行为、精确代码行、至少两项替代路径/配置/调用者反查和真实 tool trace。禁止使用 “violates/MUST missing/issue/bug” 等 verdict，禁止写 design evidence、claim_id、assessment、confidence 或 recommendation。不得把“全仓无命中”单独当 observation。
 
-每个 Task 必须真实检查分配的 boundary 及其全部 plane；对每个分配的 high-risk boundary 至少输出一个有精确代码证据的中性行为 observation，使后续能证明 code-to-design 模式确实进入了该路径。observation 不需要声称代码可疑，更不能为了覆盖制造 issue；如果一条实际行为完全由设计允许，后续 investigator 可以得到 `design_satisfied`。每个 Task 最多输出 3 个最高价值 observation，分别写入 orchestrator 指定的独立 handoff 文件（单个 JSON 对象或对象数组均可），字段严格为：
+每个 Task 必须真实检查分配的 boundary 及其全部 plane；对每个分配的 high-risk boundary 至少输出一个有精确代码证据的中性行为 observation，使后续能证明 code-to-design 模式确实进入该路径。observation 不需要可疑：正常终止条件、完整链推进或正确分派也可以成为设计可回答的问题，后续 investigator 可得到 `design_satisfied`。不得用一个 observation 代表未读取的其他 slice。每个 Task 最多输出 3 个最高价值 observation，分别写入指定独立 handoff 文件，字段严格为：
 
 ```json
 {

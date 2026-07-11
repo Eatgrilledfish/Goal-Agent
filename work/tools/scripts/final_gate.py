@@ -16,7 +16,7 @@ import stage_artifact_validator as sav
 import verdict_validator as vv
 
 
-MIN_CONFIRMED = 4
+FINAL_CONFIRMED_QUOTA = 4
 MAX_SECONDS = 21600
 
 
@@ -247,6 +247,25 @@ def run(args: argparse.Namespace) -> int:
     if design_validation.get("input_digests") != expected_design_digests:
         errors.append("design-validation trace is stale for current design artifacts")
 
+    scope_path = root / "claim_review_scope.json"
+    scope = ac.load_json(scope_path) if scope_path.is_file() else {}
+    raw_scope_claim_ids = scope.get("claim_ids", []) if isinstance(scope, dict) else []
+    scoped_claim_ids = {
+        str(value) for value in raw_scope_claim_ids
+        if isinstance(value, str) and value
+    }
+    if not scope_path.is_file():
+        errors.append("claim_review_scope.json is missing")
+    elif scope.get("session_id") != session_id:
+        errors.append("claim review scope does not match current session")
+    elif scope.get("design_claims_sha256") != expected_design_digests["design_claims.jsonl"]:
+        errors.append("claim review scope is stale for current design claims")
+    if not scoped_claim_ids or len(scoped_claim_ids) != len(raw_scope_claim_ids):
+        errors.append("claim review scope must contain unique non-empty claim IDs")
+    unknown_scoped_claims = scoped_claim_ids - set(claims)
+    if unknown_scoped_claims:
+        errors.append(f"claim review scope contains unknown claims: {sorted(unknown_scoped_claims)}")
+
     claim_review_path = root / "design_claim_review.json"
     claim_review = ac.load_json(claim_review_path) if claim_review_path.is_file() else {}
     claim_review_validation_path = trace_root / "claim_review_validation.json"
@@ -259,11 +278,12 @@ def run(args: argparse.Namespace) -> int:
         "design_coverage.json": expected_design_digests["design_coverage.json"],
         "design_agent_manifest.json": ac.sha256_file(root / "design_agent_manifest.json")
         if (root / "design_agent_manifest.json").is_file() else "",
+        "claim_review_scope.json": ac.sha256_file(scope_path) if scope_path.is_file() else "",
     }
     if not (root / "design_agent_manifest.json").is_file():
         errors.append("design_agent_manifest.json is missing")
     if claim_review.get("decision") != "accept":
-        errors.append("fresh spec critic has not accepted the current design claims")
+        errors.append("fresh spec critic has not accepted the current scoped design claims")
     if claim_review.get("input_digests") != expected_claim_review_digests:
         errors.append("design claim review is stale for current design artifacts")
     if (
@@ -272,6 +292,19 @@ def run(args: argparse.Namespace) -> int:
         or claim_review_validation.get("input_digests") != expected_claim_review_digests
     ):
         errors.append("passed digest-bound claim-review validation trace is missing or stale")
+    accepted_claim_ids = {
+        str(value) for value in claim_review_validation.get("accepted_claim_ids", [])
+        if isinstance(value, str) and value
+    }
+    if accepted_claim_ids != scoped_claim_ids:
+        errors.append("accepted claim-review scope does not match current claim_review_scope.json")
+    used_claim_ids = {
+        str(item.get("claim_id") or "") for item in [*tasks.values(), *findings.values()]
+        if item.get("claim_id")
+    }
+    unreviewed_used_claims = used_claim_ids - accepted_claim_ids
+    if unreviewed_used_claims:
+        errors.append(f"tasks/findings use claims outside accepted review scope: {sorted(unreviewed_used_claims)}")
 
     def stage_validation_current(stage: str) -> bool:
         path = trace_root / f"{stage}_validation.json"
@@ -281,12 +314,30 @@ def run(args: argparse.Namespace) -> int:
         expected_inputs, expected_combined = sav._input_digests(
             root, sav._stage_inputs(root, stage),
         )
-        return (
+        current = (
             report.get("passed") is True
             and report.get("session_id") == session_id
             and report.get("input_digests") == expected_inputs
             and report.get("combined_input_sha256") == expected_combined
         )
+        if stage == "coverage":
+            current = current and report.get("closed") is True
+        return current
+
+    evidence_validation_path = trace_root / "evidence_validation.json"
+    evidence_validation = (
+        ac.load_json(evidence_validation_path)
+        if evidence_validation_path.is_file() else {}
+    )
+    evidence_validation_current = (
+        evidence_validation.get("passed") is True
+        and evidence_validation.get("session_id") == session_id
+        and evidence_validation.get("input_digests") == vv.evidence_input_digests(root)
+        and evidence_validation.get("validated_issues_sha256")
+        == (ac.sha256_file(validated_path) if validated_path.is_file() else "")
+    )
+    if not evidence_validation_current:
+        errors.append("passed digest-bound evidence validation trace is missing or stale")
 
     for stage in ("architecture", "task", "coverage"):
         if not stage_validation_current(stage):
@@ -947,13 +998,11 @@ def run(args: argparse.Namespace) -> int:
                 f"parallel behavior path {path_id or index} lacks linked task/finding evidence "
                 f"for planes {sorted(missing_planes)}"
             )
-    uninvestigated_high_claims: list[str] = []
-    for claim_id, claim in claims.items():
-        if claim.get("priority") != "high":
-            continue
+    uninvestigated_scoped_claims: list[str] = []
+    for claim_id in sorted(scoped_claim_ids):
         completed = [task for task in tasks_by_claim.get(claim_id, []) if task.get("status") == "complete"]
         if not completed or not any(findings_by_task.get(str(task.get("task_id") or "")) for task in completed):
-            uninvestigated_high_claims.append(claim_id)
+            uninvestigated_scoped_claims.append(claim_id)
 
     semantic_path = root / "semantic_coverage.json"
     semantic = ac.load_json(semantic_path) if semantic_path.exists() else {}
@@ -1060,7 +1109,7 @@ def run(args: argparse.Namespace) -> int:
     coverage_required = [
         "session_id", "design_documents_reviewed", "claims_total", "claims_investigated",
         "rounds_completed", "exploration_modes_completed", "document_groups_total", "document_groups_accounted",
-        "code_areas_reviewed", "architecture_boundaries", "remaining_high_priority_claims",
+        "code_areas_reviewed", "architecture_boundaries", "remaining_scoped_claims",
         "deferred_claims", "stop_reason",
     ]
     for field in coverage_required:
@@ -1093,29 +1142,37 @@ def run(args: argparse.Namespace) -> int:
             errors.extend(defer_errors)
             continue
         deferred_ids.add(claim_id)
-    remaining_high_entries = coverage.get("remaining_high_priority_claims", [])
-    remaining_high_ids: set[str] = set()
-    for remaining in remaining_high_entries:
+    remaining_scoped_entries = coverage.get("remaining_scoped_claims", [])
+    remaining_scoped_ids: set[str] = set()
+    for remaining in remaining_scoped_entries:
         if not isinstance(remaining, dict):
-            errors.append("coverage audit remaining_high_priority_claims entries must be objects")
+            errors.append("coverage audit remaining_scoped_claims entries must be objects")
             continue
         claim_id = str(remaining.get("claim_id") or "")
         if not claim_id or not remaining.get("reason"):
-            errors.append("coverage audit remaining high-priority claim needs claim_id and reason")
+            errors.append("coverage audit remaining scoped claim needs claim_id and reason")
             continue
-        remaining_high_ids.add(claim_id)
-        if claim_id not in claims or claims[claim_id].get("priority") != "high":
-            errors.append(f"coverage audit has unknown/non-high remaining claim {claim_id}")
-    actionable_high_claims = set(uninvestigated_high_claims) - deferred_ids
-    if remaining_high_ids != actionable_high_claims:
+        remaining_scoped_ids.add(claim_id)
+        if claim_id not in scoped_claim_ids:
+            errors.append(f"coverage audit has out-of-scope remaining claim {claim_id}")
+    actionable_scoped_claims = set(uninvestigated_scoped_claims) - deferred_ids
+    if remaining_scoped_ids != actionable_scoped_claims:
         errors.append(
-            "coverage audit remaining_high_priority_claims does not match uninvestigated, "
-            "non-deferred high-priority claims"
+            "coverage audit remaining_scoped_claims does not match uninvestigated, "
+            "non-deferred scoped claims"
         )
-    if actionable_high_claims:
+    if actionable_scoped_claims:
         errors.append(
-            f"high-priority design claims remain uninvestigated: {sorted(actionable_high_claims)}"
+            f"scoped design claims remain uninvestigated: {sorted(actionable_scoped_claims)}"
         )
+    if coverage.get("next_round_tasks"):
+        errors.append("coverage audit still contains next_round_tasks")
+    unfinished_tasks = sorted(
+        task_id for task_id, task in tasks.items()
+        if task.get("status") in {"pending", "in_progress"}
+    )
+    if unfinished_tasks:
+        errors.append(f"investigation frontier still has unfinished tasks: {unfinished_tasks}")
     try:
         if int(coverage.get("claims_total", -1)) != len(claims):
             errors.append("coverage audit claims_total does not match design_claims.jsonl")
@@ -1168,8 +1225,11 @@ def run(args: argparse.Namespace) -> int:
         errors.append("session started_at missing")
     if elapsed_seconds > MAX_SECONDS:
         errors.append(f"review elapsed time {elapsed_seconds}s exceeds {MAX_SECONDS}s")
-    if confirmed_count < MIN_CONFIRMED:
-        errors.append(f"only {confirmed_count} unique validated confirmed findings; target is at least {MIN_CONFIRMED}")
+    if confirmed_count < FINAL_CONFIRMED_QUOTA:
+        errors.append(
+            f"only {confirmed_count} unique validated confirmed findings; final quota is "
+            f"{FINAL_CONFIRMED_QUOTA}"
+        )
 
     checks.update({
         "result_artifacts_exist": all((result_root / name).is_file() for name in ("issues.json", "issues.jsonl", "00-summary.md")),
@@ -1181,13 +1241,17 @@ def run(args: argparse.Namespace) -> int:
         "stage_validations_current": all(
             stage_validation_current(stage) for stage in ("architecture", "task", "coverage")
         ),
-        "confirmed_count_target": confirmed_count >= MIN_CONFIRMED,
+        "confirmed_quota_met": confirmed_count >= FINAL_CONFIRMED_QUOTA,
         "only_confirmed_published": all(issue.get("status") == "confirmed" for issue in issues),
         "handoff_chain_complete": not any("handoff" in error for error in errors),
         "coverage_complete": (
             bool(coverage)
             and not missing_groups
             and len(coverage_groups) == len(expected_groups)
+            and not coverage.get("next_round_tasks")
+            and not actionable_scoped_claims
+            and not unfinished_tasks
+            and stage_validation_current("coverage")
         ),
         "semantic_lenses_covered": (
             bool(expected_lenses)
@@ -1204,10 +1268,7 @@ def run(args: argparse.Namespace) -> int:
         "target_roots_unchanged": not target_integrity_errors,
         "review_snapshots_unchanged": not review_integrity_errors,
         "within_time_budget": elapsed_seconds <= MAX_SECONDS,
-        "evidence_validation_passed": (
-            (trace_root / "evidence_validation.json").is_file()
-            and ac.load_json(trace_root / "evidence_validation.json").get("passed") is True
-        ),
+        "evidence_validation_passed": evidence_validation_current,
     })
     for name, passed in checks.items():
         if not passed:
@@ -1220,7 +1281,7 @@ def run(args: argparse.Namespace) -> int:
         "checks": checks,
         "metrics": {
             "confirmed": confirmed_count,
-            "minimum_confirmed": MIN_CONFIRMED,
+            "final_confirmed_quota": FINAL_CONFIRMED_QUOTA,
             "elapsed_seconds": elapsed_seconds,
             "maximum_seconds": MAX_SECONDS,
             "design_document_groups": len(expected_groups),

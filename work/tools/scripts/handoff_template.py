@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import agent_common as ac
+import stage_artifact_validator as sav
 
 
 def _valid_deferred_task(task: dict[str, Any]) -> bool:
@@ -39,6 +40,73 @@ def _index_jsonl(path: Path, key: str) -> dict[str, dict[str, Any]]:
     if len(indexed) != len(values):
         raise ValueError(f"{path.name} has missing or duplicate {key}")
     return indexed
+
+
+def _current_task_validation(state_root: Path) -> tuple[dict[str, Any], list[str]]:
+    errors: list[str] = []
+    manifest_path = state_root / "workspace_manifest.json"
+    state_path = state_root / "agent_loop_state.json"
+    try:
+        manifest = ac.load_json(manifest_path)
+        state = ac.load_json(state_path)
+    except (OSError, json.JSONDecodeError) as exc:
+        return {}, [f"cannot load prepared session for task validation: {exc}"]
+    log_root_value = manifest.get("paths", {}).get("log_root") if isinstance(manifest, dict) else None
+    if not isinstance(log_root_value, str) or not log_root_value:
+        return {}, ["workspace_manifest.json lacks paths.log_root"]
+    trace_path = Path(log_root_value).resolve() / "trace" / "task_validation.json"
+    if not trace_path.is_file():
+        return {}, [f"current passed task validation is missing: {trace_path}"]
+    try:
+        trace = ac.load_json(trace_path)
+    except (OSError, json.JSONDecodeError) as exc:
+        return {}, [f"cannot load task validation trace: {exc}"]
+    if not isinstance(trace, dict):
+        return {}, ["task validation trace must be an object"]
+    expected_inputs, expected_combined = sav._input_digests(
+        state_root, sav._stage_inputs(state_root, "task"),
+    )
+    session_id = str(state.get("session_id") or "") if isinstance(state, dict) else ""
+    if trace.get("stage") != "task":
+        errors.append("task validation trace has the wrong stage")
+    if trace.get("passed") is not True:
+        errors.append("task validation trace has not passed")
+    if trace.get("session_id") != session_id:
+        errors.append("task validation trace belongs to a different session")
+    if trace.get("input_digests") != expected_inputs:
+        errors.append("task validation trace is stale for current frontier inputs")
+    if trace.get("combined_input_sha256") != expected_combined:
+        errors.append("task validation combined digest is stale")
+    return trace, errors
+
+
+def _ordered_rounds(path: Path) -> list[dict[str, Any]]:
+    values, errors = ac.load_jsonl(path)
+    if errors:
+        raise ValueError("; ".join(errors))
+    return values
+
+
+def _eligible_pending_frontier(
+    tasks: dict[str, dict[str, Any]], rounds: list[dict[str, Any]],
+) -> tuple[str, list[str]]:
+    """Return at most two ordered pending tasks from the earliest open round."""
+    for index, round_item in enumerate(rounds, start=1):
+        round_id = str(round_item.get("round_id") or f"#{index}")
+        task_ids = round_item.get("task_ids")
+        if not isinstance(task_ids, list):
+            raise ValueError(f"investigation round {round_id} task_ids must be an array")
+        ordered = [str(task_id) for task_id in task_ids if isinstance(task_id, str) and task_id]
+        open_tasks = [
+            task_id for task_id in ordered
+            if task_id in tasks and tasks[task_id].get("status") in {"pending", "in_progress"}
+        ]
+        if not open_tasks:
+            continue
+        active = sum(tasks[task_id].get("status") == "in_progress" for task_id in open_tasks)
+        pending = [task_id for task_id in open_tasks if tasks[task_id].get("status") == "pending"]
+        return round_id, pending[:max(0, 2 - active)]
+    return "", []
 
 
 def finding_template(task: dict[str, Any], claim: dict[str, Any]) -> dict[str, Any]:
@@ -111,23 +179,34 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args(argv)
     tasks_path = Path(args.tasks).resolve()
+    claims_path = Path(args.claims).resolve()
     output = Path(args.output).resolve()
     state_root = tasks_path.parent
     template_root = (state_root / "handoff-templates" / "investigators").resolve()
+    if tasks_path != (state_root / "investigation_tasks.jsonl").resolve():
+        print(json.dumps({
+            "passed": False,
+            "error": "--tasks must be the canonical state investigation_tasks.jsonl",
+        }))
+        return 2
+    if claims_path != (state_root / "design_claims.jsonl").resolve():
+        print(json.dumps({
+            "passed": False,
+            "error": "--claims must be the canonical state design_claims.jsonl",
+        }))
+        return 2
     if output.parent != template_root:
         print(json.dumps({
             "passed": False,
             "error": f"output must be directly under {template_root}",
         }))
         return 2
-    if output.exists() and not args.force:
-        print(json.dumps({"passed": False, "error": "output already exists"}))
+    if output.name != f"{args.task_id}.json":
+        print(json.dumps({
+            "passed": False,
+            "error": f"output filename must be {args.task_id}.json",
+        }))
         return 2
-    try:
-        tasks = _index_jsonl(tasks_path, "task_id")
-    except (OSError, ValueError) as exc:
-        print(json.dumps({"passed": False, "error": str(exc)}))
-        return 1
     gate_path = state_root / "investigator_batch_gate.json"
     gate = ac.load_json(gate_path) if gate_path.is_file() else {}
     if gate and gate.get("passed") is not True:
@@ -137,6 +216,23 @@ def main(argv: list[str] | None = None) -> int:
             "gate": str(gate_path),
         }))
         return 3
+    if output.exists() and not args.force:
+        print(json.dumps({"passed": False, "error": "output already exists"}))
+        return 2
+    _, validation_errors = _current_task_validation(state_root)
+    if validation_errors:
+        print(json.dumps({
+            "passed": False,
+            "error": "current passed task validation is required before template creation",
+            "validation_errors": validation_errors,
+        }))
+        return 3
+    try:
+        tasks = _index_jsonl(tasks_path, "task_id")
+        rounds = _ordered_rounds(state_root / "investigation_rounds.jsonl")
+    except (OSError, ValueError) as exc:
+        print(json.dumps({"passed": False, "error": str(exc)}))
+        return 1
     validated_ids = set(gate.get("validated_ids", [])) if isinstance(gate, dict) else set()
     deferred_ids = {
         f"FINDING-{task_id}" for task_id, task in tasks.items()
@@ -160,10 +256,20 @@ def main(argv: list[str] | None = None) -> int:
         }))
         return 3
     try:
-        claims = _index_jsonl(Path(args.claims).resolve(), "claim_id")
+        claims = _index_jsonl(claims_path, "claim_id")
         task = tasks.get(args.task_id)
         if not task:
             raise ValueError(f"unknown task_id: {args.task_id}")
+        round_id, eligible_task_ids = _eligible_pending_frontier(tasks, rounds)
+        if task.get("status") != "pending":
+            raise ValueError(
+                f"task {args.task_id} is not pending and cannot receive a new investigator template"
+            )
+        if args.task_id not in eligible_task_ids:
+            raise ValueError(
+                f"task {args.task_id} is outside the ordered two-task frontier for earliest "
+                f"open round {round_id or '(none)'}; eligible={eligible_task_ids}"
+            )
         claim = claims.get(str(task.get("claim_id") or ""))
         if not claim:
             raise ValueError(f"task references unknown claim_id: {task.get('claim_id')}")
