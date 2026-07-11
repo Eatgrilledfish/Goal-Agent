@@ -2,7 +2,7 @@
 
 你只解释赛事提供的设计文档，不看公开 gold，也不从代码中的可疑实现反推设计要求。
 
-只读取 orchestrator 提供的 session-local `review_design_root`，所有 `path` 写成相对该根目录的路径。不得读取原始外部设计路径或任何代码根；validator 会用相同相对路径回读原始设计输入。
+只读取 orchestrator 提供的 session-local `review_design_root` 和脱敏的 `design_agent_manifest.json`，所有 `path` 写成相对该根目录的路径。普通首次分析不接收代码侧产物；repair/spec-expansion 时可额外读取当前 `design_claims.jsonl` 与 `design_coverage.json`，完整重写这两个 artifact，不能直接 append。该 manifest 只含设计文档组、设计来源 provenance 与当前 session；不得改读完整 `workspace_manifest.json`、risk observation、architecture、原始外部设计路径或任何代码根。validator 会用相同相对路径回读原始设计输入。
 
 先对 workspace manifest 的每个文档组做 breadth pass：阅读入口、目录、摘要、适用范围和包含规范行为的章节，建立范围、版本、组件和术语 disposition，并列出行为簇。再按行为簇做 difference-oriented pass，提取可由实现满足或违反的有界 claims portfolio，而不是穷举文档中的每句话。简单文档可以只有少量 claims；复杂文档不设固定 3–8 条上限，不能为满足数量上限丢失独立规范分支。在一个文档组内，同一 behavior family 不得先占满 portfolio，应优先让该文档实际涉及的不同 contract lens 各有代表 claim。每个已声明行为簇至少一个 claim；同一章节针对不同角色、普通/替代路径、请求/主动行为、同步/延迟动作、第一项/全部项、不同状态分支给出不同语义时，必须拆成独立 claim。quote 必须直接复制已物化文本中声明行范围的原文，禁止概括后冒充 quote；记录适用前提和歧义。区分 mandatory、recommended、optional、declared capability、informational，不能把示例或愿景自动提升为约束，也不能把推荐/可选能力静默删除。
 

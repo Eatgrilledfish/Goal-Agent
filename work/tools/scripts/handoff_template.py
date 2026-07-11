@@ -11,6 +11,26 @@ from typing import Any
 import agent_common as ac
 
 
+def _valid_deferred_task(task: dict[str, Any]) -> bool:
+    raw_evidence = task.get("defer_evidence")
+    evidence = raw_evidence if isinstance(raw_evidence, dict) else {}
+    attempts = evidence.get("attempts")
+    return (
+        task.get("status") == "deferred"
+        and bool(task.get("defer_reason"))
+        and evidence.get("kind") in {"provider_failure", "tool_failure"}
+        and isinstance(attempts, list)
+        and len(attempts) >= 2
+        and all(
+            isinstance(attempt, dict)
+            and attempt.get("attempt_id")
+            and attempt.get("outcome") == "failed"
+            and attempt.get("evidence")
+            for attempt in attempts
+        )
+    )
+
+
 def _index_jsonl(path: Path, key: str) -> dict[str, dict[str, Any]]:
     values, errors = ac.load_jsonl(path)
     if errors:
@@ -103,6 +123,11 @@ def main(argv: list[str] | None = None) -> int:
     if output.exists() and not args.force:
         print(json.dumps({"passed": False, "error": "output already exists"}))
         return 2
+    try:
+        tasks = _index_jsonl(tasks_path, "task_id")
+    except (OSError, ValueError) as exc:
+        print(json.dumps({"passed": False, "error": str(exc)}))
+        return 1
     gate_path = state_root / "investigator_batch_gate.json"
     gate = ac.load_json(gate_path) if gate_path.is_file() else {}
     if gate and gate.get("passed") is not True:
@@ -113,6 +138,10 @@ def main(argv: list[str] | None = None) -> int:
         }))
         return 3
     validated_ids = set(gate.get("validated_ids", [])) if isinstance(gate, dict) else set()
+    deferred_ids = {
+        f"FINDING-{task_id}" for task_id, task in tasks.items()
+        if _valid_deferred_task(task)
+    }
     existing_ids: set[str] = set()
     if template_root.is_dir():
         for path in template_root.glob("*.json"):
@@ -122,7 +151,7 @@ def main(argv: list[str] | None = None) -> int:
                 continue
             if isinstance(value, dict) and value.get("finding_id"):
                 existing_ids.add(str(value["finding_id"]))
-    unresolved = existing_ids - validated_ids
+    unresolved = existing_ids - validated_ids - deferred_ids
     if len(unresolved) >= 2 and f"FINDING-{args.task_id}" not in unresolved:
         print(json.dumps({
             "passed": False,
@@ -131,7 +160,6 @@ def main(argv: list[str] | None = None) -> int:
         }))
         return 3
     try:
-        tasks = _index_jsonl(tasks_path, "task_id")
         claims = _index_jsonl(Path(args.claims).resolve(), "claim_id")
         task = tasks.get(args.task_id)
         if not task:

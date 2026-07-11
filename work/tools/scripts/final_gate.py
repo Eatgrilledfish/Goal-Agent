@@ -10,6 +10,9 @@ from pathlib import Path
 from typing import Any
 
 import agent_common as ac
+import handoff_merge as hm
+import report_writer as rw
+import stage_artifact_validator as sav
 import verdict_validator as vv
 
 
@@ -17,9 +20,22 @@ MIN_CONFIRMED = 4
 MAX_SECONDS = 21600
 
 
-def _index(path: Path, key: str) -> tuple[dict[str, dict], list[str]]:
+def _index(
+    path: Path, key: str, *, allow_revisions: bool = False,
+) -> tuple[dict[str, dict], list[str]]:
     values, errors = ac.load_jsonl(path)
-    return {str(value.get(key)): value for value in values if value.get(key)}, errors
+    indexed: dict[str, dict] = {}
+    seen: set[str] = set()
+    for line_number, value in enumerate(values, start=1):
+        identifier = str(value.get(key) or "")
+        if not identifier:
+            errors.append(f"{path.name}:{line_number}: missing {key}")
+            continue
+        if identifier in seen and not allow_revisions:
+            errors.append(f"{path.name}:{line_number}: duplicate {key} {identifier}")
+        seen.add(identifier)
+        indexed[identifier] = value
+    return indexed, errors
 
 
 def _check_issue(issue: dict[str, Any], session_id: str, result_root: Path) -> list[str]:
@@ -110,6 +126,15 @@ def run(args: argparse.Namespace) -> int:
     if result.get("session_id") != session_id:
         errors.append("issues.json session does not match current session")
     issues = result.get("issues") if isinstance(result.get("issues"), list) else []
+    issue_ids = [str(issue.get("issue_id") or "") for issue in issues]
+    finding_id_list = [str(issue.get("finding_id") or "") for issue in issues]
+    report_paths = [str(issue.get("report_path") or "") for issue in issues]
+    if len(set(issue_ids)) != len(issue_ids):
+        errors.append("issues.json contains duplicate issue_id values")
+    if len(set(finding_id_list)) != len(finding_id_list):
+        errors.append("issues.json contains duplicate finding_id values")
+    if len(set(report_paths)) != len(report_paths):
+        errors.append("issues.json contains duplicate report_path values")
     published_finding_ids = {
         str(issue.get("finding_id")) for issue in issues if issue.get("finding_id")
     }
@@ -118,22 +143,229 @@ def run(args: argparse.Namespace) -> int:
     }
     if result.get("summary", {}).get("total") != len(issues):
         errors.append("issues.json summary.total does not match issue count")
-    for issue in issues:
+    jsonl_issues, jsonl_errors = ac.load_jsonl(result_root / "issues.jsonl")
+    errors.extend(jsonl_errors)
+    if jsonl_issues != issues:
+        errors.append("issues.jsonl does not exactly match issues.json issues")
+
+    validated_path = root / "validated_issues.json"
+    validated = ac.load_json(validated_path) if validated_path.is_file() else {}
+    validated_confirmed = [
+        issue for issue in validated.get("issues", [])
+        if isinstance(issue, dict) and issue.get("status") == "confirmed"
+    ]
+    validated_probable = [
+        issue for issue in validated.get("issues", [])
+        if isinstance(issue, dict) and issue.get("status") == "probable"
+    ]
+    validated_by_finding = {
+        str(issue.get("finding_id")): issue
+        for issue in validated_confirmed if issue.get("finding_id")
+    }
+    if len(validated_by_finding) != len(validated_confirmed):
+        errors.append("validated_issues.json contains missing or duplicate confirmed finding IDs")
+    if published_finding_ids != set(validated_by_finding):
+        errors.append("published finding IDs do not exactly match validated confirmed findings")
+    confirmed_count = len(published_finding_ids.intersection(validated_by_finding))
+    summary = result.get("summary") if isinstance(result.get("summary"), dict) else {}
+    expected_summary = {
+        "total": len(validated_confirmed),
+        "confirmed": len(validated_confirmed),
+        "probable": len(validated_probable),
+        "high_confidence": sum(
+            float(issue.get("confidence") or 0) >= 0.8 for issue in validated_confirmed
+        ),
+    }
+    if summary != expected_summary:
+        errors.append("issues.json summary does not match validated issue counts")
+    for index, issue in enumerate(issues, start=1):
+        finding_id = str(issue.get("finding_id") or "")
+        expected = validated_by_finding.get(finding_id)
+        core = {key: value for key, value in issue.items() if key not in {"issue_id", "report_path"}}
+        if expected is not None and core != expected:
+            errors.append(f"{issue.get('issue_id', '?')}: published issue differs from validated issue")
+        expected_issue_id = f"ISSUE-{index:03d}"
+        expected_report_path = result_root / f"{index:02d}-{ac.slugify(str(issue.get('title') or 'issue'))}.md"
+        if issue.get("issue_id") != expected_issue_id:
+            errors.append(f"{issue.get('issue_id', '?')}: issue_id does not match deterministic report order")
+        if str(issue.get("report_path") or "") != str(expected_report_path):
+            errors.append(f"{issue.get('issue_id', '?')}: report_path does not match deterministic report order")
         errors.extend(_check_issue(issue, session_id, result_root))
+        if expected_report_path.is_file() and expected_report_path.read_text(encoding="utf-8") != rw.render_issue(issue):
+            errors.append(f"{issue.get('issue_id', '?')}: single-issue Markdown does not match published JSON")
+    summary_path = result_root / "00-summary.md"
+    if summary_path.is_file() and summary_path.read_text(encoding="utf-8") != rw.render_summary(result, len(validated_probable)):
+        errors.append("00-summary.md does not match published JSON")
 
     claims, claim_errors = _index(root / "design_claims.jsonl", "claim_id")
+    risks, risk_errors = _index(root / "risk_observations.jsonl", "observation_id")
     tasks, task_errors = _index(root / "investigation_tasks.jsonl", "task_id")
     findings, finding_errors = _index(root / "investigation_findings.jsonl", "finding_id")
     critiques, critic_errors = _index(root / "critic_reviews.jsonl", "finding_id")
     probes, probe_errors = _index(root / "dynamic_probes.jsonl", "probe_id")
-    verdicts, verdict_errors = _index(root / "agent_review_verdicts.jsonl", "finding_id")
+    verdicts, verdict_errors = _index(
+        root / "agent_review_verdicts.jsonl", "finding_id", allow_revisions=True,
+    )
     rounds, round_errors = _index(root / "investigation_rounds.jsonl", "round_id")
-    errors.extend(claim_errors + task_errors + finding_errors + critic_errors + probe_errors + verdict_errors)
+    errors.extend(
+        claim_errors + risk_errors + task_errors + finding_errors
+        + critic_errors + probe_errors + verdict_errors
+    )
     errors.extend(round_errors)
+    reviewable_finding_ids = {
+        finding_id for finding_id, finding in findings.items()
+        if finding.get("assessment") in {"contradiction_supported", "uncertain"}
+    }
+    if not reviewable_finding_ids.issubset(critiques) or set(critiques) - set(findings):
+        missing = sorted(reviewable_finding_ids - set(critiques))
+        extra = sorted(set(critiques) - set(findings))
+        errors.append(
+            "critic coverage does not cover every reviewable finding: "
+            f"missing={missing}, extra={extra}"
+        )
+    if set(verdicts) != set(findings):
+        missing = sorted(set(findings) - set(verdicts))
+        extra = sorted(set(verdicts) - set(findings))
+        errors.append(
+            "final-judge verdict coverage does not exactly match findings: "
+            f"missing={missing}, extra={extra}"
+        )
     probe_integrity_errors: list[str] = []
     investigated_claim_ids = {
         str(finding.get("claim_id")) for finding in findings.values() if finding.get("claim_id")
     }
+
+    design_validation = ac.load_json(trace_root / "design_validation.json") if (trace_root / "design_validation.json").is_file() else {}
+    if design_validation.get("passed") is not True:
+        errors.append("passed design-validation trace is missing")
+    expected_design_digests = {
+        "design_claims.jsonl": ac.sha256_file(root / "design_claims.jsonl"),
+        "design_coverage.json": ac.sha256_file(root / "design_coverage.json")
+        if (root / "design_coverage.json").is_file() else "",
+        "workspace_manifest.json": ac.sha256_file(root / "workspace_manifest.json"),
+    }
+    if design_validation.get("input_digests") != expected_design_digests:
+        errors.append("design-validation trace is stale for current design artifacts")
+
+    claim_review_path = root / "design_claim_review.json"
+    claim_review = ac.load_json(claim_review_path) if claim_review_path.is_file() else {}
+    claim_review_validation_path = trace_root / "claim_review_validation.json"
+    claim_review_validation = (
+        ac.load_json(claim_review_validation_path)
+        if claim_review_validation_path.is_file() else {}
+    )
+    expected_claim_review_digests = {
+        "design_claims.jsonl": expected_design_digests["design_claims.jsonl"],
+        "design_coverage.json": expected_design_digests["design_coverage.json"],
+        "design_agent_manifest.json": ac.sha256_file(root / "design_agent_manifest.json")
+        if (root / "design_agent_manifest.json").is_file() else "",
+    }
+    if not (root / "design_agent_manifest.json").is_file():
+        errors.append("design_agent_manifest.json is missing")
+    if claim_review.get("decision") != "accept":
+        errors.append("fresh spec critic has not accepted the current design claims")
+    if claim_review.get("input_digests") != expected_claim_review_digests:
+        errors.append("design claim review is stale for current design artifacts")
+    if (
+        claim_review_validation.get("passed") is not True
+        or claim_review_validation.get("decision") != "accept"
+        or claim_review_validation.get("input_digests") != expected_claim_review_digests
+    ):
+        errors.append("passed digest-bound claim-review validation trace is missing or stale")
+
+    def stage_validation_current(stage: str) -> bool:
+        path = trace_root / f"{stage}_validation.json"
+        if not path.is_file():
+            return False
+        report = ac.load_json(path)
+        expected_inputs, expected_combined = sav._input_digests(
+            root, sav._stage_inputs(root, stage),
+        )
+        return (
+            report.get("passed") is True
+            and report.get("session_id") == session_id
+            and report.get("input_digests") == expected_inputs
+            and report.get("combined_input_sha256") == expected_combined
+        )
+
+    for stage in ("architecture", "task", "coverage"):
+        if not stage_validation_current(stage):
+            errors.append(f"passed digest-bound {stage} validation trace is missing or stale")
+
+    def valid_merge_report(path: Path, expected_ids: set[str], ledger_path: Path) -> bool:
+        if not path.is_file() or not ledger_path.is_file():
+            return False
+        report = ac.load_json(path)
+        return (
+            report.get("passed") is True
+            and set(report.get("validated_ids", [])) == expected_ids
+            and report.get("ledger_sha256") == ac.sha256_file(ledger_path)
+        )
+
+    def current_merge_reports(
+        artifact_type: str, expected_ids: set[str], ledger_path: Path,
+    ) -> set[Path]:
+        reports: set[Path] = set()
+        for path in trace_root.glob("*merge*.json"):
+            if not path.is_file():
+                continue
+            report = ac.load_json(path)
+            if report.get("artifact_type") != artifact_type:
+                continue
+            if valid_merge_report(path, expected_ids, ledger_path):
+                reports.add(path.resolve())
+        return reports
+
+    merge_requirements = {
+        "task": (set(tasks), root / "investigation_tasks.jsonl"),
+        "finding": (set(findings), root / "investigation_findings.jsonl"),
+        "risk": (set(risks), root / "risk_observations.jsonl"),
+        "critic": (set(critiques), root / "critic_reviews.jsonl"),
+        "probe": (set(probes), root / "dynamic_probes.jsonl"),
+    }
+    valid_report_paths: dict[str, set[Path]] = {}
+    for artifact_type, (expected_ids, ledger_path) in merge_requirements.items():
+        paths = current_merge_reports(artifact_type, expected_ids, ledger_path)
+        valid_report_paths[artifact_type] = paths
+        if expected_ids and not paths:
+            errors.append(
+                f"{artifact_type} handoff merge trace does not validate the current ledger"
+            )
+    run_ledger, run_ledger_errors = ac.load_jsonl(root / "agent_run_ledger.jsonl")
+    errors.extend(run_ledger_errors)
+    def valid_merge_event(
+        artifact_type: str, expected_ids: set[str], ledger_path: Path, report_paths: set[Path],
+    ) -> bool:
+        if not ledger_path.is_file():
+            return False
+        ledger_sha256 = ac.sha256_file(ledger_path)
+        for event in run_ledger:
+            if not (
+                event.get("event") == "handoff_merge"
+                and event.get("status") == "complete"
+                and event.get("session_id") == session_id
+                and event.get("artifact_type") == artifact_type
+                and set(event.get("validated_ids", [])) == expected_ids
+                and event.get("ledger_sha256") == ledger_sha256
+            ):
+                continue
+            report_path = ac.contained_path(trace_root, str(event.get("report") or ""))
+            if report_path not in report_paths or not report_path or not report_path.is_file():
+                continue
+            if event.get("report_sha256") == ac.sha256_file(report_path):
+                return True
+        return False
+
+    provenance_requirements = [
+        (artifact_type, expected_ids, ledger_path, valid_report_paths[artifact_type])
+        for artifact_type, (expected_ids, ledger_path) in merge_requirements.items()
+        if expected_ids
+    ]
+    for artifact_type, expected_ids, ledger_path, report_paths in provenance_requirements:
+        if not valid_merge_event(artifact_type, expected_ids, ledger_path, report_paths):
+            errors.append(
+                f"session ledger lacks a current, digest-bound {artifact_type} handoff merge event"
+            )
 
     for issue in issues:
         claim_id = str(issue.get("claim_id") or "")
@@ -274,6 +506,24 @@ def run(args: argparse.Namespace) -> int:
         for group in manifest.get("design", {}).get("document_groups", [])
         if group.get("document_key")
     }
+    approvals, approval_errors = ac.load_jsonl(root / "approval_events.jsonl")
+    errors.extend(approval_errors)
+    session_approvals = [item for item in approvals if item.get("session_id") == session_id]
+    approval_decisions = {
+        (str(item.get("action") or ""), str(item.get("decision") or ""))
+        for item in session_approvals
+    }
+    required_approval_decisions = {
+        ("review_snapshot_read", "auto_approved"),
+        ("session_artifact_write", "auto_approved"),
+        ("target_source_write", "denied"),
+        ("external_side_effect", "external_approval_required"),
+    }
+    missing_policy_decisions = required_approval_decisions - approval_decisions
+    if missing_policy_decisions:
+        errors.append(f"approval policy trace is incomplete: {sorted(missing_policy_decisions)}")
+    if probes and ("focused_dynamic_probe", "auto_approved") not in approval_decisions:
+        errors.append("dynamic probes lack an isolated-probe approval event")
     source_manifest = manifest.get("design", {}).get("source_manifest")
     if isinstance(source_manifest, dict):
         remote_locations = {
@@ -282,8 +532,6 @@ def run(args: argparse.Namespace) -> int:
             if isinstance(item, dict) and item.get("kind") == "url" and item.get("location")
         }
         if remote_locations:
-            approvals, approval_errors = ac.load_jsonl(root / "approval_events.jsonl")
-            errors.extend(approval_errors)
             approved_locations = {
                 str(item.get("scope"))
                 for item in approvals
@@ -391,12 +639,18 @@ def run(args: argparse.Namespace) -> int:
         if isinstance(item, dict) and item.get("plane_id")
     }
     parallel_behavior_paths: list[dict[str, Any]] = []
+    parallel_path_ids: set[str] = set()
     for index, item in enumerate(architecture.get("parallel_behavior_paths", []), start=1):
         label = f"architecture parallel_behavior_paths[{index}]"
         if not isinstance(item, dict):
             errors.append(f"{label}: must be an object")
             continue
-        errors.extend(_require_fields(item, ("behavior", "plane_ids", "evidence"), label))
+        errors.extend(_require_fields(item, ("path_id", "behavior", "plane_ids", "evidence"), label))
+        path_id = str(item.get("path_id") or "")
+        if path_id in parallel_path_ids:
+            errors.append(f"{label}: duplicate path_id {path_id}")
+        elif path_id:
+            parallel_path_ids.add(path_id)
         plane_ids = {str(value) for value in item.get("plane_ids", []) if value}
         if len(plane_ids) < 2:
             errors.append(f"{label}: must identify at least two implementation planes")
@@ -404,6 +658,50 @@ def run(args: argparse.Namespace) -> int:
         if unknown:
             errors.append(f"{label}: unknown implementation planes {sorted(unknown)}")
         parallel_behavior_paths.append(item)
+
+    for observation_id, observation in risks.items():
+        errors.extend(hm.validate_item(
+            observation, artifact_type="risk", identifier=observation_id,
+            session_id=session_id, code_root=code_root,
+        ))
+        errors.extend(hm._context_errors(
+            observation, "risk", root, f"risk ({observation_id})",
+        ))
+    high_risk_boundary_ids = {
+        str(item.get("boundary_id"))
+        for item in architecture.get("integration_boundaries", [])
+        if isinstance(item, dict) and item.get("risk") == "high" and item.get("boundary_id")
+    }
+    observed_risk_boundaries = {
+        str(boundary)
+        for observation in risks.values()
+        for boundary in observation.get("architecture_boundaries", [])
+        if boundary
+    }
+    missing_risk_boundaries = high_risk_boundary_ids - observed_risk_boundaries
+    if missing_risk_boundaries:
+        errors.append(
+            "high-risk architecture boundaries lack code-only risk observations: "
+            f"{sorted(missing_risk_boundaries)}"
+        )
+    required_parallel_planes = {
+        str(plane_id)
+        for item in parallel_behavior_paths
+        for plane_id in item.get("plane_ids", [])
+        if plane_id
+    }
+    observed_risk_planes = {
+        str(plane_id)
+        for observation in risks.values()
+        for plane_id in observation.get("implementation_planes", [])
+        if plane_id
+    }
+    missing_risk_planes = required_parallel_planes - observed_risk_planes
+    if missing_risk_planes:
+        errors.append(
+            "parallel implementation planes lack code-only risk observations: "
+            f"{sorted(missing_risk_planes)}"
+        )
 
     for task_id, task in tasks.items():
         errors.extend(_require_fields(task, (
@@ -413,6 +711,7 @@ def run(args: argparse.Namespace) -> int:
         ), f"investigation task {task_id}"))
         if task.get("session_id") != session_id:
             errors.append(f"investigation task {task_id}: session does not match current session")
+        errors.extend(hm.validate_task_defer_evidence(task, f"investigation task {task_id}"))
         if str(task.get("claim_id") or "") not in claims:
             errors.append(f"investigation task {task_id}: unknown claim_id")
         if task.get("exploration_mode") not in expected_modes:
@@ -428,8 +727,56 @@ def run(args: argparse.Namespace) -> int:
         unknown_planes = set(task.get("implementation_planes", [])) - architecture_plane_ids
         if unknown_planes:
             errors.append(f"investigation task {task_id}: unknown implementation planes {sorted(unknown_planes)}")
+        task_parallel_ids = task.get("parallel_path_ids", [])
+        if not isinstance(task_parallel_ids, list):
+            errors.append(f"investigation task {task_id}: parallel_path_ids must be an array")
+        else:
+            unknown_parallel = set(task_parallel_ids) - parallel_path_ids
+            if unknown_parallel:
+                errors.append(
+                    f"investigation task {task_id}: unknown parallel path IDs {sorted(unknown_parallel)}"
+                )
+        task_risk_ids = task.get("risk_observation_ids", [])
+        if not isinstance(task_risk_ids, list):
+            errors.append(f"investigation task {task_id}: risk_observation_ids must be an array")
+        else:
+            unknown_risks = set(task_risk_ids) - set(risks)
+            if unknown_risks:
+                errors.append(
+                    f"investigation task {task_id}: unknown risk observation IDs {sorted(unknown_risks)}"
+                )
+            if task.get("exploration_mode") == "code-to-design risk backtracking" and not task_risk_ids:
+                errors.append(
+                    f"investigation task {task_id}: code-to-design mode lacks a risk observation"
+                )
+            for risk_id in set(task_risk_ids).intersection(risks):
+                observation = risks[risk_id]
+                if not set(task.get("architecture_boundaries", [])).intersection(
+                    observation.get("architecture_boundaries", [])
+                ):
+                    errors.append(
+                        f"investigation task {task_id}: risk observation {risk_id} shares no boundary"
+                    )
+                if not set(task.get("implementation_planes", [])).intersection(
+                    observation.get("implementation_planes", [])
+                ):
+                    errors.append(
+                        f"investigation task {task_id}: risk observation {risk_id} shares no plane"
+                    )
 
     for finding_id, finding in findings.items():
+        try:
+            template = hm._load_template(
+                root / "handoff-templates" / "investigators", finding, required=True,
+            )
+        except (OSError, ValueError) as exc:
+            template = None
+            errors.append(f"investigation finding {finding_id}: {exc}")
+        errors.extend(hm.validate_item(
+            finding, artifact_type="finding", identifier=finding_id,
+            session_id=session_id, code_root=code_root, design_root=design_root,
+            template=template if isinstance(template, dict) else None,
+        ))
         if finding_id not in published_finding_ids:
             continue
         required_finding_fields = (
@@ -497,7 +844,6 @@ def run(args: argparse.Namespace) -> int:
         if round_item.get("session_id") != session_id:
             errors.append(f"investigation round {round_id}: session does not match current session")
         modes = set(round_item.get("exploration_modes", []))
-        observed_modes.update(modes)
         if modes - expected_modes:
             errors.append(f"investigation round {round_id}: unknown exploration modes {sorted(modes - expected_modes)}")
         for value, known, label in (
@@ -512,6 +858,45 @@ def run(args: argparse.Namespace) -> int:
             unknown = set(value) - known
             if unknown:
                 errors.append(f"investigation round {round_id}: unknown {label} {sorted(unknown)}")
+        round_claims = {str(value) for value in round_item.get("claim_ids", []) if value}
+        round_tasks = {str(value) for value in round_item.get("task_ids", []) if value}
+        round_findings = {str(value) for value in round_item.get("finding_ids", []) if value}
+        for mode in modes.intersection(expected_modes):
+            matching_tasks = {
+                task_id for task_id in round_tasks.intersection(tasks)
+                if tasks[task_id].get("exploration_mode") == mode
+            }
+            if not matching_tasks:
+                errors.append(
+                    f"investigation round {round_id}: exploration mode {mode!r} "
+                    "has no task with that mode"
+                )
+                continue
+            evidenced_tasks = {
+                str(findings[finding_id].get("task_id") or "")
+                for finding_id in round_findings.intersection(findings)
+            }
+            completed = {
+                task_id for task_id in matching_tasks
+                if tasks[task_id].get("status") == "complete"
+            }
+            if not completed.intersection(evidenced_tasks):
+                errors.append(
+                    f"investigation round {round_id}: exploration mode {mode!r} "
+                    "lacks a completed task/finding"
+                )
+                continue
+            observed_modes.add(mode)
+        for task_id in round_tasks.intersection(tasks):
+            claim_id = str(tasks[task_id].get("claim_id") or "")
+            if claim_id not in round_claims:
+                errors.append(f"investigation round {round_id}: task {task_id} claim is absent from claim_ids")
+        for finding_id in round_findings.intersection(findings):
+            finding = findings[finding_id]
+            if str(finding.get("task_id") or "") not in round_tasks:
+                errors.append(f"investigation round {round_id}: finding {finding_id} task is absent from task_ids")
+            if str(finding.get("claim_id") or "") not in round_claims:
+                errors.append(f"investigation round {round_id}: finding {finding_id} claim is absent from claim_ids")
     missing_modes = sorted(expected_modes - observed_modes)
     if missing_modes:
         errors.append(f"investigation rounds missing exploration modes: {missing_modes}")
@@ -522,18 +907,46 @@ def run(args: argparse.Namespace) -> int:
         tasks_by_claim.setdefault(str(task.get("claim_id") or ""), []).append(task)
     for finding in findings.values():
         findings_by_task.setdefault(str(finding.get("task_id") or ""), []).append(finding)
+    for task_id, linked_findings in findings_by_task.items():
+        task = tasks.get(task_id)
+        if task is None:
+            errors.append(f"finding ledger references unknown task {task_id!r}")
+            continue
+        if len(linked_findings) != 1:
+            errors.append(f"investigation task {task_id} has {len(linked_findings)} findings; expected one")
+        if task.get("status") != "complete":
+            errors.append(f"investigation task {task_id} has a finding but is not complete")
+    for task_id, task in tasks.items():
+        linked_count = len(findings_by_task.get(task_id, []))
+        if task.get("status") == "complete" and linked_count != 1:
+            errors.append(
+                f"completed investigation task {task_id} has {linked_count} findings; expected one"
+            )
+        if task.get("status") in {"pending", "in_progress", "deferred"} and linked_count:
+            errors.append(
+                f"non-complete investigation task {task_id} must not have a finding"
+            )
     for index, item in enumerate(parallel_behavior_paths, start=1):
+        path_id = str(item.get("path_id") or "")
         required_planes = {str(value) for value in item.get("plane_ids", []) if value}
-        covered_planes: set[str] = set()
-        for task_id, task in tasks.items():
-            if task.get("status") != "complete" or not findings_by_task.get(task_id):
-                continue
-            covered_planes.update(required_planes.intersection(set(task.get("implementation_planes", []))))
-        missing_parallel_planes = required_planes - covered_planes
-        # The coverage critic may account for a plane across several rounds; the
-        # strict published evidence chain is checked separately. Keep this
-        # calculation for audit metrics without turning every unselected plane
-        # into a fatal error for a time-bounded review.
+        covering_tasks = {
+            task_id: task for task_id, task in tasks.items()
+            if task.get("status") == "complete"
+            and findings_by_task.get(task_id)
+            and path_id in task.get("parallel_path_ids", [])
+        }
+        covered_planes = {
+            str(plane_id)
+            for task in covering_tasks.values()
+            for plane_id in task.get("implementation_planes", [])
+            if plane_id in required_planes
+        }
+        missing_planes = required_planes - covered_planes
+        if missing_planes:
+            errors.append(
+                f"parallel behavior path {path_id or index} lacks linked task/finding evidence "
+                f"for planes {sorted(missing_planes)}"
+            )
     uninvestigated_high_claims: list[str] = []
     for claim_id, claim in claims.items():
         if claim.get("priority") != "high":
@@ -580,6 +993,54 @@ def run(args: argparse.Namespace) -> int:
         for finding_id in lens_findings:
             if finding_id not in findings:
                 errors.append(f"semantic coverage {lens}: unknown finding_id {finding_id}")
+        if disposition == "investigated":
+            referenced_tasks = {task_id: tasks[task_id] for task_id in lens_tasks if task_id in tasks}
+            referenced_findings = {
+                finding_id: findings[finding_id]
+                for finding_id in lens_findings if finding_id in findings
+            }
+            linked_task_ids = {
+                str(finding.get("task_id") or "") for finding in referenced_findings.values()
+            }
+            for task_id, task in referenced_tasks.items():
+                if task.get("status") != "complete":
+                    errors.append(f"semantic coverage {lens}: task {task_id} is not complete")
+                if lens not in task.get("review_lenses", []):
+                    errors.append(f"semantic coverage {lens}: task {task_id} does not declare this lens")
+                if task_id not in linked_task_ids:
+                    errors.append(f"semantic coverage {lens}: task {task_id} has no linked finding")
+            for finding_id, finding in referenced_findings.items():
+                task_id = str(finding.get("task_id") or "")
+                task = referenced_tasks.get(task_id)
+                if task is None:
+                    errors.append(f"semantic coverage {lens}: finding {finding_id} is not linked to a listed task")
+                    continue
+                if lens not in finding.get("review_lenses", []):
+                    errors.append(f"semantic coverage {lens}: finding {finding_id} does not declare this lens")
+                if str(task.get("claim_id") or "") != str(finding.get("claim_id") or ""):
+                    errors.append(f"semantic coverage {lens}: task/finding claim mismatch for {finding_id}")
+            task_boundaries = {
+                str(boundary)
+                for task in referenced_tasks.values()
+                for boundary in task.get("architecture_boundaries", []) if boundary
+            }
+            uncovered_boundaries = set(boundary_refs) - task_boundaries
+            if uncovered_boundaries:
+                errors.append(
+                    f"semantic coverage {lens}: boundary_refs lack linked task evidence "
+                    f"{sorted(uncovered_boundaries)}"
+                )
+            task_groups = {
+                str(Path(str(claims[str(task.get('claim_id'))].get("path") or "")).with_suffix("")).lower()
+                for task in referenced_tasks.values()
+                if str(task.get("claim_id") or "") in claims
+            }
+            uncovered_groups = set(design_refs) - task_groups
+            if uncovered_groups:
+                errors.append(
+                    f"semantic coverage {lens}: design_group_refs lack linked claim evidence "
+                    f"{sorted(uncovered_groups)}"
+                )
 
     lens_use_counts: dict[str, int] = {}
     for entry in lens_entries.values():
@@ -615,13 +1076,46 @@ def run(args: argparse.Namespace) -> int:
             errors.append("coverage audit deferred_claims entries must be objects")
             continue
         claim_id = str(deferred.get("claim_id") or "")
-        if not claim_id or not deferred.get("reason"):
-            errors.append("coverage audit deferred claim needs claim_id and reason")
+        task_id = str(deferred.get("task_id") or "")
+        if not claim_id or not task_id or not deferred.get("reason"):
+            errors.append("coverage audit deferred claim needs claim_id, task_id, and reason")
             continue
-        deferred_ids.add(claim_id)
         claim = claims.get(claim_id)
         if not claim:
             errors.append(f"coverage audit defers unknown claim {claim_id}")
+            continue
+        task = tasks.get(task_id)
+        if not task or str(task.get("claim_id") or "") != claim_id:
+            errors.append(f"coverage audit deferred claim {claim_id} lacks its linked task")
+            continue
+        defer_errors = hm.validate_task_defer_evidence(task, f"coverage deferred task {task_id}")
+        if defer_errors:
+            errors.extend(defer_errors)
+            continue
+        deferred_ids.add(claim_id)
+    remaining_high_entries = coverage.get("remaining_high_priority_claims", [])
+    remaining_high_ids: set[str] = set()
+    for remaining in remaining_high_entries:
+        if not isinstance(remaining, dict):
+            errors.append("coverage audit remaining_high_priority_claims entries must be objects")
+            continue
+        claim_id = str(remaining.get("claim_id") or "")
+        if not claim_id or not remaining.get("reason"):
+            errors.append("coverage audit remaining high-priority claim needs claim_id and reason")
+            continue
+        remaining_high_ids.add(claim_id)
+        if claim_id not in claims or claims[claim_id].get("priority") != "high":
+            errors.append(f"coverage audit has unknown/non-high remaining claim {claim_id}")
+    actionable_high_claims = set(uninvestigated_high_claims) - deferred_ids
+    if remaining_high_ids != actionable_high_claims:
+        errors.append(
+            "coverage audit remaining_high_priority_claims does not match uninvestigated, "
+            "non-deferred high-priority claims"
+        )
+    if actionable_high_claims:
+        errors.append(
+            f"high-priority design claims remain uninvestigated: {sorted(actionable_high_claims)}"
+        )
     try:
         if int(coverage.get("claims_total", -1)) != len(claims):
             errors.append("coverage audit claims_total does not match design_claims.jsonl")
@@ -655,6 +1149,16 @@ def run(args: argparse.Namespace) -> int:
             errors.append(f"high-risk architecture boundary is not covered: {boundary_id}")
         elif item.get("status") != "investigated" or not item.get("evidence"):
             errors.append(f"architecture boundary {boundary_id} lacks status/evidence")
+        linked_tasks = [
+            task_id for task_id, task in tasks.items()
+            if task.get("status") == "complete"
+            and boundary_id in task.get("architecture_boundaries", [])
+            and findings_by_task.get(task_id)
+        ]
+        if not linked_tasks:
+            errors.append(
+                f"high-risk architecture boundary lacks completed task/finding evidence: {boundary_id}"
+            )
 
     started_at = str(state.get("started_at") or "")
     elapsed_seconds = 0
@@ -664,13 +1168,20 @@ def run(args: argparse.Namespace) -> int:
         errors.append("session started_at missing")
     if elapsed_seconds > MAX_SECONDS:
         errors.append(f"review elapsed time {elapsed_seconds}s exceeds {MAX_SECONDS}s")
-    if len(issues) < MIN_CONFIRMED:
-        errors.append(f"only {len(issues)} confirmed findings; target is at least {MIN_CONFIRMED}")
+    if confirmed_count < MIN_CONFIRMED:
+        errors.append(f"only {confirmed_count} unique validated confirmed findings; target is at least {MIN_CONFIRMED}")
 
     checks.update({
         "result_artifacts_exist": all((result_root / name).is_file() for name in ("issues.json", "issues.jsonl", "00-summary.md")),
         "preflight_passed": not preflight_problems,
-        "confirmed_count_target": len(issues) >= MIN_CONFIRMED,
+        "design_claim_review_passed": (
+            claim_review.get("decision") == "accept"
+            and claim_review_validation.get("passed") is True
+        ),
+        "stage_validations_current": all(
+            stage_validation_current(stage) for stage in ("architecture", "task", "coverage")
+        ),
+        "confirmed_count_target": confirmed_count >= MIN_CONFIRMED,
         "only_confirmed_published": all(issue.get("status") == "confirmed" for issue in issues),
         "handoff_chain_complete": not any("handoff" in error for error in errors),
         "coverage_complete": (
@@ -684,6 +1195,9 @@ def run(args: argparse.Namespace) -> int:
             and len(lens_entries) == len(expected_lenses)
         ),
         "architecture_mapped": bool(architecture) and "integration_boundaries" in architecture,
+        "risk_backtracking_complete": (
+            bool(risks) and not missing_risk_boundaries and not missing_risk_planes
+        ),
         "investigation_round_recorded": bool(rounds),
         "exploration_modes_complete": bool(expected_modes) and not missing_modes,
         "dynamic_probe_integrity": not probe_integrity_errors,
@@ -705,12 +1219,13 @@ def run(args: argparse.Namespace) -> int:
         "passed": passed,
         "checks": checks,
         "metrics": {
-            "confirmed": len(issues),
+            "confirmed": confirmed_count,
             "minimum_confirmed": MIN_CONFIRMED,
             "elapsed_seconds": elapsed_seconds,
             "maximum_seconds": MAX_SECONDS,
             "design_document_groups": len(expected_groups),
             "design_claims": len(claims),
+            "risk_observations": len(risks),
             "investigation_rounds": len(rounds),
             "investigation_tasks": len(tasks),
             "investigation_findings": len(findings),

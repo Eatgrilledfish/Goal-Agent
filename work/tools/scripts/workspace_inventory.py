@@ -13,6 +13,7 @@ import os
 import shutil
 import sys
 from collections import Counter
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -21,9 +22,12 @@ import agent_common as ac
 
 ARTIFACT_NAMES = {
     "architecture_map": "architecture_map.json",
+    "design_agent_manifest": "design_agent_manifest.json",
     "design_coverage": "design_coverage.json",
+    "design_claim_review": "design_claim_review.json",
     "semantic_coverage": "semantic_coverage.json",
     "design_claims": "design_claims.jsonl",
+    "risk_observations": "risk_observations.jsonl",
     "rounds": "investigation_rounds.jsonl",
     "investigation_tasks": "investigation_tasks.jsonl",
     "investigation_findings": "investigation_findings.jsonl",
@@ -74,21 +78,64 @@ def file_record(root: Path, path: Path, include_hash: bool = False) -> dict[str,
 def design_manifest(root: Path, entries: list[str]) -> tuple[list[dict], list[dict], list[str]]:
     problems: list[str] = []
     explicit: list[Path] = []
+    binary_docs: list[Path] = []
+    explicitly_rejected_binary: set[Path] = set()
     for value in entries:
         path = ac.contained_path(root, value)
         if not path or not path.is_file():
             problems.append(f"design entry is missing or outside design root: {value}")
             continue
+        if path.suffix.lower() in ac.UNSUPPORTED_BINARY_DESIGN_SUFFIXES:
+            problems.append(
+                f"binary design document requires a text export with stable line provenance: {value}"
+            )
+            binary_docs.append(path)
+            explicitly_rejected_binary.add(path)
+            continue
+        if path.suffix.lower() not in ac.DESIGN_SUFFIXES:
+            problems.append(f"design entry has an unsupported text suffix: {value}")
+            continue
         explicit.append(path)
 
     docs: list[Path] = []
     for path in ac.iter_files(root):
+        if path.suffix.lower() in ac.UNSUPPORTED_BINARY_DESIGN_SUFFIXES:
+            if path not in binary_docs:
+                binary_docs.append(path)
+            continue
         if path.suffix.lower() in ac.DESIGN_SUFFIXES:
             docs.append(path)
+    if binary_docs and not docs and not explicit:
+        problems.append(
+            "design root contains only binary PDF/DOCX files; provide a UTF-8 text export "
+            "with stable line provenance"
+        )
+    elif binary_docs:
+        text_stems = {(path.parent, path.stem) for path in docs}
+        for path in binary_docs:
+            if path in explicitly_rejected_binary:
+                continue
+            if (path.parent, path.stem) not in text_stems:
+                problems.append(
+                    "binary design document lacks a same-stem UTF-8 text export with stable "
+                    f"line provenance: {ac.relative_path(root, path)}"
+                )
     ordered = explicit + [path for path in docs if path not in explicit]
     records: list[dict] = []
     groups: dict[str, list[str]] = {}
     for path in ordered:
+        try:
+            text = path.read_text(encoding="utf-8", errors="strict")
+        except UnicodeDecodeError:
+            problems.append(
+                f"design document is not valid UTF-8 text: {ac.relative_path(root, path)}"
+            )
+            continue
+        if "\x00" in text:
+            problems.append(
+                f"design document contains binary NUL bytes: {ac.relative_path(root, path)}"
+            )
+            continue
         record = file_record(root, path, include_hash=True) | {"explicit_entry": path in explicit}
         document_key = str(Path(record["path"]).with_suffix("")).lower()
         record["document_key"] = document_key
@@ -260,11 +307,15 @@ def loop_contract(paths: dict[str, str], session_id: str) -> dict[str, Any]:
     state_root = Path(paths["state_root"])
     artifacts = {name: str(state_root / filename) for name, filename in ARTIFACT_NAMES.items()}
     return {
-        "contract_version": 7,
+        "contract_version": 10,
         "execution_model": "opencode-owned-model-driven-loop",
         "session": {
             "session_id": session_id,
-            "resume": "Read state, ledger, and existing JSONL artifacts; append revisions and never discard prior evidence.",
+            "resume": (
+                "Read state, ledger, and current stable-ID artifacts. Replace a current revision only through "
+                "validated handoff merge, and preserve prior provenance in ledger/trace; never append duplicate "
+                "typed IDs or discard evidence silently."
+            ),
             "artifacts": artifacts,
         },
         "objective": (
@@ -285,6 +336,24 @@ def loop_contract(paths: dict[str, str], session_id: str) -> dict[str, Any]:
                 "owner": "spec_analyst",
                 "output": [artifacts["design_coverage"], artifacts["design_claims"]],
                 "done_when": "Every manifest document group has an evidence-backed disposition and a bounded difference-oriented claim portfolio with exact source locations.",
+            },
+            {
+                "id": "design_claim_review",
+                "owner": "spec_critic",
+                "output": artifacts["design_claim_review"],
+                "done_when": (
+                    "A fresh design-only critic accepted complete claim/group coverage, quote entailment, "
+                    "normative strength, atomicity, and applicability against the current artifact digests."
+                ),
+            },
+            {
+                "id": "code_risk_backtracking",
+                "owner": "risk_explorer",
+                "output": artifacts["risk_observations"],
+                "done_when": (
+                    "Fresh code-only agents have inspected architecture planes and boundaries through generic semantic "
+                    "lenses, handing off exact code observations and design lookup questions without issuing verdicts."
+                ),
             },
             {
                 "id": "investigation_planning",
@@ -327,17 +396,69 @@ def loop_contract(paths: dict[str, str], session_id: str) -> dict[str, Any]:
             },
         ],
         "handoffs": [
-            {"from": "orchestrator", "to": "spec_analyst", "artifact": artifacts["architecture_map"]},
-            {"from": "spec_analyst", "to": "orchestrator", "artifact": artifacts["design_claims"]},
-            {"from": "orchestrator", "to": "code_investigator", "artifact": artifacts["investigation_tasks"]},
-            {"from": "code_investigator", "to": "evidence_critic", "artifact": artifacts["investigation_findings"]},
-            {"from": "code_investigator", "to": "evidence_critic", "artifact": artifacts["dynamic_probes"]},
-            {"from": "evidence_critic", "to": "final_judge", "artifact": artifacts["critic_reviews"]},
-            {"from": "final_judge", "to": "helper_validator", "artifact": artifacts["verdicts"]},
+            {
+                "from": "orchestrator", "to": "spec_analyst",
+                "inputs": [artifacts["design_agent_manifest"]],
+                "read_roots": [paths["review_design_root"]],
+            },
+            {
+                "from": "spec_analyst", "to": "spec_critic",
+                "inputs": [
+                    artifacts["design_agent_manifest"], artifacts["design_coverage"],
+                    artifacts["design_claims"],
+                ],
+                "read_roots": [paths["review_design_root"]],
+            },
+            {
+                "from": "orchestrator", "to": "risk_explorer",
+                "inputs": [artifacts["architecture_map"]],
+                "read_roots": [paths["review_code_root"]],
+            },
+            {
+                "from": "orchestrator", "to": "code_investigator",
+                "inputs": [
+                    artifacts["architecture_map"], artifacts["design_claims"],
+                    artifacts["risk_observations"], artifacts["investigation_tasks"],
+                ],
+                "read_roots": [paths["review_code_root"], paths["review_design_root"]],
+            },
+            {
+                "from": "code_investigator", "to": "evidence_critic",
+                "inputs": [
+                    artifacts["design_claims"], artifacts["investigation_findings"],
+                    artifacts["dynamic_probes"],
+                ],
+                "read_roots": [paths["review_code_root"], paths["review_design_root"]],
+            },
+            {
+                "from": "evidence_critic", "to": "final_judge",
+                "inputs": [
+                    artifacts["design_claims"], artifacts["investigation_findings"],
+                    artifacts["critic_reviews"], artifacts["dynamic_probes"],
+                ],
+                "read_roots": [paths["review_code_root"], paths["review_design_root"]],
+            },
+            {
+                "from": "orchestrator", "to": "coverage_critic",
+                "inputs": [
+                    str(state_root / "workspace_manifest.json"),
+                    str(state_root / "agent_loop_contract.json"),
+                    artifacts["architecture_map"], artifacts["design_coverage"],
+                    artifacts["design_claims"], artifacts["risk_observations"],
+                    artifacts["investigation_tasks"], artifacts["investigation_findings"],
+                    artifacts["dynamic_probes"], artifacts["critic_reviews"],
+                    artifacts["verdicts"], artifacts["rounds"],
+                ],
+                "read_roots": [],
+            },
+            {
+                "from": "final_judge", "to": "helper_validator",
+                "inputs": [artifacts["verdicts"]], "read_roots": [],
+            },
         ],
         "handoff_integrity": {
             "max_concurrent_subagent_tasks": 2,
-            "parallel_write_rule": "Each investigator/probe/critic task writes one isolated JSON file under state/handoffs; never append to a shared JSONL from parallel tasks.",
+            "parallel_write_rule": "Each risk/investigator/probe/critic task writes one isolated JSON file under state/handoffs; never append to a shared JSONL from parallel tasks.",
             "merge_helper": str(Path(paths["state_root"]).parents[1] / "work" / "tools" / "scripts" / "handoff_merge.py"),
             "merge_semantics": "Syntax, artifact-shape, session, and stable-ID validation plus atomic replacement only; no semantic filtering or ranking.",
         },
@@ -418,6 +539,11 @@ def loop_contract(paths: dict[str, str], session_id: str) -> dict[str, Any]:
                 "group must be represented by at least one claim before that group is considered covered."
             ),
             "boundary_rule": "A high-risk integration boundary must be investigated, not merely deferred, for a successful gate.",
+            "risk_backtracking_rule": (
+                "Fresh code-only risk explorers inspect every high-risk boundary and every plane in a parallel behavior path. "
+                "A code-to-design task must reference at least one validated risk observation sharing a boundary and plane; "
+                "writing the exploration-mode label alone is not evidence that the mode ran."
+            ),
             "anti_shortcut": "Prior maturity, upstream origin, popularity, and a few compliant samples are not evidence that the supplied implementation is fully consistent.",
             "dynamic_probe": {
                 "selection": (
@@ -659,6 +785,10 @@ def prepare(args: argparse.Namespace) -> int:
         ],
         "stop_reason": "",
     }
+    started_at = str(state.get("started_at") or prepared_at)
+    if not state.get("deadline_at"):
+        deadline = ac.parse_iso(started_at) + timedelta(seconds=21600)
+        state["deadline_at"] = deadline.replace(microsecond=0).isoformat().replace("+00:00", "Z")
     state["updated_at"] = prepared_at
     state["artifacts"] = contract["session"]["artifacts"]
     state.setdefault("metrics", {}).update({
@@ -669,15 +799,62 @@ def prepare(args: argparse.Namespace) -> int:
 
     if not resumed:
         ac.save_json(state_root / "workspace_manifest.json", manifest)
+    design_only_manifest = {
+        "session_id": session_id,
+        "prepared_at": manifest.get("prepared_at", prepared_at),
+        "review_design_root": paths["review_design_root"],
+        "design": {
+            key: manifest.get("design", {}).get(key)
+            for key in (
+                "document_count", "document_group_count", "documents",
+                "document_groups", "source_manifest",
+            )
+        },
+        "preflight_problems": list(manifest.get("preflight_problems", [])),
+    }
+    ac.save_json(state_root / ARTIFACT_NAMES["design_agent_manifest"], design_only_manifest)
     ac.save_json(state_root / "agent_loop_contract.json", contract)
     ac.save_json(state_root / ARTIFACT_NAMES["state"], state)
     for key in (
-        "design_claims", "rounds", "investigation_tasks", "investigation_findings", "dynamic_probes", "critic_reviews",
+        "design_claims", "risk_observations", "rounds", "investigation_tasks", "investigation_findings", "dynamic_probes", "critic_reviews",
         "verdicts", "approval_events",
     ):
         path = state_root / ARTIFACT_NAMES[key]
         if not path.exists():
             path.touch()
+    approval_path = state_root / ARTIFACT_NAMES["approval_events"]
+    existing_approvals, _ = ac.load_jsonl(approval_path)
+    existing_decisions = {
+        (str(item.get("action") or ""), str(item.get("decision") or ""))
+        for item in existing_approvals if item.get("session_id") == session_id
+    }
+    approval_baseline = [
+            (
+                "review_snapshot_read", str(review_root), "auto_approved",
+                "Model agents may read/search only the session-local review copies.",
+            ),
+            (
+                "session_artifact_write", str(state_root), "auto_approved",
+                "The run may write machine artifacts only under its session result/log/state roots.",
+            ),
+            (
+                "target_source_write", f"{code_root} | {design_root}", "denied",
+                "The supplied code and design roots are immutable review inputs.",
+            ),
+            (
+                "external_side_effect", "outside supplied inputs and session outputs",
+                "external_approval_required",
+                "Destructive, publishing, credential, dependency-install, and mutable external actions are out of scope.",
+            ),
+    ]
+    for action, scope, decision, rationale in approval_baseline:
+        if (action, decision) in existing_decisions:
+            continue
+        ac.append_jsonl(approval_path, {
+            "recorded_at": prepared_at, "session_id": session_id,
+            "actor": "prepare_policy", "action": action, "scope": scope,
+            "decision": decision, "rationale": rationale,
+        })
     ac.append_jsonl(state_root / ARTIFACT_NAMES["ledger"], {
         "recorded_at": prepared_at,
         "session_id": session_id,

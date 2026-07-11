@@ -18,9 +18,10 @@ DEFAULT_IGNORED_DIRS = {
     "__pycache__",
 }
 DESIGN_SUFFIXES = {
-    ".md", ".markdown", ".txt", ".rst", ".adoc", ".asc", ".pdf", ".docx",
+    ".md", ".markdown", ".txt", ".rst", ".adoc", ".asc",
     ".yaml", ".yml", ".json", ".toml",
 }
+UNSUPPORTED_BINARY_DESIGN_SUFFIXES = {".pdf", ".docx"}
 REVIEW_GIT_BARRIER_CONTENT = "gitdir: .goal-agent-no-vcs\n"
 
 
@@ -159,7 +160,13 @@ def validate_source_evidence(item: Any, root: Path, label: str, text_field: str)
         return [f"{label}: line range must be integers"]
     if start < 1 or end < start:
         return [f"{label}: invalid line range {start}-{end}"]
-    lines = read_text(path).splitlines()
+    try:
+        source_text = path.read_text(encoding="utf-8", errors="strict")
+    except UnicodeDecodeError:
+        return [f"{label}: cited file is not valid UTF-8 text"]
+    if "\x00" in source_text:
+        return [f"{label}: cited file contains binary NUL bytes"]
+    lines = source_text.splitlines()
     if end > len(lines):
         return [f"{label}: line range {start}-{end} exceeds {len(lines)} lines"]
     cited = str(item.get(text_field) or "")

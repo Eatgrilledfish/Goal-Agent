@@ -13,11 +13,13 @@ from pathlib import Path
 from typing import Any
 
 import agent_common as ac
+import handoff_template as ht
 
 
-ARTIFACT_TYPES = {"generic", "task", "finding", "critic", "probe"}
+ARTIFACT_TYPES = {"generic", "task", "risk", "finding", "critic", "probe"}
 ARTIFACT_KEYS = {
     "task": "task_id",
+    "risk": "observation_id",
     "finding": "finding_id",
     "critic": "finding_id",
     "probe": "probe_id",
@@ -26,6 +28,11 @@ TRACE_KINDS = {
     "design_read", "code_search", "code_navigation", "code_read", "reverse_check",
     "test", "config_read", "history_read", "build_read", "analysis",
 }
+DEFER_FAILURE_KINDS = {"provider_failure", "tool_failure"}
+FINDING_TEMPLATE_FIELDS = (
+    "finding_id", "session_id", "task_id", "claim_id", "hypothesis", "expected_behavior",
+    "design_evidence", "review_lenses",
+)
 
 
 class HandoffValidationError(ValueError):
@@ -73,6 +80,66 @@ def _validate_trace(item: dict[str, Any], label: str) -> list[str]:
     return errors
 
 
+def _validate_risk_trace(item: dict[str, Any], label: str) -> list[str]:
+    trace = item.get("tool_trace")
+    if not isinstance(trace, list) or len(trace) < 3:
+        return [f"{label}: code-only tool_trace must contain at least three real steps"]
+    errors: list[str] = []
+    kinds: set[str] = set()
+    for index, step in enumerate(trace, start=1):
+        step_label = f"{label}: tool_trace[{index}]"
+        if not isinstance(step, dict):
+            errors.append(f"{step_label} must be an object")
+            continue
+        errors.extend(_require(step, ("kind", "tool", "target", "purpose", "result"), step_label))
+        if step.get("seq") != index:
+            errors.append(f"{step_label}: seq must equal {index}")
+        kind = str(step.get("kind") or "")
+        if kind not in TRACE_KINDS:
+            errors.append(f"{step_label}: unsupported kind {kind!r}")
+        if kind == "design_read":
+            errors.append(f"{step_label}: risk explorer must not read design")
+        kinds.add(kind)
+    for required, description in (
+        ({"code_search", "code_navigation"}, "code_search or code_navigation"),
+        ({"code_read"}, "code_read"),
+        ({"reverse_check"}, "reverse_check"),
+    ):
+        if not kinds.intersection(required):
+            errors.append(f"{label}: tool_trace lacks {description}")
+    return errors
+
+
+def validate_task_defer_evidence(item: dict[str, Any], label: str) -> list[str]:
+    if item.get("status") != "deferred":
+        return []
+    errors: list[str] = []
+    if not _present(item.get("defer_reason")):
+        errors.append(f"{label}: deferred task requires defer_reason")
+    evidence = item.get("defer_evidence")
+    if not isinstance(evidence, dict):
+        return errors + [f"{label}: deferred task requires structured defer_evidence"]
+    if evidence.get("kind") not in DEFER_FAILURE_KINDS:
+        errors.append(
+            f"{label}: defer_evidence.kind must be one of {sorted(DEFER_FAILURE_KINDS)}"
+        )
+    attempts = evidence.get("attempts")
+    if not isinstance(attempts, list) or len(attempts) < 2:
+        errors.append(f"{label}: defer_evidence requires at least two failed attempts")
+    else:
+        for index, attempt in enumerate(attempts, start=1):
+            attempt_label = f"{label}: defer_evidence.attempts[{index}]"
+            if not isinstance(attempt, dict):
+                errors.append(f"{attempt_label} must be an object")
+            else:
+                errors.extend(_require(
+                    attempt, ("attempt_id", "outcome", "evidence"), attempt_label,
+                ))
+                if attempt.get("outcome") != "failed":
+                    errors.append(f"{attempt_label}: outcome must be failed")
+    return errors
+
+
 def validate_artifact(item: dict[str, Any], artifact_type: str, label: str) -> list[str]:
     """Check a handoff's machine contract without judging its semantics."""
     if artifact_type == "generic":
@@ -86,9 +153,47 @@ def validate_artifact(item: dict[str, Any], artifact_type: str, label: str) -> l
         ), label))
         if item.get("status") not in {"pending", "in_progress", "complete", "deferred"}:
             errors.append(f"{label}: invalid status")
+        errors.extend(validate_task_defer_evidence(item, label))
         lenses = item.get("review_lenses")
         if not isinstance(lenses, list) or not 1 <= len(lenses) <= 3:
             errors.append(f"{label}: review_lenses must contain one to three focused lenses")
+        for field in ("parallel_path_ids", "risk_observation_ids"):
+            if field not in item:
+                errors.append(f"{label}: missing {field}")
+            elif not isinstance(item.get(field), list):
+                errors.append(f"{label}: {field} must be an array")
+        return errors
+
+    if artifact_type == "risk":
+        errors.extend(_require(item, (
+            "observation_id", "session_id", "behavior_question", "observed_code_behavior",
+            "review_lenses", "architecture_boundaries", "implementation_planes",
+            "code_evidence", "false_positive_checks", "design_lookup_questions", "tool_trace",
+        ), label))
+        lenses = item.get("review_lenses")
+        if not isinstance(lenses, list) or not 1 <= len(lenses) <= 3:
+            errors.append(f"{label}: review_lenses must contain one to three focused lenses")
+        checks = item.get("false_positive_checks")
+        if not isinstance(checks, list) or len(checks) < 2:
+            errors.append(f"{label}: false_positive_checks must contain at least two checks")
+        else:
+            for index, check in enumerate(checks, start=1):
+                if not isinstance(check, dict):
+                    errors.append(f"{label}: false_positive_checks[{index}] must be an object")
+                else:
+                    errors.extend(_require(
+                        check, ("question", "method", "target", "result"),
+                        f"{label}: false_positive_checks[{index}]",
+                    ))
+        questions = item.get("design_lookup_questions")
+        if not isinstance(questions, list) or not questions or not all(_present(value) for value in questions):
+            errors.append(f"{label}: design_lookup_questions must contain non-empty questions")
+        forbidden = set(item).intersection({
+            "claim_id", "design_evidence", "assessment", "recommendation", "status", "confidence",
+        })
+        if forbidden:
+            errors.append(f"{label}: code-only observation contains verdict/design fields {sorted(forbidden)}")
+        errors.extend(_validate_risk_trace(item, label))
         return errors
 
     if artifact_type == "finding":
@@ -180,6 +285,249 @@ def _read_values(path: Path) -> list[dict[str, Any]]:
     raise ValueError("handoff must be one JSON object, an object array, or JSONL objects")
 
 
+def _template_errors(
+    item: dict[str, Any], template: dict[str, Any] | None, label: str,
+) -> list[str]:
+    """Protect the design/task-owned portion of a finding handoff."""
+    if template is None:
+        return []
+    errors: list[str] = []
+    for field in FINDING_TEMPLATE_FIELDS:
+        if item.get(field) != template.get(field):
+            errors.append(f"{label}: {field} does not match the pristine finding template")
+    return errors
+
+
+def _template_root_for_handoff(path: Path) -> Path | None:
+    parent = path.resolve().parent
+    if parent.name != "investigators" or parent.parent.name != "handoffs":
+        return None
+    return parent.parent.parent / "handoff-templates" / "investigators"
+
+
+def _load_template(
+    template_root: Path | None, item: dict[str, Any], *, required: bool,
+) -> dict[str, Any] | None:
+    if template_root is None:
+        return None
+    task_id = str(item.get("task_id") or "")
+    path = template_root / f"{task_id}.json"
+    if not task_id or not path.is_file():
+        if required:
+            raise ValueError(f"finding {item.get('finding_id') or '?'} lacks pristine template {path}")
+        return None
+    value = ac.load_json(path)
+    if not isinstance(value, dict):
+        raise ValueError(f"pristine template is not an object: {path}")
+    state_root = template_root.parent.parent
+    tasks, task_errors = ac.load_jsonl(state_root / "investigation_tasks.jsonl")
+    claims, claim_errors = ac.load_jsonl(state_root / "design_claims.jsonl")
+    if task_errors or claim_errors:
+        raise ValueError("cannot reconstruct pristine template from invalid task/claim ledgers")
+    task_matches = [task for task in tasks if task.get("task_id") == task_id]
+    if len(task_matches) != 1:
+        raise ValueError(f"pristine template task must occur exactly once: {task_id}")
+    claim_id = str(task_matches[0].get("claim_id") or "")
+    claim_matches = [claim for claim in claims if claim.get("claim_id") == claim_id]
+    if len(claim_matches) != 1:
+        raise ValueError(f"pristine template claim must occur exactly once: {claim_id}")
+    reconstructed = ht.finding_template(task_matches[0], claim_matches[0])
+    if value != reconstructed:
+        raise ValueError(f"pristine template differs from current task/claim contract: {path}")
+    return value
+
+
+def _handoff_identifiers(input_dir: Path, key: str) -> set[str]:
+    identifiers: set[str] = set()
+    for path in sorted(
+        path for path in input_dir.rglob("*")
+        if path.is_file() and path.suffix.lower() in {".json", ".jsonl"}
+    ):
+        for item in _read_values(path):
+            identifier = str(item.get(key) or "")
+            if identifier:
+                identifiers.add(identifier)
+    return identifiers
+
+
+def _load_index(path: Path, key: str) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    values, errors = ac.load_jsonl(path)
+    indexed: dict[str, dict[str, Any]] = {}
+    for line_number, value in enumerate(values, start=1):
+        identifier = str(value.get(key) or "")
+        if not identifier:
+            errors.append(f"{path.name}:{line_number}: missing {key}")
+        elif identifier in indexed:
+            errors.append(f"{path.name}:{line_number}: duplicate {key} {identifier}")
+        else:
+            indexed[identifier] = value
+    return indexed, errors
+
+
+def _context_errors(
+    item: dict[str, Any], artifact_type: str, state_root: Path, label: str,
+) -> list[str]:
+    """Validate typed references against current session artifacts before a round starts."""
+    if artifact_type not in {"task", "risk"}:
+        return []
+    contract_path = state_root / "agent_loop_contract.json"
+    architecture_path = state_root / "architecture_map.json"
+    if not contract_path.is_file() or not architecture_path.is_file():
+        return []
+    contract = ac.load_json(contract_path)
+    architecture = ac.load_json(architecture_path)
+    if not contract or not architecture:
+        return []
+    lenses = set(contract.get("coverage_contract", {}).get("portfolio_lenses", []))
+    modes = set(contract.get("coverage_contract", {}).get("exploration_modes", []))
+    boundaries = {
+        str(value.get("boundary_id"))
+        for value in architecture.get("integration_boundaries", [])
+        if isinstance(value, dict) and value.get("boundary_id")
+    }
+    planes = {
+        str(value.get("plane_id"))
+        for value in architecture.get("implementation_planes", [])
+        if isinstance(value, dict) and value.get("plane_id")
+    }
+    parallel_paths = {
+        str(value.get("path_id"))
+        for value in architecture.get("parallel_behavior_paths", [])
+        if isinstance(value, dict) and value.get("path_id")
+    }
+    errors: list[str] = []
+    unknown_lenses = set(item.get("review_lenses", [])) - lenses
+    unknown_boundaries = set(item.get("architecture_boundaries", [])) - boundaries
+    unknown_planes = set(item.get("implementation_planes", [])) - planes
+    if unknown_lenses:
+        errors.append(f"{label}: unknown review lenses {sorted(unknown_lenses)}")
+    if unknown_boundaries:
+        errors.append(f"{label}: unknown architecture boundaries {sorted(unknown_boundaries)}")
+    if unknown_planes:
+        errors.append(f"{label}: unknown implementation planes {sorted(unknown_planes)}")
+
+    if artifact_type == "risk":
+        return errors
+
+    claims, claim_errors = _load_index(state_root / "design_claims.jsonl", "claim_id")
+    risks, risk_errors = _load_index(state_root / "risk_observations.jsonl", "observation_id")
+    if claim_errors:
+        errors.append(f"{label}: design claim ledger is invalid: {'; '.join(claim_errors)}")
+    if risk_errors:
+        errors.append(f"{label}: risk observation ledger is invalid: {'; '.join(risk_errors)}")
+    claim_id = str(item.get("claim_id") or "")
+    if claim_id not in claims:
+        errors.append(f"{label}: unknown claim_id {claim_id!r}")
+    mode = str(item.get("exploration_mode") or "")
+    if mode not in modes:
+        errors.append(f"{label}: unknown exploration_mode {mode!r}")
+    path_ids = item.get("parallel_path_ids", [])
+    if isinstance(path_ids, list):
+        unknown_paths = set(path_ids) - parallel_paths
+        if unknown_paths:
+            errors.append(f"{label}: unknown parallel_path_ids {sorted(unknown_paths)}")
+    risk_ids = item.get("risk_observation_ids", [])
+    if isinstance(risk_ids, list):
+        unknown_risks = set(risk_ids) - set(risks)
+        if unknown_risks:
+            errors.append(f"{label}: unknown risk_observation_ids {sorted(unknown_risks)}")
+        if mode == "code-to-design risk backtracking" and not risk_ids:
+            errors.append(f"{label}: code-to-design task requires risk_observation_ids")
+        for risk_id in set(risk_ids).intersection(risks):
+            risk = risks[risk_id]
+            if not set(item.get("architecture_boundaries", [])).intersection(
+                risk.get("architecture_boundaries", [])
+            ):
+                errors.append(f"{label}: risk observation {risk_id} shares no architecture boundary")
+            if not set(item.get("implementation_planes", [])).intersection(
+                risk.get("implementation_planes", [])
+            ):
+                errors.append(f"{label}: risk observation {risk_id} shares no implementation plane")
+    return errors
+
+
+def _finding_batch_expectation(output: Path, input_dir: Path) -> tuple[list[str], list[str], list[str]]:
+    """Use already-created pristine templates as the immutable batch membership."""
+    state_root = output.resolve().parent
+    template_root = state_root / "handoff-templates" / "investigators"
+    if not template_root.is_dir():
+        return [], [], []
+    tasks, task_errors = ac.load_jsonl(state_root / "investigation_tasks.jsonl")
+    if task_errors:
+        raise ValueError(f"investigation task ledger is invalid: {'; '.join(task_errors)}")
+    deferred_task_ids = {
+        str(item.get("task_id")) for item in tasks
+        if item.get("task_id") and item.get("status") == "deferred"
+        and not validate_task_defer_evidence(item, f"task ({item.get('task_id')})")
+    }
+    prior, prior_errors = ac.load_jsonl(output)
+    if prior_errors and output.exists():
+        raise ValueError(f"existing ledger is invalid: {'; '.join(prior_errors)}")
+    prior_ids = sorted(
+        str(item.get("finding_id")) for item in prior if item.get("finding_id")
+    )
+    template_ids: set[str] = set()
+    for path in sorted(template_root.glob("*.json")):
+        value = ac.load_json(path)
+        if not isinstance(value, dict) or not value.get("finding_id"):
+            raise ValueError(f"invalid pristine template: {path}")
+        template_ids.add(str(value["finding_id"]))
+    deferred_ids = sorted(
+        finding_id for finding_id in template_ids
+        if finding_id.removeprefix("FINDING-") in deferred_task_ids
+    )
+    expected = sorted(template_ids - set(prior_ids) - set(deferred_ids))
+    if len(expected) > 2:
+        raise ValueError(
+            f"investigator batch has more than two unresolved template IDs: {expected}"
+        )
+    present = _handoff_identifiers(input_dir, "finding_id")
+    missing = sorted(set(expected) - present)
+    return expected, missing, deferred_ids
+
+
+def _deferred_finding_input_errors(
+    state_root: Path, input_dir: Path,
+) -> dict[str, list[str]]:
+    """Reject late handoffs for tasks already retired by the recovery contract."""
+    task_path = state_root / "investigation_tasks.jsonl"
+    if not task_path.is_file():
+        return {}
+    tasks, task_errors = _load_index(task_path, "task_id")
+    if task_errors:
+        raise ValueError(f"investigation task ledger is invalid: {'; '.join(task_errors)}")
+    errors: dict[str, list[str]] = {}
+    for path in sorted(
+        path for path in input_dir.rglob("*")
+        if path.is_file() and path.suffix.lower() in {".json", ".jsonl"}
+    ):
+        for item in _read_values(path):
+            finding_id = str(item.get("finding_id") or "?")
+            task_id = str(item.get("task_id") or "")
+            task = tasks.get(task_id)
+            if task is not None and task.get("status") == "deferred":
+                errors.setdefault(finding_id, []).append(
+                    f"finding handoff targets deferred task {task_id}; retire or reopen the task first"
+                )
+    return errors
+
+
+def _snapshot_files(paths: list[Path]) -> dict[Path, bytes | None]:
+    return {path: path.read_bytes() if path.is_file() else None for path in paths}
+
+
+def _restore_files(snapshot: dict[Path, bytes | None]) -> None:
+    """Best-effort atomic per-file rollback for a failed multi-ledger transition."""
+    for path, content in snapshot.items():
+        if content is None:
+            if path.exists():
+                path.unlink()
+            continue
+        temporary = path.with_suffix(path.suffix + ".rollback")
+        temporary.write_bytes(content)
+        temporary.replace(path)
+
+
 def validate_item(
     item: dict[str, Any],
     *,
@@ -188,16 +536,24 @@ def validate_item(
     session_id: str | None = None,
     code_root: Path | None = None,
     design_root: Path | None = None,
+    template: dict[str, Any] | None = None,
 ) -> list[str]:
     label = f"{artifact_type} ({identifier})"
     errors = validate_artifact(item, artifact_type, label)
     if session_id and item.get("session_id") != session_id:
         errors.append(f"{label}: session_id does not match current session")
+    if artifact_type == "finding":
+        errors.extend(_template_errors(item, template, label))
     if artifact_type == "finding" and code_root and design_root:
         for index, evidence in enumerate(item.get("design_evidence", []), start=1):
             errors.extend(ac.validate_source_evidence(
                 evidence, design_root, f"{label}: design_evidence[{index}]", "quote"
             ))
+        for index, evidence in enumerate(item.get("code_evidence", []), start=1):
+            errors.extend(ac.validate_source_evidence(
+                evidence, code_root, f"{label}: code_evidence[{index}]", "snippet"
+            ))
+    if artifact_type == "risk" and code_root:
         for index, evidence in enumerate(item.get("code_evidence", []), start=1):
             errors.extend(ac.validate_source_evidence(
                 evidence, code_root, f"{label}: code_evidence[{index}]", "snippet"
@@ -213,6 +569,8 @@ def merge(
     session_id: str | None = None,
     code_root: Path | None = None,
     design_root: Path | None = None,
+    template_root: Path | None = None,
+    context_root: Path | None = None,
 ) -> dict[str, Any]:
     if not input_dir.is_dir():
         raise ValueError(f"handoff directory is missing: {input_dir}")
@@ -237,15 +595,28 @@ def merge(
         if path.is_file() and path.suffix.lower() in {".json", ".jsonl"}
     )
     imported_items: list[tuple[Path, dict[str, Any]]] = []
+    imported_sources: dict[str, Path] = {}
     for path in files:
         for item_index, item in enumerate(_read_values(path), start=1):
             identifier = str(item.get(key) or "")
             if not identifier:
                 raise ValueError(f"{path}: handoff entry lacks {key}")
+            if artifact_type != "generic" and identifier in imported_sources:
+                raise ValueError(
+                    f"duplicate {key} {identifier!r} across typed handoffs "
+                    f"{imported_sources[identifier]} and {path}"
+                )
+            imported_sources[identifier] = path
             imported_items.append((path, item))
 
     for _path, item in imported_items:
         identifier = str(item.get(key) or "")
+        prior = values.get(identifier)
+        if (
+            artifact_type == "task" and prior
+            and prior.get("status") == "complete" and item.get("status") == "pending"
+        ):
+            item = {**item, "status": "complete"}
         if identifier not in values:
             ordered.append(identifier)
         values[identifier] = item
@@ -254,10 +625,18 @@ def merge(
     validation_errors: dict[str, list[str]] = {}
     for identifier in ordered:
         item = values[identifier]
+        template = _load_template(
+            template_root, item, required=template_root is not None,
+        ) if artifact_type == "finding" else None
         item_errors = validate_item(
             item, artifact_type=artifact_type, identifier=identifier,
             session_id=session_id, code_root=code_root, design_root=design_root,
+            template=template,
         )
+        if context_root is not None:
+            item_errors.extend(_context_errors(
+                item, artifact_type, context_root, f"{artifact_type} ({identifier})",
+            ))
         if item_errors:
             validation_errors[identifier] = item_errors
     if validation_errors:
@@ -273,6 +652,61 @@ def merge(
     return {
         "files": len(files), "imported": imported, "ledger_entries": len(ordered),
         "validated_ids": ordered,
+    }
+
+
+def _complete_tasks_for_findings(state_root: Path, session_id: str | None) -> dict[str, Any]:
+    """Apply the deterministic pending -> complete transition after a finding merge."""
+    task_path = state_root / "investigation_tasks.jsonl"
+    finding_path = state_root / "investigation_findings.jsonl"
+    tasks, task_errors = ac.load_jsonl(task_path)
+    findings, finding_errors = ac.load_jsonl(finding_path)
+    errors = [*task_errors, *finding_errors]
+    task_index = {
+        str(item.get("task_id") or ""): item for item in tasks if item.get("task_id")
+    }
+    findings_by_task: dict[str, list[dict[str, Any]]] = {}
+    for finding in findings:
+        findings_by_task.setdefault(str(finding.get("task_id") or ""), []).append(finding)
+    transitioned: list[str] = []
+    for task_id, linked in findings_by_task.items():
+        task = task_index.get(task_id)
+        if task is None:
+            errors.append(f"finding references unknown task {task_id!r}")
+            continue
+        if len(linked) != 1:
+            errors.append(f"task {task_id} has {len(linked)} findings; exactly one is required")
+            continue
+        finding = linked[0]
+        if str(task.get("claim_id") or "") != str(finding.get("claim_id") or ""):
+            errors.append(f"task/finding claim mismatch for {task_id}")
+            continue
+        if task.get("status") == "deferred":
+            errors.append(f"deferred task {task_id} cannot have a finding")
+            continue
+        if task.get("status") != "complete":
+            task["status"] = "complete"
+            task["defer_reason"] = ""
+            task.pop("defer_evidence", None)
+            transitioned.append(task_id)
+    for task in tasks:
+        identifier = str(task.get("task_id") or "?")
+        errors.extend(validate_item(
+            task, artifact_type="task", identifier=identifier, session_id=session_id,
+        ))
+        errors.extend(_context_errors(task, "task", state_root, f"task ({identifier})"))
+    if errors:
+        raise ValueError("; ".join(errors))
+    temporary = task_path.with_suffix(task_path.suffix + ".tmp")
+    temporary.write_text(
+        "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in tasks),
+        encoding="utf-8",
+    )
+    temporary.replace(task_path)
+    return {
+        "validated_ids": [str(item["task_id"]) for item in tasks],
+        "transitioned_ids": transitioned,
+        "ledger_sha256": ac.sha256_file(task_path),
     }
 
 
@@ -296,22 +730,41 @@ def main(argv: list[str] | None = None) -> int:
         if args.input_dir and args.output and args.artifact_type == "finding"
         else None
     )
+    batch_expected_ids: list[str] = []
+    batch_missing_ids: list[str] = []
+    batch_deferred_ids: list[str] = []
+    task_lifecycle: dict[str, Any] | None = None
+    ledger_snapshot: dict[Path, bytes | None] = {}
     try:
         if not key:
             raise ValueError("--key is required for generic artifacts")
+        typed_key = ARTIFACT_KEYS.get(args.artifact_type)
+        if typed_key and args.key and args.key != typed_key:
+            raise ValueError(
+                f"--artifact-type {args.artifact_type} requires key {typed_key}; "
+                f"got {args.key}"
+            )
+        if args.input_dir and args.artifact_type != "generic" and not report_path:
+            raise ValueError("typed --input-dir merge requires --report for digest-bound provenance")
         code_root = Path(args.code_root).resolve() if args.code_root else None
         design_root = Path(args.design_root).resolve() if args.design_root else None
         if args.check_file:
-            values = _read_values(Path(args.check_file).resolve())
+            check_path = Path(args.check_file).resolve()
+            values = _read_values(check_path)
             if len(values) != 1:
                 raise ValueError("--check-file must contain exactly one object")
             item = values[0]
             identifier = str(item.get(key) or "")
             if not identifier:
                 raise ValueError(f"checked handoff lacks {key}")
+            template_root = _template_root_for_handoff(check_path) if args.artifact_type == "finding" else None
+            template = _load_template(
+                template_root, item, required=template_root is not None,
+            ) if args.artifact_type == "finding" else None
             errors = validate_item(
                 item, artifact_type=args.artifact_type, identifier=identifier,
                 session_id=args.session_id, code_root=code_root, design_root=design_root,
+                template=template,
             )
             if errors:
                 raise HandoffValidationError({identifier: errors})
@@ -319,17 +772,52 @@ def main(argv: list[str] | None = None) -> int:
         else:
             if not args.output:
                 raise ValueError("--output is required with --input-dir")
+            input_dir = Path(args.input_dir).resolve()
+            output = Path(args.output).resolve()
+            template_root = _template_root_for_handoff(input_dir / "placeholder.json") if args.artifact_type == "finding" else None
+            if args.artifact_type == "finding":
+                batch_expected_ids, batch_missing_ids, batch_deferred_ids = _finding_batch_expectation(output, input_dir)
+                if batch_missing_ids:
+                    raise HandoffValidationError({
+                        identifier: [f"finding batch is missing expected handoff {identifier}"]
+                        for identifier in batch_missing_ids
+                    })
+                deferred_input_errors = _deferred_finding_input_errors(output.parent, input_dir)
+                if deferred_input_errors:
+                    raise HandoffValidationError(deferred_input_errors)
+                ledger_snapshot = _snapshot_files([
+                    output, output.parent / "investigation_tasks.jsonl",
+                ])
             result = merge(
-                Path(args.input_dir).resolve(), Path(args.output).resolve(), key,
+                input_dir, output, key,
                 artifact_type=args.artifact_type, session_id=args.session_id,
                 code_root=code_root, design_root=design_root,
+                template_root=template_root,
+                context_root=output.parent,
             )
+            result["ledger_sha256"] = ac.sha256_file(output)
+            if args.artifact_type == "finding":
+                result["expected_ids"] = batch_expected_ids
+                result["batch_validated_ids"] = sorted(
+                    set(batch_expected_ids).intersection(result["validated_ids"])
+                )
+                result["missing_ids"] = []
+                result["deferred_ids"] = batch_deferred_ids
+            if args.artifact_type == "finding":
+                task_lifecycle = _complete_tasks_for_findings(output.parent, args.session_id)
     except (OSError, ValueError) as exc:
+        if ledger_snapshot:
+            try:
+                _restore_files(ledger_snapshot)
+            except OSError as rollback_exc:
+                exc = ValueError(f"{exc}; ledger rollback failed: {rollback_exc}")
         errors = exc.errors if isinstance(exc, HandoffValidationError) else [str(exc)]
         invalid_ids = exc.invalid_ids if isinstance(exc, HandoffValidationError) else []
         report = {
             "passed": False, "artifact_type": args.artifact_type,
-            "invalid_ids": invalid_ids, "errors": errors,
+            "invalid_ids": invalid_ids, "missing_ids": batch_missing_ids,
+            "expected_ids": batch_expected_ids, "deferred_ids": batch_deferred_ids,
+            "errors": errors,
         }
         if report_path:
             ac.save_json(report_path, report)
@@ -345,6 +833,57 @@ def main(argv: list[str] | None = None) -> int:
         ac.save_json(report_path, report)
     if batch_gate_path:
         ac.save_json(batch_gate_path, report)
+    if args.input_dir and args.output:
+        output = Path(args.output).resolve()
+        state_path = output.parent / "agent_loop_state.json"
+        if state_path.is_file():
+            state = ac.load_json(state_path)
+            phase = {
+                "task": "investigation_planning", "finding": "investigation",
+                "risk": "code_risk_backtracking", "probe": "dynamic_probe", "critic": "critic_review",
+            }.get(args.artifact_type, "handoff")
+            state["updated_at"] = ac.now_iso()
+            state["status"] = "in_progress"
+            state["current_phase"] = phase
+            ac.save_json(state_path, state)
+            ac.append_jsonl(output.parent / "agent_run_ledger.jsonl", {
+                "recorded_at": ac.now_iso(), "session_id": state.get("session_id", ""),
+                "event": "handoff_merge", "actor": "handoff_merge_helper",
+                "phase": phase, "status": "complete", "artifact_type": args.artifact_type,
+                "validated_ids": result.get("validated_ids", []),
+                "expected_ids": result.get("expected_ids", []),
+                "report": str(report_path) if report_path else "",
+                "report_sha256": ac.sha256_file(report_path) if report_path and report_path.is_file() else "",
+                "ledger_sha256": result.get("ledger_sha256", ""),
+            })
+            if task_lifecycle is not None and report_path is not None:
+                task_report_path = report_path.parent / "task-handoff-merge.json"
+                task_report = {
+                    "passed": True, "artifact_type": "task", "errors": [],
+                    **task_lifecycle,
+                    "lifecycle_source": "validated finding handoff merge",
+                }
+                ac.save_json(task_report_path, task_report)
+                ac.append_jsonl(output.parent / "agent_run_ledger.jsonl", {
+                    "recorded_at": ac.now_iso(), "session_id": state.get("session_id", ""),
+                    "event": "handoff_merge", "actor": "handoff_merge_helper",
+                    "phase": "investigation_planning", "status": "complete",
+                    "artifact_type": "task", "validated_ids": task_report["validated_ids"],
+                    "report": str(task_report_path),
+                    "report_sha256": ac.sha256_file(task_report_path),
+                    "ledger_sha256": task_report["ledger_sha256"],
+                    "transitioned_ids": task_report["transitioned_ids"],
+                })
+            if args.artifact_type == "probe":
+                ac.append_jsonl(output.parent / "approval_events.jsonl", {
+                    "recorded_at": ac.now_iso(), "session_id": state.get("session_id", ""),
+                    "actor": "handoff_merge_helper", "action": "focused_dynamic_probe",
+                    "scope": str(output.parent / "probes"), "decision": "auto_approved",
+                    "rationale": (
+                        "Validated probe handoffs are confined to session-owned copies and use "
+                        "design-derived oracles."
+                    ),
+                })
     print(json.dumps(report))
     return 0
 

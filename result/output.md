@@ -2,40 +2,60 @@
 
 ## 作品入口
 
-评测平台加载仓库根目录的 `INSTRUCTION.md`，由运行中的 opencode 读取
-`work/skill/SKILL.md`、`work/skills/*.md` 和 `work/tools/` 后执行模型驱动的
-设计/实现一致性检视。目标代码与设计文档保持只读，正式结果写入 `/result`，
-session、handoff 和证据校验轨迹写入 `/logs`。
+评测平台加载根目录 `INSTRUCTION.md`，由运行中的 OpenCode 主 agent 读取
+`work/skill/SKILL.md`、角色定义和 deterministic helpers，执行通用设计/实现语义
+一致性检视。目标代码与设计文档只读，结果写入 `/result`，session、handoff 与验证
+轨迹写入 `/logs`。正式链路不需要 `opencode.json` 或人工参数。
 
-## 本地验证方式
+## 本地验证命令
 
 ```bash
-uv run --offline --with pytest python -m pytest -q work/tools/tests/test_agent_pipeline.py
-opencode run --auto --file INSTRUCTION.md "按照入口完整执行，持续到 final gate 通过"
+python3 -m pytest -q work/tools/tests
+python3 -m py_compile work/tools/scripts/*.py
+git diff --check
 ```
 
-完整语义检视不是 helper-only pipeline：`prepare` 之后必须由 opencode 按
-`INSTRUCTION.md` 执行 spec analyst → investigator → 按需 dynamic probe → evidence
-critic → final judge 交接，再运行 `review`、`report` 和 `gate`。dynamic probe
-只在 session 隔离副本中运行；环境或 baseline 失败只能记录为 inconclusive。
+当前结果：`107 passed in 21.42s`；脚本编译与 diff whitespace 检查通过。
 
-## 当前自验证结论
+开发期单阶段回放（不属于比赛入口，也不会调用 LLM）：
 
-- 通用 helper 单元/集成测试已通过。
-- 正式链路不包含 regex 结论器、协议 domain map、项目名分支或公开答案调用。
-- task/finding/probe/critic 在进入共享 ledger 前经过类型与 session 校验；finding 同时提前回读真实设计/代码行。
-- spec analyst 产物在 investigation 前经过 `design-check`，逐项校验 coverage、claim schema、probe oracle 和真实设计行。
-- validator 要求 judge 逐值复制 investigator/critic 证据，并核对 claim → task → finding → critic → verdict。
-- subagent 采用最多 2 个并发的有界批次，控制资源并让缺失 handoff 能按项恢复。
-- `prepare` 自动把任意输入路径物理复制到 session-local review roots；主/子 agent 不依赖外部目录审批，且无需 `opencode.json`、人工环境变量或路径白名单。
-- 证据路径在 review 副本与原始输入之间保持相对路径一致；final gate 同时检查原目标和 review 副本未被修改。
-- 每个 claim 都包含只由设计形成的 probe oracle；实现只能映射接口，不能改写预期。
-- 单点 probe 是可选证据增强，不是规则 fallback；测试失败不能单独确认 issue，测试通过作为反证交给 fresh critic。
-- final gate 会检查目标树未被修改、设计行为覆盖、独立 critic、输出完整性和 6 小时时限。
-- 自动测试共 50 项，覆盖 session-local 输入物化、resume 基线不可重置、目录 symlink/固定路径/Git 隔离标记完整性、finding pristine template、单文件 self-check、批次 merge lock、结构化 repair report、设计产物前置 gate、handoff 类型污染拒绝、虚假引用前置拒绝、judge 证据改写拒绝、合法 probe 闭环、oracle 污染拒绝、环境失败强制 inconclusive、只读目标和通用性守卫。
-- `skill-creator` quick validation 已通过；核心路径项目特定词扫描和 `git diff --check` 已通过。
-- F-Stack 真实输入物化烟测纳入 27,033 个文件，原始与 review manifest 完全一致，耗时约 10 秒；final gate 的原目标与 review snapshot 完整性检查均通过。
-- 未设置 `OPENCODE_CONFIG_CONTENT` 或其他路径授权时，fresh OpenCode Task 已能读取 session-local snapshot 并正常返回，未再悬挂于外部目录审批。
+```bash
+python3 work/tools/scripts/stage_replay.py claims \
+  --source-state logs/state --replay-root .agent-work/replays/old-claims \
+  --run-local --force
+python3 work/tools/scripts/stage_replay.py risk \
+  --source-state logs/state --replay-root .agent-work/replays/old-risk --force
+```
 
-完整 F-Stack 语义自验结果将在更新后的 opencode 单次运行完成后写入本节。运行中的评测产物
-`issues.json`、`issues.jsonl`、`00-summary.md` 和单 issue 报告由 report 阶段生成。
+冻结旧 session 的 claims gate 在约 0.5 秒内稳定定位 36 个上游 claim/coverage
+契约缺口；risk replay 只暴露 architecture、contract 中的 lens 和代码 review root，
+不暴露设计、旧 finding 或结果。测试还验证了一个完整 session 可复制到隔离目录并
+重新执行真实 final gate，结果通过。
+
+## 当前实现结论
+
+- helper 只负责输入物化、schema/reference/lifecycle 校验、证据逐行验真、报告和 gate；
+  不用 regex、关键词、项目名、协议表或公开答案决定 issue。
+- `design_agent_manifest.json` 是设计侧脱敏输入；spec analyst/critic 看不到代码清单。
+- fresh code-only risk explorer 从真实边界、执行 plane、配置与平行路径反查设计问题，
+  observation 不包含 verdict。
+- claim review 在 investigation 前独立检查 quote entailment、normative strength、
+  atomicity、applicability 及文档组遗漏，并绑定当前输入 digest。
+- architecture、task portfolio 和 coverage 都有早期 gate；三种 exploration mode 必须由
+  completed task/finding 证明，不能只写 round 标签。
+- 每个 reviewable finding 必须进入 fresh critic，每个 finding 都必须有 final-judge
+  verdict；候选不能因未发布而无声消失。
+- finding merge 自动完成关联 task 并刷新 digest-bound provenance；typed handoff 使用
+  独立文件、最多两个并发任务和原子 merge。
+- 单点动态测试只用于增强或反驳已有语义证据；baseline、环境或可达性失败一律
+  `inconclusive`，不能单独确认不一致。
+- final gate 绑定 JSON/JSONL/Markdown、唯一 finding、完整 handoff、覆盖闭环、目标树
+  未修改和六小时时限。
+- `stage_replay.py` 仅用于本地冻结阶段调试，未被 `INSTRUCTION.md` 或正式
+  `goal_runner.py` 调用；它会拒绝位于代码、设计、结果、日志或 review root 内的
+  replay 目录，`--force` 不能删除输入。
+
+项目主 Skill 的 frontmatter 已用等价只读校验通过；Skill Creator 自带
+`quick_validate.py` 在当前 Mac Python 环境缺少 PyYAML，因此未安装额外依赖。
+正式 F-Stack 全量 OpenCode 自验尚未在本次修改后重跑；启动时将使用后台进程、持久
+日志、PID 与退出码记录，由人工消息触发进度读取，不进行高频轮询。

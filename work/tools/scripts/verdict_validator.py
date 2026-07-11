@@ -34,10 +34,14 @@ def _nonempty(value: Any) -> bool:
 def _artifact_index(path: Path, key: str) -> tuple[dict[str, dict], list[str]]:
     values, errors = ac.load_jsonl(path)
     index: dict[str, dict] = {}
-    for value in values:
+    for line_number, value in enumerate(values, start=1):
         identifier = str(value.get(key) or "")
-        if identifier:
-            index[identifier] = value
+        if not identifier:
+            errors.append(f"{path.name}:{line_number}: missing {key}")
+            continue
+        if identifier in index:
+            errors.append(f"{path.name}:{line_number}: duplicate {key} {identifier}")
+        index[identifier] = value
     return index, errors
 
 
@@ -158,6 +162,25 @@ def validate_verdict(
     if status == "rejected":
         if not _nonempty(verdict.get("rejection_reason")):
             errors.append(f"{prefix} rejected verdict needs rejection_reason")
+        finding = findings.get(finding_id)
+        if not finding:
+            errors.append(f"{prefix} finding_id not present in investigation_findings.jsonl")
+            return errors
+        assessment = finding.get("assessment")
+        critic = critiques.get(finding_id)
+        if assessment in {"contradiction_supported", "uncertain"}:
+            if not critic:
+                errors.append(f"{prefix} reviewable finding lacks a critic artifact")
+            elif critic.get("decision") != "reject_issue":
+                errors.append(
+                    f"{prefix} rejected reviewable finding requires critic decision reject_issue"
+                )
+        elif assessment != "design_satisfied":
+            errors.append(f"{prefix} rejected verdict has invalid investigator assessment")
+        elif critic and critic.get("decision") != "reject_issue":
+            errors.append(
+                f"{prefix} design-satisfied finding has an incompatible retained critic decision"
+            )
         return errors
 
     required = [
@@ -404,6 +427,26 @@ def run(args: argparse.Namespace) -> int:
         finding_id = str(verdict.get("finding_id") or "")
         if finding_id:
             latest[finding_id] = verdict
+    reviewable_finding_ids = {
+        finding_id for finding_id, finding in findings.items()
+        if finding.get("assessment") in {"contradiction_supported", "uncertain"}
+    }
+    missing_critics = sorted(reviewable_finding_ids - set(critiques))
+    extra_critics = sorted(set(critiques) - set(findings))
+    if missing_critics:
+        artifact_errors.append(
+            f"reviewable findings lack critic handoffs: {missing_critics}"
+        )
+    if extra_critics:
+        artifact_errors.append(
+            f"critic handoffs reference unknown findings: {extra_critics}"
+        )
+    missing_verdicts = sorted(set(findings) - set(latest))
+    extra_verdicts = sorted(set(latest) - set(findings))
+    if missing_verdicts:
+        artifact_errors.append(f"findings lack final-judge verdicts: {missing_verdicts}")
+    if extra_verdicts:
+        artifact_errors.append(f"verdicts reference unknown findings: {extra_verdicts}")
     issues: list[dict] = []
     rejected: list[dict] = []
     validation_errors = list(artifact_errors)

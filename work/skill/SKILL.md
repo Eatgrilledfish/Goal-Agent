@@ -17,6 +17,7 @@ description: 由 opencode 执行的通用设计文档与代码实现语义不一
 - 覆盖不是“读过文件”。一次完整审阅必须同时包含设计到代码的义务追踪、从高风险执行边界反查设计、以及设计能力与注册/构建/入口面的缺失对账。
 - 设计入口若只是 catalog，先由模型决定实际设计源，再让 `design_source_materializer.py` 做受限复制/只读下载与哈希归档；helper 不得从 catalog 语法推断需求或候选。
 - `prepare` 将原始输入物理复制到 session-local review roots。所有模型角色只在 review roots 读取、搜索和导航，并引用相对路径；helper 仍对原始输入逐行验真且 final gate 同时验证原始输入和 review 副本未变化。不得用 symlink、人工路径授权或运行时配置代替该隔离层。
+- helper 只接受可逐行验真的文本设计证据；PDF/DOCX 若无带稳定行 provenance 的文本导出必须 preflight 失败，不能把二进制 replacement text 当 quote 来源。多个候选输入根必须由 orchestrator 语义选择后显式传入，helper 不静默聚合。
 
 ## 角色产物
 
@@ -38,11 +39,33 @@ description: 由 opencode 执行的通用设计文档与代码实现语义不一
   "alternate_execution_paths": [{"name": "...", "paths": ["..."], "trigger": "..."}],
   "test_surfaces": [{"path": "...", "coverage": "...", "available_command": "仓库已有且当前环境可执行的命令或空", "evidence": "文件/构建证据"}],
   "probe_capabilities": {"isolated_copy_feasible": true, "available_runtime": ["从当前环境取证"], "constraints": ["缺失依赖、硬件或外部服务"]},
-  "parallel_behavior_paths": [{"behavior": "同一设计行为", "plane_ids": ["PLANE-..."], "evidence": "为什么这些路径可达且需分别核对"}]
+  "parallel_behavior_paths": [{"path_id": "PARALLEL-...", "behavior": "同一设计行为", "plane_ids": ["PLANE-..."], "evidence": "为什么这些路径可达且需分别核对"}]
 }
 ```
 
-当仓库存在适配层、fast/slow path、核心/数据面、服务/存储、导入/自有代码、生成/手写代码等边界时，不能只调查其中一侧。仓库中随产品构建或被运行路径调用的导入代码属于检视面，不能仅因其来源于上游而排除。同一设计行为存在多份实现时，写入 `parallel_behavior_paths`，后续 task 必须逐 plane 核对。
+当仓库存在适配层、fast/slow path、核心/数据面、服务/存储、导入/自有代码、生成/手写代码等边界时，不能只调查其中一侧。仓库中随产品构建或被运行路径调用的导入代码属于检视面，不能仅因其来源于上游而排除。同一设计行为存在多份实现时，为 `parallel_behavior_paths` 写稳定 `path_id`；后续可按 plane 拆多个 task，但每个 task 都写相同 `parallel_path_ids`，coverage 按该 ID 聚合直接 task/finding 证据。
+
+### risk_observations.jsonl
+
+code-to-design mode 由 fresh `risk-explorer` 在不读设计的前提下生成语义热点，不产生 verdict：
+
+```json
+{
+  "observation_id": "RISK-...",
+  "session_id": "session-...",
+  "behavior_question": "需要由设计回答的中性行为问题",
+  "observed_code_behavior": "代码可证明的实际语义",
+  "review_lenses": ["1-3 个 contract lens"],
+  "architecture_boundaries": ["BOUNDARY-..."],
+  "implementation_planes": ["PLANE-..."],
+  "code_evidence": [{"file": "...", "line_start": 1, "line_end": 1, "symbol": "...", "snippet": "..."}],
+  "false_positive_checks": [{"question": "...", "method": "...", "target": "...", "result": "..."}],
+  "design_lookup_questions": ["不含代码路径的规范检索问题"],
+  "tool_trace": [{"seq": 1, "kind": "code_search|code_navigation|code_read|reverse_check|config_read|build_read|analysis", "tool": "...", "target": "...", "purpose": "...", "result": "..."}]
+}
+```
+
+每项必须有精确代码证据、两项反查和 code search/navigation、code_read、reverse_check trace；禁止 design evidence、claim、assessment、recommendation、status 或 confidence。orchestrator 只把 `design_lookup_questions` 与通用 lens 交给 fresh spec expansion，不把代码路径/snippet 泄漏给设计角色。
 
 ### design_coverage.json
 
@@ -98,6 +121,8 @@ description: 由 opencode 执行的通用设计文档与代码实现语义不一
 
 Spec Analyst 返回后必须立即运行 `goal_runner.py design-check`。该 gate 逐项核对 session、coverage 的全部 manifest 文档组、claim 字段、probe oracle 对象和真实设计行；未通过时禁止规划 investigator。
 
+结构 gate 通过后由 fresh spec critic 只读设计、脱敏的 `design_agent_manifest.json` 与 claim artifacts，逐 claim 检查 quote 是否蕴含 behavior、normative strength 是否忠实、是否把多个可独立裁决的角色/分支/阶段/元素语义压成一条、applicability 是否有来源；逐文档组检查 behavior families 与独立设计分支是否漏抽。它不读完整 workspace manifest、代码、risk observations 或 findings。`design_claim_review.json` 必须覆盖当前全部 claim/document group 并绑定 claims、coverage、design-agent manifest digest；任何 `repair` 都回到 spec analyst，修复后重新执行 design-check 和 claim-check。
+
 不要把所有描述句都变成 claim，但不能只抽样几个容易验证的强制句。先 breadth pass 阅读入口、目录、摘要、范围和规范章节，为每个适用文档组列出行为簇；再 difference-oriented pass 覆盖外部可见行为、数据/数量约束、失败语义、状态转换、跨模块责任、并发/时序、推荐/可选副作用和明确支持的能力。每个已声明行为簇至少一个 claim，独立行为不得被压成一个宽泛 claim。catalog 将文档列为 relevant/in-scope/required 时，其代表的能力默认进入 capability 对账；代码缺少同名符号不能降级。`MAY`/可选项不自动构成强制违规，但实现缺失仍可作为明确分类的 capability/optional-behavior gap；不得在 claim 阶段静默删除。`probe_oracle` 必须在不读代码的前提下从同一设计 claim 形成；非运行时、能力完全缺失、强环境依赖或无法产生可靠可观察结果的 claim 应标为 `not_suitable`，不能编造测试。
 
 ### investigation_tasks.jsonl
@@ -117,8 +142,11 @@ Spec Analyst 返回后必须立即运行 `goal_runner.py design-check`。该 gat
   "exploration_mode": "agent_loop_contract.coverage_contract.exploration_modes 中的值",
   "architecture_boundaries": ["BOUNDARY-..."],
   "implementation_planes": ["PLANE-..."],
+  "parallel_path_ids": ["PARALLEL-..."],
+  "risk_observation_ids": ["RISK-..."],
   "status": "pending|in_progress|complete|deferred",
-  "defer_reason": ""
+  "defer_reason": "",
+  "defer_evidence": {"kind": "provider_failure|tool_failure", "attempts": [{"attempt_id": "...", "outcome": "failed", "evidence": "具体运行证据"}]}
 }
 ```
 
@@ -226,7 +254,7 @@ Spec Analyst 返回后必须立即运行 `goal_runner.py design-check`。该 gat
 
 critic 必须主动寻找最强替代解释，至少独立执行两项检查，覆盖其中两项：另一实现路径、编译/运行配置、调用路径可达性、文档版本与 scope、生成/导入代码与依赖边界、测试所证明的反例。实现满足设计时必须 `reject_issue`，不能用含糊的“approved”。
 
-critic handoff 只能包含上述 critic schema，不能混入最终 issue/verdict 字段。相同 finding 和相同 evidence 只接受一个 critic 结论；数量不足不是再次寻找 critic 的理由。只有 investigator 产生新的可核验证据后才允许 revision。
+critic handoff 只能包含上述 critic schema，不能混入最终 issue/verdict 字段。相同 finding 和相同 evidence 只接受一个 critic 结论；数量不足不是再次寻找 critic 的理由。只有 investigator 产生新的可核验证据后才允许 revision；revision 仍以 `finding_id` 为 ledger 唯一键，原子替换同一路径的当前 critic 对象并使用新的 `review_id`，不得向 JSONL 追加重复 finding 行。旧版本只保留在 merge report/session trace 中。
 
 ### agent_review_verdicts.jsonl
 
@@ -300,8 +328,8 @@ task/finding 的 `review_lenses` 必须精确，最多三个。不能把 contrac
   "document_groups_accounted": 0,
   "code_areas_reviewed": ["目录/模块/边界"],
   "architecture_boundaries": [{"boundary_id": "...", "status": "investigated|deferred", "evidence": "..."}],
-  "remaining_high_priority_claims": [],
-  "deferred_claims": [{"claim_id": "...", "reason": "具体证据缺口"}],
+  "remaining_high_priority_claims": [{"claim_id": "CLAIM-...", "reason": "仍缺哪条可执行证据"}],
+  "deferred_claims": [{"claim_id": "...", "task_id": "TASK-...", "reason": "与 task.defer_evidence 一致的具体运行缺口"}],
   "false_positive_samples_rechecked": ["FINDING-..."],
   "next_round_tasks": [{
     "claim_id": "CLAIM-...",
@@ -310,6 +338,8 @@ task/finding 的 `review_lenses` 必须精确，最多三个。不能把 contrac
     "review_lenses": ["1-3 个 lens"],
     "architecture_boundaries": ["BOUNDARY-..."],
     "implementation_planes": ["PLANE-..."],
+    "parallel_path_ids": ["PARALLEL-..."],
+    "risk_observation_ids": ["RISK-..."],
     "priority_reason": "为什么它填补真实缺口"
   }],
   "stop_reason": "为什么现在可以停止或必须继续"
@@ -329,7 +359,13 @@ task/finding 的 `review_lenses` 必须精确，最多三个。不能把 contrac
 7. 反证与 critic 交接：确认前寻找替代实现、调用者、配置开关、测试和版本差异，并独立复核 probe oracle、环境和解释。
 8. coverage 反馈：从未覆盖 lens、未触达高风险边界/平行 plane、catalog capability 和缺失探索模式生成结构化下一轮任务。
 
-每类 handoff 合并时必须使用 `handoff_merge.py --artifact-type task|finding|probe|critic --session-id <当前 session> --report <trace-path>`；finding 的 Task self-check 只传 review roots，orchestrator 原子 merge 再传原始 `--code-root` 与 `--design-root`，按相同相对路径二次逐行验真。investigator 在写 finding 前使用 `handoff_template.py` 取得只复制 task/claim 元数据的语义中立模板，返回前用 `handoff_merge.py --check-file` 自检。所有 subagent 调用使用最多 2 个并发的有界批次；批次 merge report 未通过或本批 ID 未全部进入 `validated_ids` 时，`investigator_batch_gate.json` 锁住新的模板，只修复 report 的 `invalid_ids`。不得把整个 portfolio 一次性并发提交；结构或引用校验失败的对象不能进入共享 ledger，不重跑已经有效的 handoff。
+每类 handoff 合并时必须使用 `handoff_merge.py --artifact-type task|risk|finding|probe|critic --session-id <当前 session> --report <trace-path>`；finding 的 Task self-check 只传 review roots，orchestrator 原子 merge 再传原始 `--code-root` 与 `--design-root`，按相同相对路径二次逐行验真。investigator 在写 finding 前使用 `handoff_template.py` 取得只复制 task/claim 元数据的语义中立模板，返回前用 `handoff_merge.py --check-file` 自检。所有 subagent 调用使用最多 2 个并发的有界批次；批次 merge report 未通过或本批 ID 未全部进入 `validated_ids` 时，`investigator_batch_gate.json` 锁住新的模板，只修复 report 的 `invalid_ids`。不得把整个 portfolio 一次性并发提交；结构或引用校验失败的对象不能进入共享 ledger，不重跑已经有效的 handoff。
+
+pristine templates 同时是 investigator batch 的 expected membership：最多两个尚未合并 template，任一对应 handoff 缺失时 report 写 `expected_ids/missing_ids` 并保持 gate 失败。self-check 与主 merge 必须逐值保护 template 的 identity、claim、hypothesis、expected behavior、design evidence 和 lenses。成功 finding merge 自动把对应 task 转为 complete、刷新 task digest 并写 session lifecycle event；final gate 要求 design/task/risk/finding/critic/probe（若有）的 passed trace 能覆盖当前 ledger。
+
+semantic coverage 不是 ID 清单：每个 investigated lens 的 task 必须 complete、声明该 lens，并与所引 finding/claim、design group 和 boundary 直接关联；每个平行行为路径按稳定 `path_id` 聚合 completed task/finding，所有声明 plane 都必须有直接证据。未调查 high claim 只有关联 task 在两次 provider/tool 失败后携带结构化 `defer_evidence` 才可 deferred，普通 portfolio 取舍、环境泛称或任意理由不能关闭 actionable claim。
+
+发布计数按唯一、已验证的 finding ID 计算。`issues.json`、`issues.jsonl`、摘要和单 issue Markdown 必须与 `validated_issues.json` 精确绑定，复制行、改 ID 或手工增补不得通过 final gate。
 
 首轮 0 confirmed、所有 finding 被 reject、或 gate 失败时，必须触发 coverage-critic：检查是否只读了少数设计文档、是否把一条合规样本外推成整类合规、是否过度集中在核心目录、是否忽略导入/适配执行 plane、能力缺失和跨边界行为。只要仍在时间预算内，切换 exploration mode，并更换设计文档组、架构边界或审阅 lens 继续下一轮，不能把项目成熟度当作停止依据。
 
