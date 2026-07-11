@@ -219,7 +219,8 @@ def record_critic_history(state: Path, critic: dict) -> None:
 
 def record_trace_checkpoint(
     state: Path, session_id: str, phase: str, role: str,
-    *, task_id: str | None = None, provider_session_id: str | None = None,
+    *, task_id: str | None = None, scope_id: str | None = None,
+    provider_session_id: str | None = None,
 ) -> None:
     input_path = state / "workspace_manifest.json"
     records = [{
@@ -227,7 +228,27 @@ def record_trace_checkpoint(
         "sha256": ac.sha256_file(input_path),
         "size_bytes": input_path.stat().st_size,
     }]
+    artifact_name = {
+        "architecture_mapping": "architecture_map.json",
+        "design_inventory": "design_inventory.json",
+        "code_risk_backtracking": "risk_observations.jsonl",
+        "design_claim_resolution": "design_claims.jsonl",
+        "design_claim_review": "design_claim_review.json",
+        "investigation_planning": "investigation_tasks.jsonl",
+        "investigation": "investigation_findings.jsonl",
+        "dynamic_probe": "dynamic_probes.jsonl",
+        "critic_review": "critic_reviews.jsonl",
+        "coverage_audit": "coverage_audit.json",
+        "final_judgement": "agent_review_verdicts.jsonl",
+    }[phase]
+    artifact_path = state / artifact_name
+    artifact_records = [{
+        "path": str(artifact_path.resolve()),
+        "sha256": ac.sha256_file(artifact_path),
+        "size_bytes": artifact_path.stat().st_size,
+    }]
     timestamp = ac.now_iso()
+    stable_scope_id = task_id or scope_id or f"{phase}-portfolio"
     event = {
         "recorded_at": timestamp,
         "session_id": session_id,
@@ -239,9 +260,12 @@ def record_trace_checkpoint(
         "outcome": "fixture_complete",
         "summary": "Fixture phase completed with deterministic artifacts.",
         "metrics": {},
-        "artifacts": [],
+        "artifacts": [str(artifact_path.resolve())],
+        "artifact_snapshots": artifact_records,
+        "artifact_sha256": session_event.input_artifacts_sha256(artifact_records),
         "next_actions": [],
-        "scope": f"fixture:{phase}:{task_id or 'portfolio'}",
+        "scope_id": stable_scope_id,
+        "scope": f"fixture:{phase}:{stable_scope_id}",
         "input_artifacts": records,
         "input_sha256": session_event.input_artifacts_sha256(records),
         "started_at": timestamp,
@@ -249,7 +273,7 @@ def record_trace_checkpoint(
         "wall_time_seconds": 0.0,
         "provider_attempt": 1,
         "provider_session_id": provider_session_id or (
-            f"fixture-provider-{phase}-{task_id or 'portfolio'}"
+            f"fixture-provider-{phase}-{stable_scope_id}"
         ),
         "output_count": 1,
         "repair_count": 0,
@@ -849,16 +873,37 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
                 {task["task_id"]: task for task in tasks_for_templates}
             )
         ac.append_jsonl(state / "agent_run_ledger.jsonl", event)
-    for phase, role in (
-        ("architecture_mapping", "orchestrator"),
-        ("design_inventory", "spec-analyst"),
-        ("design_claim_resolution", "spec-analyst"),
-        ("design_claim_review", "spec-critic"),
-        ("investigation_planning", "orchestrator"),
-        ("coverage_audit", "coverage-critic"),
-        ("final_judgement", "final-judge"),
-    ):
-        record_trace_checkpoint(state, str(workspace["session_id"]), phase, role)
+    record_trace_checkpoint(
+        state, str(workspace["session_id"]), "architecture_mapping", "orchestrator",
+        scope_id="ARCHITECTURE-MAP",
+    )
+    record_trace_checkpoint(
+        state, str(workspace["session_id"]), "design_inventory", "spec-analyst",
+        scope_id="DESIGN-INVENTORY",
+    )
+    for round_id in sorted({item["round_id"] for item in ac.load_jsonl(
+        state / "investigation_rounds.jsonl",
+    )[0]}):
+        record_trace_checkpoint(
+            state, str(workspace["session_id"]),
+            "design_claim_resolution", "spec-analyst", scope_id=round_id,
+        )
+        record_trace_checkpoint(
+            state, str(workspace["session_id"]),
+            "design_claim_review", "spec-critic", scope_id=round_id,
+        )
+        record_trace_checkpoint(
+            state, str(workspace["session_id"]),
+            "investigation_planning", "orchestrator", scope_id=round_id,
+        )
+    record_trace_checkpoint(
+        state, str(workspace["session_id"]), "coverage_audit", "coverage-critic",
+        scope_id="COVERAGE-AUDIT-FINAL",
+    )
+    record_trace_checkpoint(
+        state, str(workspace["session_id"]), "final_judgement", "final-judge",
+        scope_id="FINAL-JUDGEMENT",
+    )
     for slice_item in ac.load_json(state / "risk_sweep_plan.json")["slices"]:
         record_trace_checkpoint(
             state, str(workspace["session_id"]),
@@ -1094,10 +1139,12 @@ def test_prepare_is_semantic_neutral_and_writes_agent_contract(workspace):
     assert "paths" not in design_manifest
     assert "code_root" not in json.dumps(design_manifest)
     assert contract["execution_model"] == "opencode-owned-model-driven-loop"
-    assert contract["contract_version"] == 13
+    assert contract["contract_version"] == 14
     assert contract["handoff_integrity"]["max_concurrent_subagent_tasks"] == 2
     assert contract["tool_protocol"]["agent_event_contract"]["required_fields"] == [
-        "event", "role", "phase", "scope", "input_artifacts", "input_sha256",
+        "event", "role", "phase", "scope_id", "scope",
+        "input_artifacts", "input_sha256", "artifacts",
+        "artifact_snapshots", "artifact_sha256",
         "started_at", "ended_at", "wall_time_seconds",
         "provider_attempt", "provider_session_id", "output_count",
         "repair_count", "outcome", "stop_reason",
@@ -1420,7 +1467,9 @@ def test_design_source_materializer_only_copies_model_selected_sources(tmp_path)
     source = tmp_path / "input-design"
     bundle = tmp_path / "bundle"
     source.mkdir()
-    (source / "benchmark.md").write_text("Use the linked service contract.\n", encoding="utf-8")
+    (source / "benchmark.md").write_text(
+        "Use service-contract.md as the service contract.\n", encoding="utf-8",
+    )
     (source / "service-contract.md").write_text("Requests must be authenticated.\n", encoding="utf-8")
     plan = tmp_path / "design-source-plan.json"
     manifest = tmp_path / "materialization.json"
@@ -1433,7 +1482,7 @@ def test_design_source_materializer_only_copies_model_selected_sources(tmp_path)
             "output_path": "sources/service-contract.md",
             "catalog_evidence": {
                 "path": "benchmark.md", "line_start": 1, "line_end": 1,
-                "quote": "Use the linked service contract.",
+                "quote": "Use service-contract.md as the service contract.",
             },
         }],
     })
@@ -2965,8 +3014,16 @@ def test_gate_rejects_third_identical_no_progress_checkpoint(workspace):
     checkpoint = next(
         event for event in ledger if event.get("phase") == "design_inventory"
     )
-    second = dict(checkpoint, outcome="same_inputs_different_wording")
-    third = dict(checkpoint, outcome="another_outcome_wording_only")
+    second = dict(
+        checkpoint,
+        outcome="same_inputs_different_wording",
+        scope="same stable scope with different wording",
+    )
+    third = dict(
+        checkpoint,
+        outcome="another_outcome_wording_only",
+        scope="same stable scope with a third wording",
+    )
     ac.append_jsonl(state / "agent_run_ledger.jsonl", second)
     ac.append_jsonl(state / "agent_run_ledger.jsonl", third)
     run_runner("review", workspace["code"], workspace["design"], workspace["result"], workspace["logs"])
@@ -2980,6 +3037,105 @@ def test_gate_rejects_third_identical_no_progress_checkpoint(workspace):
     assert proc.returncode == 1
     gate = ac.load_json(Path(workspace["logs"]) / "trace" / "final_gate.json")
     assert any("repeated a third time without progress" in error for error in gate["errors"])
+
+
+def test_gate_rejects_unbound_portfolio_scope_id(workspace):
+    populate_handoffs(workspace)
+    state = Path(workspace["state"])
+    ledger, errors = ac.load_jsonl(state / "agent_run_ledger.jsonl")
+    assert errors == []
+    checkpoint = next(
+        event for event in ledger if event.get("phase") == "design_inventory"
+    )
+    checkpoint["scope_id"] = "DESIGN-INVENTORY-RETRY-RENAMED"
+    (state / "agent_run_ledger.jsonl").write_text(
+        "".join(json.dumps(event) + "\n" for event in ledger), encoding="utf-8",
+    )
+    run_runner("review", workspace["code"], workspace["design"], workspace["result"], workspace["logs"])
+    run_runner("report", workspace["code"], workspace["design"], workspace["result"], workspace["logs"])
+
+    proc = run_runner(
+        "gate", workspace["code"], workspace["design"],
+        workspace["result"], workspace["logs"], check=False,
+    )
+
+    assert proc.returncode == 1
+    gate = ac.load_json(Path(workspace["logs"]) / "trace" / "final_gate.json")
+    assert any("unbound portfolio trace scope IDs" in error for error in gate["errors"])
+
+
+def test_gate_rejects_same_candidate_semantic_repair_reusing_provider_session(
+    workspace,
+):
+    populate_handoffs(workspace)
+    state = Path(workspace["state"])
+    ledger, errors = ac.load_jsonl(state / "agent_run_ledger.jsonl")
+    assert errors == []
+    original = next(
+        event for event in ledger
+        if event.get("phase") == "investigation"
+        and event.get("task_id") == "TASK-001"
+    )
+    changed_input = state / "design_claims.jsonl"
+    changed_input_records = [{
+        "path": str(changed_input.resolve()),
+        "sha256": ac.sha256_file(changed_input),
+        "size_bytes": changed_input.stat().st_size,
+    }]
+    repaired = dict(
+        original,
+        provider_attempt=1,
+        repair_count=1,
+        outcome="semantic_repair_complete",
+        input_artifacts=changed_input_records,
+        input_sha256=session_event.input_artifacts_sha256(changed_input_records),
+    )
+    ac.append_jsonl(state / "agent_run_ledger.jsonl", repaired)
+    run_runner("review", workspace["code"], workspace["design"], workspace["result"], workspace["logs"])
+    run_runner("report", workspace["code"], workspace["design"], workspace["result"], workspace["logs"])
+
+    proc = run_runner(
+        "gate", workspace["code"], workspace["design"],
+        workspace["result"], workspace["logs"], check=False,
+    )
+
+    assert proc.returncode == 1
+    gate = ac.load_json(Path(workspace["logs"]) / "trace" / "final_gate.json")
+    assert any(
+        "semantic repair" in error and "provider session" in error
+        for error in gate["errors"]
+    )
+
+
+def test_gate_rejects_unregistered_current_deterministic_helper_report(workspace):
+    populate_handoffs(workspace)
+    state = Path(workspace["state"])
+    run_runner("review", workspace["code"], workspace["design"], workspace["result"], workspace["logs"])
+    run_runner("report", workspace["code"], workspace["design"], workspace["result"], workspace["logs"])
+    ledger, errors = ac.load_jsonl(state / "agent_run_ledger.jsonl")
+    assert errors == []
+    ledger = [
+        event for event in ledger
+        if not (
+            event.get("event") == "deterministic_helper_trace"
+            and str(event.get("report") or "").endswith("/coverage_validation.json")
+        )
+    ]
+    (state / "agent_run_ledger.jsonl").write_text(
+        "".join(json.dumps(event) + "\n" for event in ledger), encoding="utf-8",
+    )
+
+    proc = run_runner(
+        "finalize", workspace["code"], workspace["design"],
+        workspace["result"], workspace["logs"], check=False,
+    )
+
+    assert proc.returncode == 1
+    gate = ac.load_json(Path(workspace["logs"]) / "trace" / "final_gate.json")
+    assert any(
+        "deterministic helper report" in error and "coverage_validation.json" in error
+        for error in gate["errors"]
+    )
 
 
 def test_gate_rejects_provider_session_reuse_between_candidates(workspace):

@@ -862,7 +862,8 @@ def _copy_gate_support(copier: ArtifactCopier, manifest: dict[str, Any]) -> None
             name = source.name
             if not (
                 name in {
-                    "run_clock.json", "design_validation.json", "claim_review_validation.json",
+                    "run_clock.json", "session_prepared.json",
+                    "design_validation.json", "claim_review_validation.json",
                     "architecture_validation.json", "risk_sweep_plan_validation.json",
                     "task_plan_validation.json", "task_lifecycle_validation.json",
                     "coverage_validation.json", "evidence_validation.json",

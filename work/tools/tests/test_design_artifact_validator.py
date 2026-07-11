@@ -395,6 +395,192 @@ def test_existing_local_source_plan_mode_remains_available(tmp_path):
     )
 
 
+def test_source_plan_mode_reports_invalid_json_without_traceback(tmp_path):
+    source_root = tmp_path / "source"
+    output_root = tmp_path / "bundle"
+    source_root.mkdir()
+    (source_root / "catalog.md").write_text("# Sources\n", encoding="utf-8")
+    plan_path = tmp_path / "plan.json"
+    manifest_path = tmp_path / "manifest.json"
+    plan_path.write_text('{"catalog_path": "catalog.md",\tbad}', encoding="utf-8")
+    args = argparse.Namespace(
+        source_root=str(source_root), output_root=str(output_root), plan=str(plan_path),
+        manifest=str(manifest_path), approval_log=None, allow_network=False,
+        max_bytes=1024 * 1024, timeout_seconds=1,
+    )
+
+    assert materializer.materialize(args) == 1
+    manifest = ac.load_json(manifest_path)
+    assert manifest["passed"] is False
+    assert manifest["sources"] == []
+    assert any("could not load design source plan" in error for error in manifest["errors"])
+    assert manifest["plan_sha256"] == ac.sha256_file(plan_path)
+
+
+def test_source_plan_mode_rejects_real_catalog_quote_bound_to_another_local_source(tmp_path):
+    source_root = tmp_path / "source"
+    output_root = tmp_path / "bundle"
+    source_root.mkdir()
+    (source_root / "catalog.md").write_text("Use contract-a.md.\n", encoding="utf-8")
+    (source_root / "contract-a.md").write_text("Contract A.\n", encoding="utf-8")
+    (source_root / "contract-b.md").write_text("Contract B.\n", encoding="utf-8")
+    plan_path = tmp_path / "plan.json"
+    manifest_path = tmp_path / "manifest.json"
+    ac.save_json(plan_path, {
+        "catalog_path": "catalog.md",
+        "sources": [{
+            "source_id": "substituted", "kind": "local", "location": "contract-b.md",
+            "output_path": "sources/contract-b.md",
+            "catalog_evidence": {
+                "path": "catalog.md", "line_start": 1, "line_end": 1,
+                "quote": "Use contract-a.md.",
+            },
+        }],
+    })
+    args = argparse.Namespace(
+        source_root=str(source_root), output_root=str(output_root), plan=str(plan_path),
+        manifest=str(manifest_path), approval_log=None, allow_network=False,
+        max_bytes=1024 * 1024, timeout_seconds=1,
+    )
+
+    assert materializer.materialize(args) == 1
+    manifest = ac.load_json(manifest_path)
+    assert manifest["passed"] is False
+    assert any("location is not cited" in error for error in manifest["errors"])
+    assert not (output_root / "sources" / "contract-b.md").exists()
+
+
+def test_source_plan_mode_rejects_uncited_url_before_network_access(
+    tmp_path, monkeypatch,
+):
+    source_root = tmp_path / "source"
+    output_root = tmp_path / "state" / "design-sources"
+    source_root.mkdir()
+    (source_root / "catalog.md").write_text(
+        "Use specs.example/contract-a.\n", encoding="utf-8",
+    )
+    plan_path = tmp_path / "plan.json"
+    manifest_path = tmp_path / "manifest.json"
+    approval_log = output_root.parent / "approval_events.jsonl"
+    ac.save_json(plan_path, {
+        "catalog_path": "catalog.md",
+        "sources": [{
+            "source_id": "substituted-url", "kind": "url",
+            "location": "https://unrelated.example/contract-b",
+            "output_path": "sources/contract-b.txt",
+            "catalog_evidence": {
+                "path": "catalog.md", "line_start": 1, "line_end": 1,
+                "quote": "Use specs.example/contract-a.",
+            },
+        }],
+    })
+    monkeypatch.setattr(
+        materializer, "_fetch",
+        lambda *args, **kwargs: pytest.fail("uncited URL must not be fetched"),
+    )
+    args = argparse.Namespace(
+        source_root=str(source_root), output_root=str(output_root), plan=str(plan_path),
+        manifest=str(manifest_path), approval_log=str(approval_log), allow_network=True,
+        max_bytes=1024 * 1024, timeout_seconds=1,
+    )
+
+    assert materializer.materialize(args) == 1
+    manifest = ac.load_json(manifest_path)
+    assert manifest["passed"] is False
+    assert any("location is not cited" in error for error in manifest["errors"])
+    assert not approval_log.exists()
+
+
+@pytest.mark.parametrize(
+    ("kind", "location", "quote", "expected"),
+    [
+        (
+            "url", "https://www.docs.example/spec/",
+            "Use docs.example/spec.", True,
+        ),
+        (
+            "url", "https://docs.example/spec",
+            "Use evil-docs.example/spec.", False,
+        ),
+        (
+            "url", "https://docs.example:444/spec",
+            "Use docs.example/spec.", False,
+        ),
+        (
+            "local", "Design Spec.md",
+            "Use [the contract](Design Spec.md).", True,
+        ),
+        (
+            "local", "contract.md",
+            "Use old-contract.md.", False,
+        ),
+        (
+            "local", "contract.md",
+            "Use archive/contract.md.", False,
+        ),
+    ],
+)
+def test_catalog_location_binding_requires_equal_tokens(kind, location, quote, expected):
+    assert materializer._catalog_cites_location(kind, location, quote) is expected
+
+
+@pytest.mark.parametrize(
+    "overlap",
+    ("output", "plan", "manifest", "approval"),
+)
+def test_source_plan_mode_rejects_writes_or_control_files_in_supplied_source(
+    tmp_path, overlap,
+):
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    (source_root / "catalog.md").write_text("Use contract.md.\n", encoding="utf-8")
+    (source_root / "contract.md").write_text("Contract.\n", encoding="utf-8")
+    output_root = tmp_path / "bundle"
+    plan_path = tmp_path / "plan.json"
+    manifest_path = tmp_path / "manifest.json"
+    approval_log = tmp_path / "approval_events.jsonl"
+    if overlap == "output":
+        output_root = source_root / "bundle"
+    elif overlap == "plan":
+        plan_path = source_root / "plan.json"
+    elif overlap == "manifest":
+        manifest_path = source_root / "manifest.json"
+    else:
+        approval_log = source_root / "approval_events.jsonl"
+    ac.save_json(plan_path, {
+        "catalog_path": "catalog.md",
+        "sources": [{
+            "source_id": "contract", "kind": "local", "location": "contract.md",
+            "output_path": "sources/contract.md",
+            "catalog_evidence": {
+                "path": "catalog.md", "line_start": 1, "line_end": 1,
+                "quote": "Use contract.md.",
+            },
+        }],
+    })
+    before = {
+        path.relative_to(source_root).as_posix(): path.read_bytes()
+        for path in source_root.rglob("*") if path.is_file()
+    }
+    args = argparse.Namespace(
+        source_root=str(source_root), output_root=str(output_root), plan=str(plan_path),
+        manifest=str(manifest_path), approval_log=str(approval_log), allow_network=False,
+        max_bytes=1024 * 1024, timeout_seconds=1,
+    )
+
+    assert materializer.materialize(args) == 2
+    after = {
+        path.relative_to(source_root).as_posix(): path.read_bytes()
+        for path in source_root.rglob("*") if path.is_file()
+    }
+    assert after == before
+    assert not output_root.exists()
+    if overlap == "manifest":
+        assert not manifest_path.exists()
+    else:
+        assert ac.load_json(manifest_path)["passed"] is False
+
+
 def test_inventory_materializer_owns_evidence_heading_and_group_digest(artifacts):
     inventory = load_inventory(artifacts)
     group = inventory["document_groups"][0]

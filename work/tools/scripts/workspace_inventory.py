@@ -375,7 +375,7 @@ def loop_contract(
     state_root = Path(paths["state_root"])
     artifacts = {name: str(state_root / filename) for name, filename in ARTIFACT_NAMES.items()}
     return {
-        "contract_version": 13,
+        "contract_version": 14,
         "execution_model": "opencode-owned-model-driven-loop",
         "session": {
             "session_id": session_id,
@@ -602,8 +602,9 @@ def loop_contract(
             "principle": "Use tools for just-in-time retrieval; semantic decisions belong to the model, not search syntax.",
             "agent_event_contract": {
                 "required_fields": [
-                    "event", "role", "phase", "scope", "input_artifacts",
-                    "input_sha256",
+                    "event", "role", "phase", "scope_id", "scope",
+                    "input_artifacts", "input_sha256", "artifacts",
+                    "artifact_snapshots", "artifact_sha256",
                     "started_at", "ended_at", "wall_time_seconds",
                     "provider_attempt", "provider_session_id", "output_count",
                     "repair_count", "outcome", "stop_reason",
@@ -612,6 +613,10 @@ def loop_contract(
                 "input_digest": (
                     "session_event.py must hash at least one real regular input file, "
                     "record each path/digest, and derive input_sha256; the model never supplies the digest."
+                ),
+                "output_digest": (
+                    "session_event.py canonicalizes and hashes every declared output artifact; "
+                    "retry progress cannot be created by changing free-form scope or outcome text."
                 ),
                 "required_phase_roles": [
                     {"phase": "architecture_mapping", "role": "orchestrator"},
@@ -630,6 +635,17 @@ def loop_contract(
                     "investigation/code-investigator": "task_id",
                     "dynamic_probe/code-investigator": "finding_id",
                     "critic_review/evidence-critic": "finding_id",
+                },
+                "portfolio_checkpoint_scope_ids": {
+                    "architecture_mapping/orchestrator": "ARCHITECTURE-MAP",
+                    "design_inventory/spec-analyst": "DESIGN-INVENTORY",
+                    "design_claim_resolution/spec-analyst": "current ROUND-*",
+                    "design_claim_review/spec-critic": "current ROUND-*",
+                    "investigation_planning/orchestrator": "current ROUND-*",
+                    "coverage_audit/coverage-critic": (
+                        "COVERAGE-AUDIT-INITIAL or COVERAGE-AUDIT-FINAL; final is required"
+                    ),
+                    "final_judgement/final-judge": "FINAL-JUDGEMENT",
                 },
             },
             "minimum_confirmed_trace": {

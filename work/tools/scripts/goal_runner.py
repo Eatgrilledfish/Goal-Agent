@@ -46,6 +46,13 @@ COMMANDS = {
     "finalize": ["report_writer.py", "final_gate.py"],
 }
 MAX_HELPER_SECONDS = 21600
+TRACE_REPORTS = {
+    "workspace_inventory.py": "session_prepared.json",
+    "design_artifact_validator.py": "design_validation.json",
+    "claim_review_validator.py": "claim_review_validation.json",
+    "risk_sweep_plan_validator.py": "risk_sweep_plan_validation.json",
+    "verdict_validator.py": "evidence_validation.json",
+}
 
 
 def _directories(path: Path) -> list[Path]:
@@ -150,6 +157,51 @@ def record_timeout(args: argparse.Namespace, script_spec: str, reason: str) -> N
     })
 
 
+def helper_trace_path(args: argparse.Namespace, script_spec: str) -> Path | None:
+    script, _, explicit_stage = script_spec.partition(":")
+    trace_name = TRACE_REPORTS.get(script)
+    if script == "stage_artifact_validator.py":
+        stage = explicit_stage or args.command.removesuffix("-check")
+        trace_name = {
+            "task-plan": "task_plan_validation.json",
+            "task-lifecycle": "task_lifecycle_validation.json",
+        }.get(stage, f"{stage}_validation.json")
+    if not trace_name:
+        return None
+    return Path(args.log_root).resolve() / "trace" / trace_name
+
+
+def record_helper_trace(
+    args: argparse.Namespace, script_spec: str, returncode: int,
+    started_at: str, ended_at: str,
+) -> None:
+    report_path = helper_trace_path(args, script_spec)
+    if not report_path or not report_path.is_file() or report_path.is_symlink():
+        return
+    root = ac.state_root(Path(args.log_root), args.state_root)
+    state_path = root / "agent_loop_state.json"
+    if not state_path.is_file():
+        return
+    state = ac.load_json(state_path)
+    session_id = str(state.get("session_id") or "")
+    if not session_id:
+        return
+    ac.append_jsonl(root / "agent_run_ledger.jsonl", {
+        "recorded_at": ac.now_iso(),
+        "session_id": session_id,
+        "event": "deterministic_helper_trace",
+        "actor": "goal_runner",
+        "phase": args.command,
+        "status": "complete" if returncode == 0 else "failed",
+        "helper": script_spec,
+        "started_at": started_at,
+        "ended_at": ended_at,
+        "returncode": returncode,
+        "report": str(report_path.resolve()),
+        "report_sha256": ac.sha256_file(report_path),
+    })
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Prepare and finalize a generic opencode design/code inconsistency review."
@@ -179,12 +231,14 @@ def main(argv: list[str] | None = None) -> int:
             return 124
         command = script_command(script_spec, args)
         print(f"[goal-runner] {script_spec}")
+        started_at = ac.now_iso()
         try:
             result = subprocess.run(command, timeout=timeout)
         except subprocess.TimeoutExpired:
             record_timeout(args, script_spec, f"helper exceeded remaining session budget ({timeout}s)")
             print(f"[goal-runner] timed out: {script_spec}", file=sys.stderr)
             return 124
+        record_helper_trace(args, script_spec, result.returncode, started_at, ac.now_iso())
         if result.returncode:
             exit_code = exit_code or result.returncode
             if args.command != "gate":

@@ -495,6 +495,32 @@ def run(args: argparse.Namespace) -> int:
             )
     run_ledger, run_ledger_errors = ac.load_jsonl(root / "agent_run_ledger.jsonl")
     errors.extend(run_ledger_errors)
+    required_helper_reports = (
+        "session_prepared.json",
+        "architecture_validation.json",
+        "risk_sweep_plan_validation.json",
+        "design_validation.json",
+        "claim_review_validation.json",
+        "task_plan_validation.json",
+        "task_lifecycle_validation.json",
+        "coverage_validation.json",
+        "evidence_validation.json",
+    )
+    for report_name in required_helper_reports:
+        report_path = trace_root / report_name
+        report_sha256 = ac.sha256_file(report_path) if report_path.is_file() else ""
+        if not any(
+            event.get("event") == "deterministic_helper_trace"
+            and event.get("session_id") == session_id
+            and event.get("status") == "complete"
+            and event.get("report") == str(report_path.resolve())
+            and event.get("report_sha256") == report_sha256
+            for event in run_ledger
+        ):
+            errors.append(
+                f"current deterministic helper report is not registered in the run ledger: "
+                f"{report_name}"
+            )
     contract_value = ac.load_json(root / "agent_loop_contract.json")
     event_contract = contract_value.get("tool_protocol", {}).get(
         "agent_event_contract", {}
@@ -508,23 +534,73 @@ def run(args: argparse.Namespace) -> int:
     }
     if probes:
         required_pairs.add(("dynamic_probe", "code-investigator"))
+    claim_round_scope_ids = {
+        str(round_value.get("round_id") or "")
+        for round_value in rounds.values()
+        if round_value.get("round_id") and round_value.get("claim_ids")
+    }
+    review_round_id = str(scope.get("round_id") or "")
+    if review_round_id:
+        claim_round_scope_ids.add(review_round_id)
+    if not claim_round_scope_ids:
+        claim_round_scope_ids = {"DESIGN-ROUND"}
+    planning_scope_ids = set(rounds) or {"INVESTIGATION-PLANNING"}
+    portfolio_scope_requirements: dict[
+        tuple[str, str], tuple[set[str], set[str]]
+    ] = {
+        ("architecture_mapping", "orchestrator"): (
+            {"ARCHITECTURE-MAP"}, {"ARCHITECTURE-MAP"},
+        ),
+        ("design_inventory", "spec-analyst"): (
+            {"DESIGN-INVENTORY"}, {"DESIGN-INVENTORY"},
+        ),
+        ("design_claim_resolution", "spec-analyst"): (
+            claim_round_scope_ids, claim_round_scope_ids,
+        ),
+        ("design_claim_review", "spec-critic"): (
+            claim_round_scope_ids, claim_round_scope_ids,
+        ),
+        ("investigation_planning", "orchestrator"): (
+            planning_scope_ids, planning_scope_ids,
+        ),
+        ("coverage_audit", "coverage-critic"): (
+            {"COVERAGE-AUDIT-FINAL"},
+            {"COVERAGE-AUDIT-INITIAL", "COVERAGE-AUDIT-FINAL"},
+        ),
+        ("final_judgement", "final-judge"): (
+            {"FINAL-JUDGEMENT"}, {"FINAL-JUDGEMENT"},
+        ),
+    }
     valid_checkpoints_by_pair: dict[
         tuple[str, str], list[dict[str, Any]]
     ] = {}
+    all_valid_checkpoints_by_pair: dict[
+        tuple[str, str], list[dict[str, Any]]
+    ] = {pair: [] for pair in required_pairs}
     fresh_provider_uses: dict[str, set[tuple[str, str, str]]] = {}
-    for phase, role in sorted(required_pairs):
-        candidates = [
-            event for event in run_ledger
-            if event.get("phase") == phase and event.get("role") == role
-            and event.get("status") == "complete"
+    semantic_events_by_use: dict[
+        tuple[str, str, str], list[dict[str, Any]]
+    ] = {}
+    for event in run_ledger:
+        pair = (str(event.get("phase") or ""), str(event.get("role") or ""))
+        if not (
+            pair in required_pairs
+            and event.get("session_id") == session_id
             and isinstance(event.get("event"), str)
             and str(event.get("event")).endswith(".checkpoint")
-        ]
+        ):
+            continue
+        event_errors = se.checkpoint_event_errors(
+            event, session_id=session_id, role=pair[1], phase=pair[0],
+            require_complete=False,
+        )
+        trace_contract_errors.extend(event_errors)
+        if not event_errors:
+            all_valid_checkpoints_by_pair[pair].append(event)
+    for phase, role in sorted(required_pairs):
         valid_candidates = [
-            event for event in candidates
-            if not se.checkpoint_event_errors(
-                event, session_id=session_id, role=role, phase=phase,
-            )
+            event for event in all_valid_checkpoints_by_pair[(phase, role)]
+            if event.get("status") == "complete"
         ]
         valid_checkpoints_by_pair[(phase, role)] = valid_candidates
         if not valid_candidates:
@@ -535,17 +611,12 @@ def run(args: argparse.Namespace) -> int:
             trace_contract_errors.append(
                 f"complete trace checkpoint for {phase}/{role} records no output"
             )
-        if role != "orchestrator":
-            for event in valid_candidates:
-                provider_session_id = str(event.get("provider_session_id") or "")
-                if provider_session_id:
-                    fresh_provider_uses.setdefault(provider_session_id, set()).add(
-                        (phase, role, str(event.get("task_id") or ""))
-                    )
-        for event in candidates:
-            trace_contract_errors.extend(se.checkpoint_event_errors(
-                event, session_id=session_id, role=role, phase=phase,
-            ))
+        for event in all_valid_checkpoints_by_pair[(phase, role)]:
+            provider_session_id = str(event.get("provider_session_id") or "")
+            use = (phase, role, str(event.get("scope_id") or ""))
+            if role != "orchestrator" and provider_session_id:
+                fresh_provider_uses.setdefault(provider_session_id, set()).add(use)
+            semantic_events_by_use.setdefault(use, []).append(event)
     checkpoint_risk_plan_path = root / "risk_sweep_plan.json"
     checkpoint_risk_plan = (
         ac.load_json(checkpoint_risk_plan_path)
@@ -572,6 +643,7 @@ def run(args: argparse.Namespace) -> int:
         }
     for pair, expected_candidate_ids in candidate_checkpoint_requirements.items():
         checkpoints = valid_checkpoints_by_pair.get(pair, [])
+        all_checkpoints = all_valid_checkpoints_by_pair.get(pair, [])
         observed_candidate_ids = {
             str(event.get("task_id") or "") for event in checkpoints
             if event.get("task_id")
@@ -582,6 +654,42 @@ def run(args: argparse.Namespace) -> int:
                 f"missing candidate-level trace checkpoints for {pair[0]}/{pair[1]}: "
                 f"{sorted(missing_candidate_ids)}"
             )
+        for event in all_checkpoints:
+            task_id = str(event.get("task_id") or "")
+            scope_id = str(event.get("scope_id") or "")
+            if task_id not in expected_candidate_ids:
+                trace_contract_errors.append(
+                    f"unexpected candidate-level trace checkpoint for {pair[0]}/{pair[1]}: "
+                    f"{task_id or '<missing task_id>'}"
+                )
+            elif scope_id != task_id:
+                trace_contract_errors.append(
+                    f"candidate trace scope_id must equal task_id for {pair[0]}/{pair[1]}: "
+                    f"{scope_id!r} != {task_id!r}"
+                )
+    for pair, (expected_scope_ids, allowed_scope_ids) in portfolio_scope_requirements.items():
+        if pair not in required_pairs:
+            continue
+        complete_scope_ids = {
+            str(event.get("scope_id") or "")
+            for event in valid_checkpoints_by_pair.get(pair, [])
+        }
+        all_scope_ids = {
+            str(event.get("scope_id") or "")
+            for event in all_valid_checkpoints_by_pair.get(pair, [])
+        }
+        missing_scope_ids = expected_scope_ids - complete_scope_ids
+        unexpected_scope_ids = all_scope_ids - allowed_scope_ids
+        if missing_scope_ids:
+            trace_contract_errors.append(
+                f"missing portfolio trace scope IDs for {pair[0]}/{pair[1]}: "
+                f"{sorted(missing_scope_ids)}"
+            )
+        if unexpected_scope_ids:
+            trace_contract_errors.append(
+                f"unbound portfolio trace scope IDs for {pair[0]}/{pair[1]}: "
+                f"{sorted(unexpected_scope_ids)}"
+            )
     for provider_session_id, uses in sorted(fresh_provider_uses.items()):
         if len(uses) > 1:
             trace_contract_errors.append(
@@ -589,26 +697,83 @@ def run(args: argparse.Namespace) -> int:
                 f"{provider_session_id}: {sorted(uses)}"
             )
 
+    for use, events in sorted(semantic_events_by_use.items()):
+        baseline_providers: set[str] = set()
+        repair_provider = ""
+        prior_checkpoint_seen = False
+        previous_repair_count = 0
+        previous_attempt = {0: 0, 1: 0}
+        provider_by_attempt: dict[tuple[int, int], str] = {}
+        for event in events:
+            repair_count = int(event.get("repair_count") or 0)
+            provider_attempt = int(event.get("provider_attempt") or 0)
+            provider_session_id = str(event.get("provider_session_id") or "")
+            if repair_count < previous_repair_count:
+                trace_contract_errors.append(
+                    "semantic repair_count regressed for "
+                    f"{use[0]}/{use[1]}/{use[2]}"
+                )
+            if repair_count == 1:
+                if not prior_checkpoint_seen:
+                    trace_contract_errors.append(
+                        "semantic repair has no baseline checkpoint for "
+                        f"{use[0]}/{use[1]}/{use[2]}"
+                    )
+                if use[1] != "orchestrator" and provider_session_id in baseline_providers:
+                    trace_contract_errors.append(
+                        "semantic repair reused its baseline provider session "
+                        f"{provider_session_id}: {use[0]}/{use[1]}/{use[2]}"
+                    )
+                if repair_provider and provider_session_id != repair_provider:
+                    trace_contract_errors.append(
+                        "semantic scope records more than one repair provider for "
+                        f"{use[0]}/{use[1]}/{use[2]}"
+                    )
+                repair_provider = repair_provider or provider_session_id
+            elif provider_session_id:
+                baseline_providers.add(provider_session_id)
+            prior_attempt = previous_attempt[repair_count]
+            if (
+                (prior_attempt == 0 and provider_attempt != 1)
+                or provider_attempt < prior_attempt
+                or provider_attempt > prior_attempt + 1
+            ):
+                trace_contract_errors.append(
+                    "provider attempt sequence is invalid for "
+                    f"{use[0]}/{use[1]}/{use[2]} repair={repair_count}"
+                )
+            attempt_key = (repair_count, provider_attempt)
+            recorded_provider = provider_by_attempt.get(attempt_key)
+            if recorded_provider and recorded_provider != provider_session_id:
+                trace_contract_errors.append(
+                    "one provider attempt names multiple sessions for "
+                    f"{use[0]}/{use[1]}/{use[2]} repair={repair_count} "
+                    f"attempt={provider_attempt}"
+                )
+            provider_by_attempt.setdefault(attempt_key, provider_session_id)
+            previous_attempt[repair_count] = max(prior_attempt, provider_attempt)
+            previous_repair_count = max(previous_repair_count, repair_count)
+            prior_checkpoint_seen = True
+
     retry_state: dict[
-        tuple[str, str, str, tuple[str, ...]], tuple[str, int]
+        tuple[str, str, str], tuple[str, int]
     ] = {}
+    valid_trace_events = {
+        id(event) for events in all_valid_checkpoints_by_pair.values() for event in events
+    }
     for event in run_ledger:
-        if not (
-            event.get("session_id") == session_id
-            and isinstance(event.get("event"), str)
-            and str(event.get("event")).endswith(".checkpoint")
-        ):
+        if id(event) not in valid_trace_events:
             continue
-        artifacts = tuple(sorted(
-            str(value) for value in event.get("artifacts", [])
-            if isinstance(value, str) and value
-        )) if isinstance(event.get("artifacts"), list) else ()
         base = (
             str(event.get("phase") or ""), str(event.get("role") or ""),
-            str(event.get("scope") or ""), artifacts,
+            # Candidate IDs and portfolio scope IDs are both bound above to
+            # current artifact identities, so free-form scope text cannot
+            # create a new retry identity.
+            str(event.get("scope_id") or ""),
         )
         signature = json.dumps({
             "input_sha256": event.get("input_sha256"),
+            "artifact_sha256": event.get("artifact_sha256"),
             "validation_error_categories": event.get(
                 "validation_error_categories", {}
             ),

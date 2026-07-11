@@ -22,7 +22,8 @@ python3 ${WORK_ROOT}/tools/scripts/session_event.py \
   --state-root ${STATE_ROOT} --actor "<当前角色或Task ID>" --role "<角色>" \
   --event "<phase>.checkpoint" --phase "<当前phase>" \
   --status "<ready|in_progress|complete|warning|failed>" \
-  --summary "<事实摘要>" --scope "<稳定ID与互斥范围>" \
+  --summary "<事实摘要>" --scope-id "<稳定且不可随retry改写的范围ID>" \
+  --scope "<互斥范围的事实描述>" \
   --input-artifact "<本阶段实际读取的普通文件绝对路径>" \
   [--input-artifact "<另一实际输入文件绝对路径>"] \
   --started-at "${STARTED_AT}" --ended-at "<当前UTC ISO-8601时间>" \
@@ -30,11 +31,14 @@ python3 ${WORK_ROOT}/tools/scripts/session_event.py \
   --output-count "<输出对象数>" --repair-count "<repair次数>" \
   --outcome "<terminal outcome>" --stop-reason "<停止或交接原因>" \
   [--task-id "<candidate Task ID>"] [--error-category "ERROR_CODE=count"] \
-  [--artifact "<输出artifact>"] [--completed-phase "<已完成phase>"] \
+  --artifact "<模型阶段输出artifact绝对路径>" [--artifact "<另一输出artifact绝对路径>"] \
+  [--completed-phase "<已完成phase>"] \
   [--next "<下一证据动作>"]
 ```
 
-至少传一个本阶段实际读取的普通文件作为 `--input-artifact`，需要时重复；不得传目录、软链、猜测路径或模型生成摘要。helper实际读取并排序文件，记录逐文件摘要并计算组合`input_sha256`，同时机械校验时间顺序和计数、确定性计算wall time。
+至少传一个本阶段实际读取的普通文件作为 `--input-artifact`，需要时重复；complete checkpoint至少传一个真实模型阶段输出`--artifact`；不得传目录、软链、猜测路径或模型生成摘要。`goal_runner.py`另行登记deterministic validator report的路径与digest，不把其时间戳变化算作模型进展。同一工作及其retry/repair保持`scope-id`逐值不变；candidate令它等于`task-id`。helper实际读取并排序输入及输出artifact，记录逐文件摘要并计算组合digest，同时机械校验时间顺序和计数、确定性计算wall time。只改scope/summary/outcome不算进展，语义repair必须使用fresh provider session。
+
+Portfolio scope ID逐值使用：`ARCHITECTURE-MAP`、`DESIGN-INVENTORY`；claim resolution/review与investigation planning逐round使用真实`ROUND-*`；coverage只用`COVERAGE-AUDIT-INITIAL|COVERAGE-AUDIT-FINAL`且关闭时必须有FINAL；Final Judge用`FINAL-JUDGEMENT`。不得为retry创建新scope ID。
 
 读取/搜索 review roots、写 state/log/result、session隔离 probe与受限只读 catalog fetch按 loop contract自动批准并记 `approval_events.jsonl`。修改目标树、安装/发布依赖、凭据/破坏性/无关外部副作用机械拒绝，不能等待人工审批。
 

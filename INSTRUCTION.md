@@ -44,7 +44,7 @@ python3 ${WORK_ROOT}/tools/scripts/goal_runner.py start-clock \
 }
 ```
 
-只物化 catalog 明确提供的设计来源；catalog 链接证明来源，不自动证明产品承诺了其中全部能力。执行：
+只物化 catalog 明确提供的设计来源；每个`location`必须由同项`catalog_evidence.quote`中的本地相对路径或HTTPS地址逐字绑定（只允许scheme、`www.`与末尾斜线规范化），不能引用一行真实但无关的catalog文字后替换来源。Catalog链接证明来源，不自动证明产品承诺了其中全部能力。执行：
 
 ```bash
 python3 ${WORK_ROOT}/tools/scripts/design_source_materializer.py \
@@ -95,7 +95,8 @@ python3 ${WORK_ROOT}/tools/scripts/session_event.py \
   --state-root ${STATE_ROOT} --actor "<当前角色或Task ID>" --role "<角色>" \
   --event "<phase>.checkpoint" --phase "<当前phase>" \
   --status "<ready|in_progress|complete|warning|failed>" \
-  --summary "<事实摘要>" --scope "<稳定ID与互斥范围>" \
+  --summary "<事实摘要>" --scope-id "<稳定且不可随retry改写的范围ID>" \
+  --scope "<互斥范围的事实描述>" \
   --input-artifact "<本阶段实际读取的普通文件绝对路径>" \
   [--input-artifact "<另一实际输入文件绝对路径>"] \
   --started-at "${STARTED_AT}" --ended-at "<当前UTC ISO-8601时间>" \
@@ -103,13 +104,16 @@ python3 ${WORK_ROOT}/tools/scripts/session_event.py \
   --output-count "<本阶段输出对象数>" --repair-count "<本阶段repair次数>" \
   --outcome "<terminal outcome>" --stop-reason "<停止或交接原因>" \
   [--task-id "<candidate Task ID>"] [--error-category "ERROR_CODE=count"] \
-  [--artifact "<输出artifact>"] [--completed-phase "<已完成phase>"] \
+  --artifact "<模型阶段输出artifact绝对路径>" [--artifact "<另一输出artifact绝对路径>"] \
+  [--completed-phase "<已完成phase>"] \
   [--next "<下一证据动作>"]
 ```
 
-每个 `--input-artifact` 必须是本阶段实际读取的现存普通文件，不得是目录、软链或猜测路径；至少传一个，可重复。`session_event.py` 读取并排序这些文件，记录逐文件路径/大小/SHA-256并计算组合 `input_sha256`，同时机械校验时间顺序和计数、由 started/ended 计算 wall time；模型不得手填摘要，重复错误不得逐条灌入主上下文。
+每个 `--input-artifact` 必须是本阶段实际读取的现存普通文件，不得是目录、软链或猜测路径；至少传一个，可重复。Complete checkpoint还必须传至少一个真实模型阶段输出`--artifact`；failed/warning且没有输出时可省略。`goal_runner.py`会把每个deterministic validator report的真实路径与digest另行登记到ledger，不能用带时间戳的validator report伪造模型输出进展。`--scope-id` 在同一语义工作及其repair/retry间必须逐值不变；candidate checkpoint令它等于同一命令的`--task-id`，非candidate使用document/round/phase的稳定ID。`session_event.py` 读取并排序输入与声明的输出artifact，记录逐文件路径/大小/SHA-256并计算组合digest，同时机械校验时间顺序和计数、由 started/ended 计算 wall time；模型不得手填摘要。只改scope/summary/outcome不算进展，语义repair必须切换fresh provider session。
 
 主要phase/role必须逐字使用以下配对并各产生至少一个`status=complete,output_count>0` checkpoint：`architecture_mapping/orchestrator`、`design_inventory/spec-analyst`、`code_risk_backtracking/risk-explorer`、`design_claim_resolution/spec-analyst`、`design_claim_review/spec-critic`、`investigation_planning/orchestrator`、`investigation/code-investigator`、`critic_review/evidence-critic`、`coverage_audit/coverage-critic`、`final_judgement/final-judge`；存在probe时还需`dynamic_probe/code-investigator`。Risk每个sweep单独用`--task-id ${SWEEP_ID}`；Investigator每个finding用其`${TASK_ID}`；probe与critic每个finding用`--task-id ${FINDING_ID}`。每个candidate使用自己的fresh provider session。Final gate复算checkpoint的输入清单摘要、时间与计数并拒绝缺失phase/candidate。
+
+非candidate的`scope-id`也由当前artifact身份冻结，不能自由命名：architecture=`ARCHITECTURE-MAP`，inventory=`DESIGN-INVENTORY`；每个claim resolution/review batch与investigation plan逐个使用其真实`ROUND-*`；coverage补扫前可用`COVERAGE-AUDIT-INITIAL`，最终关闭必须用`COVERAGE-AUDIT-FINAL`；Final Judge统一使用`FINAL-JUDGEMENT`。Final gate只接受当前`investigation_rounds.jsonl`和`claim_review_scope.json`实际存在的round ID；改写scope ID不能重置repair/no-progress历史。
 
 读取/搜索 review roots、写 session/result/log、在 session隔离副本做低成本 probe，以及从 supplied catalog进行受限只读 HTTPS materialization按 contract自动批准并写 `approval_events.jsonl`。修改目标树、凭据访问、依赖安装/发布、破坏性命令或无关外部副作用机械拒绝；不得转成人工等待。
 

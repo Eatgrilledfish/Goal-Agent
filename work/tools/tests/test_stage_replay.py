@@ -116,7 +116,7 @@ def replay_source(tmp_path: Path) -> dict[str, Path | str]:
         "state": str(state / "agent_loop_state.json"),
     }
     ac.save_json(state / "agent_loop_contract.json", {
-        "contract_version": 13,
+        "contract_version": 14,
         "execution_model": "opencode-owned-model-driven-loop",
         "session": {"session_id": session_id, "artifacts": artifacts},
         "coverage_contract": {
@@ -525,6 +525,24 @@ def replay_source(tmp_path: Path) -> dict[str, Path | str]:
     }])
     _write_jsonl(state / "agent_run_ledger.jsonl", [])
     _write_jsonl(state / "approval_events.jsonl", [])
+    session_prepared = trace / "session_prepared.json"
+    ac.save_json(session_prepared, {
+        "ok": True, "session_id": session_id, "prepared_at": "2026-01-01T00:00:00Z",
+    })
+    ac.append_jsonl(state / "agent_run_ledger.jsonl", {
+        "recorded_at": "2026-01-01T00:00:00Z",
+        "session_id": session_id,
+        "event": "deterministic_helper_trace",
+        "actor": "goal_runner",
+        "phase": "prepare",
+        "status": "complete",
+        "helper": "workspace_inventory.py",
+        "started_at": "2026-01-01T00:00:00Z",
+        "ended_at": "2026-01-01T00:00:00Z",
+        "returncode": 0,
+        "report": str(session_prepared.resolve()),
+        "report_sha256": ac.sha256_file(session_prepared),
+    })
     ac.save_json(state / "coverage_audit.json", {"session_id": session_id})
     ac.save_json(state / "semantic_coverage.json", {"session_id": session_id})
     ac.save_json(state / "coverage_supplement_history.json", {
@@ -775,7 +793,7 @@ def test_claims_prepare_writes_frozen_manifest_and_no_llm(replay_source, tmp_pat
     assert manifest["development_only"] is True
     assert manifest["llm_invoked"] is False
     assert manifest["runtime"] == {"provider": "provider-a", "model": "model-b"}
-    assert manifest["schema"]["contract_version"] == 13
+    assert manifest["schema"]["contract_version"] == 14
     assert len(manifest["source_digest"]) == 64
     assert len(manifest["replay_input_digest"]) == 64
     assert len(manifest["prompt"]["sha256"]) == 64
@@ -1253,6 +1271,54 @@ def test_claims_local_schema_replay_is_isolated(replay_source, tmp_path):
     assert ac.sha256_file(source_claims) == before
 
 
+def test_claims_local_replay_corrupt_raw_json_fails_closed(
+    replay_source, tmp_path,
+):
+    replay = tmp_path / "replay-claims-corrupt-json"
+    stage_replay.prepare_replay(
+        source_state=replay_source["state"], replay_root=replay,
+        stage="claims", run_local=True,
+    )
+    raw_path = replay / "state" / "handoffs" / "design" / "claims.raw.jsonl"
+    raw_path.write_bytes(b"{broken claim artifact\n")
+
+    assert stage_replay.run_local(replay) == 1
+    assert not (replay / "state" / "design_claims.jsonl").exists()
+    materialization = ac.load_json(
+        replay / "logs" / "trace" / "design_claim_materialization.json"
+    )
+    assert materialization["passed"] is False
+    assert materialization["errors"]
+    execution = ac.load_json(replay / "logs" / "trace" / "stage_replay_local.json")
+    assert execution["command"][1].endswith("design_source_materializer.py")
+    assert execution["preflight"]["returncode"] == 1
+
+
+def test_claims_local_replay_invalid_source_ref_fails_closed(
+    replay_source, tmp_path,
+):
+    replay = tmp_path / "replay-claims-invalid-source-ref"
+    stage_replay.prepare_replay(
+        source_state=replay_source["state"], replay_root=replay,
+        stage="claims", run_local=True,
+    )
+    raw_path = replay / "state" / "handoffs" / "design" / "claims.raw.jsonl"
+    raw_claims = _jsonl(raw_path)
+    raw_claims[0]["source_ref"]["line_end"] = 999
+    _write_jsonl(raw_path, raw_claims)
+
+    assert stage_replay.run_local(replay) == 1
+    assert not (replay / "state" / "design_claims.jsonl").exists()
+    materialization = ac.load_json(
+        replay / "logs" / "trace" / "design_claim_materialization.json"
+    )
+    assert materialization["passed"] is False
+    assert any("exceeds" in error for error in materialization["errors"])
+    execution = ac.load_json(replay / "logs" / "trace" / "stage_replay_local.json")
+    assert execution["command"][1].endswith("design_source_materializer.py")
+    assert execution["preflight"]["returncode"] == 1
+
+
 def test_gate_local_replay_uses_existing_deterministic_runner(
     replay_source, tmp_path, monkeypatch,
 ):
@@ -1272,6 +1338,7 @@ def test_gate_local_replay_uses_existing_deterministic_runner(
     assert (replay / "state" / "design_lookup_requests.jsonl").is_file()
     assert (replay / "state" / "coverage_supplement_history.json").is_file()
     assert (replay / "logs" / "trace" / "risk_sweep_plan_validation.json").is_file()
+    assert (replay / "logs" / "trace" / "session_prepared.json").is_file()
     assert (replay / "logs" / "trace" / "claim_review_validation.json").is_file()
     assert (replay / "logs" / "trace" / "task_plan_validation.json").is_file()
     assert (replay / "logs" / "trace" / "task_lifecycle_validation.json").is_file()

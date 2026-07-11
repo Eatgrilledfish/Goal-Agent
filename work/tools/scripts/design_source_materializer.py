@@ -100,6 +100,71 @@ def _target_path(output_root: Path, relative: str) -> Path | None:
     return ac.contained_path(output_root, relative)
 
 
+def _paths_overlap(first: Path, second: Path) -> bool:
+    try:
+        first.relative_to(second)
+        return True
+    except ValueError:
+        pass
+    try:
+        second.relative_to(first)
+        return True
+    except ValueError:
+        return False
+
+
+_CATALOG_URL_RE = re.compile(
+    r"(?<![A-Za-z0-9_./-])(?:https://)?(?:www\.)?"
+    r"(?:[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z0-9-]+"
+    r"(?::\d+)?(?:/[^\s<>\"'\]\)}]*)?",
+    re.IGNORECASE,
+)
+
+
+def _canonical_catalog_url(value: str) -> tuple[str, int | None, str, str, str] | None:
+    candidate = value.rstrip(".,;:!?")
+    if "://" not in candidate:
+        candidate = "https://" + candidate
+    parsed = urlparse(candidate)
+    if parsed.scheme.lower() != "https" or not parsed.hostname:
+        return None
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+    host = parsed.hostname.lower()
+    if host.startswith("www."):
+        host = host[4:]
+    path = (parsed.path or "/").rstrip("/") or "/"
+    return host, port, path, parsed.query, parsed.fragment
+
+
+def _catalog_cites_location(kind: str, location: str, quote: str) -> bool:
+    """Bind a selected source to an equal path/URL token in exact catalog evidence."""
+    normalized_quote = quote.replace("\\", "/")
+    if kind == "url":
+        expected = _canonical_catalog_url(location)
+        return bool(expected) and any(
+            _canonical_catalog_url(match.group(0)) == expected
+            for match in _CATALOG_URL_RE.finditer(normalized_quote)
+        )
+    if kind == "local":
+        path = Path(location)
+        if path.is_absolute():
+            return False
+        key = path.as_posix()
+        while key.startswith("./"):
+            key = key[2:]
+        if not key:
+            return False
+        pattern = re.compile(
+            rf"(?<![A-Za-z0-9_./-])(?:\./)?{re.escape(key)}"
+            rf"(?![A-Za-z0-9_./-])"
+        )
+        return pattern.search(normalized_quote) is not None
+    return False
+
+
 def _fetch(url: str, maximum_bytes: int, timeout_seconds: int) -> tuple[bytes, str]:
     parsed = urlparse(url)
     if parsed.scheme != "https" or not parsed.netloc:
@@ -332,7 +397,7 @@ def materialize_artifact(args: argparse.Namespace) -> int:
 
 def materialize(args: argparse.Namespace) -> int:
     source_root = Path(args.source_root).resolve()
-    output_root = ac.ensure_dir(Path(args.output_root).resolve())
+    output_root = Path(args.output_root).resolve()
     plan_path = Path(args.plan).resolve()
     manifest_path = Path(args.manifest).resolve()
     approval_log = Path(args.approval_log).resolve() if args.approval_log else None
@@ -343,11 +408,32 @@ def materialize(args: argparse.Namespace) -> int:
         errors.append(f"source root is not a directory: {source_root}")
     if not plan_path.is_file():
         errors.append(f"design source plan is missing: {plan_path}")
+    for label, path in (
+        ("output root", output_root),
+        ("design source plan", plan_path),
+        ("manifest", manifest_path),
+        ("approval log", approval_log),
+    ):
+        if path is not None and _paths_overlap(path, source_root):
+            errors.append(f"{label} must be outside the supplied source root: {path}")
     if errors:
-        ac.save_json(manifest_path, {"materialized_at": ac.now_iso(), "passed": False, "errors": errors, "sources": []})
+        if not _paths_overlap(manifest_path, source_root):
+            ac.save_json(manifest_path, {
+                "materialized_at": ac.now_iso(), "passed": False,
+                "errors": errors, "sources": [],
+            })
+        print(json.dumps({"passed": False, "sources": 0, "errors": len(errors)}))
         return 2
+    ac.ensure_dir(output_root)
 
-    plan = ac.load_json(plan_path)
+    try:
+        plan = ac.load_json(plan_path)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        # A model-authored plan is untrusted input.  Preserve the normal
+        # machine-readable failure contract instead of leaking a traceback and
+        # leaving the orchestrator without a repairable manifest.
+        errors.append(f"could not load design source plan: {exc}")
+        plan = {}
     if not isinstance(plan, dict) or not isinstance(plan.get("sources"), list):
         errors.append("plan must be an object with a sources array")
         sources: list[Any] = []
@@ -405,6 +491,12 @@ def materialize(args: argparse.Namespace) -> int:
         )
         if catalog and evidence_path != catalog:
             evidence_errors.append(f"{label}.catalog_evidence must cite plan catalog_path")
+        if not evidence_errors and not _catalog_cites_location(
+            kind, location, str(catalog_evidence.get("quote") or ""),
+        ):
+            evidence_errors.append(
+                f"{label}.location is not cited by catalog_evidence.quote"
+            )
         if evidence_errors:
             errors.extend(evidence_errors)
             continue

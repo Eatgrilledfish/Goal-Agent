@@ -40,6 +40,7 @@ def _input_file(tmp_path: Path, name: str = "input.json", text: str = "{}\n") ->
 def _required_args(
     root: Path,
     inputs: list[Path],
+    output_artifact: Path | None = None,
     **overrides: str,
 ) -> list[str]:
     values = {
@@ -49,6 +50,7 @@ def _required_args(
         "status": "complete",
         "summary": "Candidate evidence review completed.",
         "event": "critic.completed",
+        "scope_id": "FINDING-017",
         "scope": "claim=CLAIM-009;finding=FINDING-017",
         "started_at": "2026-07-11T02:03:04.250Z",
         "ended_at": "2026-07-11T02:04:34.750Z",
@@ -65,6 +67,7 @@ def _required_args(
         args.extend([f"--{name.replace('_', '-')}", value])
     for path in inputs:
         args.extend(["--input-artifact", str(path)])
+    args.extend(["--artifact", str(output_artifact or inputs[0])])
     return args
 
 
@@ -93,10 +96,12 @@ def test_trace_event_records_required_fields_and_real_input_digests(tmp_path: Pa
     root = _state_root(tmp_path)
     first = _input_file(tmp_path, "zeta.json", '{"z": 1}\n')
     second = _input_file(tmp_path, "alpha.md", "# actual input\n")
+    output = _input_file(tmp_path, "critic_reviews.jsonl", '{"decision":"accept"}\n')
 
     assert session_event.main(_required_args(
         root,
         [first, second],
+        output_artifact=output,
         role="evidence_critic",
         provider_attempt="2",
         output_count="3",
@@ -108,7 +113,6 @@ def test_trace_event_records_required_fields_and_real_input_digests(tmp_path: Pa
         "--error-category", "CLAIM_GROUP_GAP=4",
         "--completed-phase", "candidate_review",
         "--metric", "reviewed=2",
-        "--artifact", "critic_reviews.jsonl",
         "--next", "Run coverage supplement.",
     ]) == 0
 
@@ -126,6 +130,7 @@ def test_trace_event_records_required_fields_and_real_input_digests(tmp_path: Pa
     assert event["actor"] == "orchestrator"
     assert event["role"] == "evidence_critic"
     assert event["task_id"] == "TASK-017"
+    assert event["scope_id"] == "FINDING-017"
     assert event["scope"] == "claim=CLAIM-009;finding=FINDING-017"
     assert event["started_at"] == "2026-07-11T02:03:04.250Z"
     assert event["ended_at"] == "2026-07-11T02:04:34.750Z"
@@ -136,7 +141,15 @@ def test_trace_event_records_required_fields_and_real_input_digests(tmp_path: Pa
     assert event["repair_count"] == 1
     assert event["outcome"] == "accepted"
     assert event["stop_reason"] == "candidate_evidence_closed"
-    assert event["artifacts"] == ["critic_reviews.jsonl"]
+    assert event["artifacts"] == [str(output)]
+    assert event["artifact_snapshots"] == [{
+        "path": str(output),
+        "sha256": ac.sha256_file(output),
+        "size_bytes": output.stat().st_size,
+    }]
+    assert event["artifact_sha256"] == _expected_combined_digest(
+        event["artifact_snapshots"]
+    )
 
     expected_records = [
         {
@@ -174,8 +187,10 @@ def test_input_digest_is_independent_of_repeated_argument_order(tmp_path: Path) 
     [
         "--event",
         "--role",
+        "--scope-id",
         "--scope",
         "--input-artifact",
+        "--artifact",
         "--started-at",
         "--ended-at",
         "--provider-attempt",
@@ -273,6 +288,7 @@ def test_legacy_model_supplied_input_digest_is_rejected(
     ("overrides", "extra_args", "message"),
     [
         ({"event": "not an id"}, [], "event must match"),
+        ({"scope_id": "not an id"}, [], "scope-id must match"),
         ({"scope": ""}, [], "must not be empty"),
         ({"started_at": "2026-07-11T02:03:04"}, [], "must include a timezone"),
         (
