@@ -20,6 +20,7 @@ from typing import Any, Callable
 
 import agent_common as ac
 import handoff_template as ht
+import risk_sweep_plan_validator as rpv
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -91,6 +92,7 @@ CORE_FILES = (
 
 GATE_STATE_FILES = (
     "architecture_map.json",
+    "risk_sweep_plan.json",
     "design_agent_manifest.json",
     "design_coverage.json",
     "claim_review_scope.json",
@@ -453,48 +455,29 @@ def _prepare_stage_inputs(
         return selection
 
     if stage == "risk":
-        _copy_named(copier, [("architecture_map.json", True)])
-        architecture = ac.load_json(state / "architecture_map.json")
-        contract = ac.load_json(state / "agent_loop_contract.json")
-        boundaries = [
-            item for item in architecture.get("integration_boundaries", [])
-            if isinstance(item, dict) and item.get("boundary_id")
-        ]
-        selected_boundaries = ([
-            str(item["boundary_id"]) for item in boundaries if item.get("risk") == "high"
-        ] or ([str(boundaries[0]["boundary_id"])] if boundaries else []))[:1]
-        planes = [
-            item for item in architecture.get("implementation_planes", [])
-            if isinstance(item, dict) and item.get("plane_id")
-        ]
-        parallel_plane_ids = {
-            str(plane_id)
-            for path in architecture.get("parallel_behavior_paths", [])
-            if isinstance(path, dict)
-            for plane_id in path.get("plane_ids", []) if plane_id
-        }
-        selected_planes = ([
-            str(item["plane_id"]) for item in planes
-            if str(item["plane_id"]) in parallel_plane_ids
-        ] or ([str(planes[0]["plane_id"])] if planes else []))[:2]
-        lenses = [
-            str(value) for value in contract.get("coverage_contract", {}).get(
-                "portfolio_lenses", [],
-            ) if isinstance(value, str) and value
-        ]
-        if not selected_boundaries or not selected_planes or not lenses:
+        _copy_named(copier, [
+            ("architecture_map.json", True), ("risk_sweep_plan.json", True),
+        ])
+        plan, index, errors = rpv.load_validated_plan(copier.state_root)
+        if errors:
             raise ReplayError(
-                "risk replay needs at least one mapped boundary, plane, and contract lens"
+                "risk replay requires a currently validated risk sweep plan: "
+                + "; ".join(errors)
             )
-        return {
-            "architecture_boundaries": selected_boundaries,
-            "implementation_planes": selected_planes,
-            "review_lenses": [lenses[0]],
+        raw_slices = plan.get("slices", []) if isinstance(plan, dict) else []
+        selected = raw_slices[0] if raw_slices and isinstance(raw_slices[0], dict) else None
+        if not selected or selected.get("sweep_id") not in index.get("slices", {}):
+            raise ReplayError("risk replay cannot select the first validated risk sweep slice")
+        return dict(selected) | {
+            "risk_sweep_plan_sha256": ac.sha256_file(
+                copier.state_root / "risk_sweep_plan.json"
+            ),
         }
 
     if stage == "plan":
         _copy_named(copier, [
-            ("architecture_map.json", True), ("design_coverage.json", True),
+            ("architecture_map.json", True), ("risk_sweep_plan.json", True),
+            ("design_coverage.json", True),
             ("design_claims.jsonl", True), ("claim_review_scope.json", True),
             ("risk_observations.jsonl", False),
             ("coverage_audit.json", False), ("semantic_coverage.json", False),
@@ -503,7 +486,8 @@ def _prepare_stage_inputs(
 
     if stage == "coverage":
         _copy_named(copier, [
-            ("architecture_map.json", True), ("design_agent_manifest.json", True),
+            ("architecture_map.json", True), ("risk_sweep_plan.json", True),
+            ("design_agent_manifest.json", True),
             ("design_coverage.json", True), ("design_claims.jsonl", True),
             ("claim_review_scope.json", True), ("design_claim_review.json", True),
             ("risk_observations.jsonl", True),
@@ -541,7 +525,8 @@ def _prepare_stage_inputs(
             "design_claims.jsonl", claims, key="claim_id", identifiers=[claim_id],
         )
         _copy_named(copier, [
-            ("architecture_map.json", True), ("design_coverage.json", False),
+            ("architecture_map.json", True), ("risk_sweep_plan.json", True),
+            ("design_coverage.json", False),
         ])
         risk_ids = _risk_ids(task)
         risk_path = state / "risk_observations.jsonl"
@@ -670,7 +655,8 @@ def _copy_gate_support(copier: ArtifactCopier, manifest: dict[str, Any]) -> None
             if not (
                 name in {
                     "design_validation.json", "claim_review_validation.json",
-                    "architecture_validation.json", "task_validation.json",
+                    "architecture_validation.json", "risk_sweep_plan_validation.json",
+                    "task_validation.json",
                     "coverage_validation.json", "evidence_validation.json",
                 }
                 or name.endswith("-handoff-merge.json")
@@ -761,15 +747,20 @@ def _prompt_inputs(stage: str, records: list[dict[str, Any]]) -> list[str]:
             "state/design_claims.jsonl", "state/claim_review_scope.json",
             "state/design_claim_review.json",
         },
-        "risk": {"state/agent_loop_contract.json", "state/architecture_map.json"},
+        "risk": {
+            "state/agent_loop_contract.json", "state/architecture_map.json",
+            "state/risk_sweep_plan.json",
+        },
         "plan": {
             "state/agent_loop_contract.json", "state/architecture_map.json",
+            "state/risk_sweep_plan.json",
             "state/design_coverage.json", "state/design_claims.jsonl",
             "state/claim_review_scope.json", "state/risk_observations.jsonl", "state/coverage_audit.json",
             "state/semantic_coverage.json",
         },
         "investigator": {
-            "state/architecture_map.json", "state/design_coverage.json",
+            "state/architecture_map.json", "state/risk_sweep_plan.json",
+            "state/design_coverage.json",
             "state/design_claims.jsonl", "state/investigation_tasks.jsonl",
             "state/risk_observations.jsonl",
         },
@@ -785,7 +776,8 @@ def _prompt_inputs(stage: str, records: list[dict[str, Any]]) -> list[str]:
         },
         "coverage": {
             "state/agent_loop_contract.json", "state/workspace_manifest.json",
-            "state/architecture_map.json", "state/design_agent_manifest.json",
+            "state/architecture_map.json", "state/risk_sweep_plan.json",
+            "state/design_agent_manifest.json",
             "state/design_coverage.json", "state/design_claims.jsonl",
             "state/claim_review_scope.json", "state/design_claim_review.json",
             "state/risk_observations.jsonl",

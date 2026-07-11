@@ -203,6 +203,13 @@ def validate_architecture(
         errors.extend(_string(item, "name", item_label))
         _, item_errors = _string_array(item, "paths", item_label, allow_empty=False)
         errors.extend(item_errors)
+        plane_ids, item_errors = _string_array(
+            item, "plane_ids", item_label, allow_empty=False,
+        )
+        errors.extend(item_errors)
+        unknown_planes = set(plane_ids) - set(plane_index)
+        if unknown_planes:
+            errors.append(f"{item_label}: unknown plane_ids {sorted(unknown_planes)}")
         if item.get("risk") not in BOUNDARY_RISKS:
             errors.append(f"{item_label}: invalid risk {item.get('risk')!r}")
         errors.extend(_string(item, "why", item_label))
@@ -1294,6 +1301,7 @@ def _stage_inputs(root: Path, stage: str) -> list[Path]:
     if stage == "architecture":
         return common
     common.extend([
+        root / "risk_sweep_plan.json",
         root / "design_agent_manifest.json", root / "design_coverage.json",
         root / "claim_review_scope.json", root / "design_claim_review.json",
         root / "design_claims.jsonl",

@@ -37,8 +37,12 @@ def replay_source(tmp_path: Path) -> dict[str, Path | str]:
     for path in (state, trace, result, code, design, review_code, review_design):
         path.mkdir(parents=True, exist_ok=True)
     (code / "service.py").write_text("def accept(value):\n    return True\n", encoding="utf-8")
+    (code / "audit.py").write_text("def record(value):\n    return value\n", encoding="utf-8")
     (design / "contract.md").write_text("The service must reject invalid values.\n", encoding="utf-8")
     (review_code / "service.py").write_text("def accept(value):\n    return True\n", encoding="utf-8")
+    (review_code / "audit.py").write_text(
+        "def record(value):\n    return value\n", encoding="utf-8",
+    )
     (review_design / "contract.md").write_text(
         "The service must reject invalid values.\n", encoding="utf-8",
     )
@@ -96,7 +100,7 @@ def replay_source(tmp_path: Path) -> dict[str, Path | str]:
         "state": str(state / "agent_loop_state.json"),
     }
     ac.save_json(state / "agent_loop_contract.json", {
-        "contract_version": 11,
+        "contract_version": 12,
         "execution_model": "opencode-owned-model-driven-loop",
         "session": {"session_id": session_id, "artifacts": artifacts},
         "coverage_contract": {
@@ -117,13 +121,60 @@ def replay_source(tmp_path: Path) -> dict[str, Path | str]:
         "implementation_planes": [{
             "plane_id": "PLANE-SERVICE", "kind": "owned", "paths": ["service.py"],
             "reachable_evidence": "The public function executes directly.",
+        }, {
+            "plane_id": "PLANE-AUDIT", "kind": "owned", "paths": ["audit.py"],
+            "reachable_evidence": "The audit function executes independently.",
         }],
         "integration_boundaries": [{
             "boundary_id": "BOUNDARY-SERVICE", "name": "service API",
-            "paths": ["service.py"], "risk": "high",
+            "paths": ["service.py"], "plane_ids": ["PLANE-SERVICE"], "risk": "high",
             "why": "The behavior is externally visible.",
+        }, {
+            "boundary_id": "BOUNDARY-AUDIT", "name": "audit API",
+            "paths": ["audit.py"], "plane_ids": ["PLANE-AUDIT"], "risk": "high",
+            "why": "The audit behavior is independently externally visible.",
         }],
         "parallel_behavior_paths": [],
+    })
+    ac.save_json(state / "risk_sweep_plan.json", {
+        "session_id": session_id,
+        "plan_id": "RISK-PLAN-001",
+        "architecture_map_sha256": ac.sha256_file(state / "architecture_map.json"),
+        "required_coverage": {
+            "boundary_ids": ["BOUNDARY-SERVICE", "BOUNDARY-AUDIT"],
+            "plane_ids": ["PLANE-SERVICE", "PLANE-AUDIT"],
+            "parallel_path_ids": [],
+        },
+        "slices": [{
+            "sweep_id": "RISK-SWEEP-SERVICE",
+            "architecture_boundaries": ["BOUNDARY-SERVICE"],
+            "implementation_planes": ["PLANE-SERVICE"],
+            "parallel_path_ids": [],
+            "anchor_paths": ["service.py"],
+            "review_lenses": ["input acceptance"],
+            "scope_rationale": "The service API is an independent execution component.",
+        }, {
+            "sweep_id": "RISK-SWEEP-AUDIT",
+            "architecture_boundaries": ["BOUNDARY-AUDIT"],
+            "implementation_planes": ["PLANE-AUDIT"],
+            "parallel_path_ids": [],
+            "anchor_paths": ["audit.py"],
+            "review_lenses": ["input acceptance"],
+            "scope_rationale": "The audit API is an independent execution component.",
+        }],
+    })
+    risk_plan_digest = ac.sha256_file(state / "risk_sweep_plan.json")
+    ac.save_json(trace / "risk_sweep_plan_validation.json", {
+        "validated_at": "2026-01-01T00:00:00Z",
+        "session_id": session_id,
+        "passed": True,
+        "input_digests": {
+            "architecture_map.json": ac.sha256_file(state / "architecture_map.json"),
+            "risk_sweep_plan.json": risk_plan_digest,
+            "agent_loop_contract.json": ac.sha256_file(state / "agent_loop_contract.json"),
+        },
+        "validated_sweep_ids": ["RISK-SWEEP-AUDIT", "RISK-SWEEP-SERVICE"],
+        "errors": [],
     })
     claims = [
         {
@@ -254,8 +305,26 @@ def replay_source(tmp_path: Path) -> dict[str, Path | str]:
     ]
     _write_jsonl(state / "investigation_tasks.jsonl", tasks)
     _write_jsonl(state / "risk_observations.jsonl", [
-        {"observation_id": "OBS-1", "session_id": session_id, "summary": "Direct path."},
-        {"observation_id": "OBS-2", "session_id": session_id, "summary": "Adapter path."},
+        {
+            "observation_id": "OBS-1", "session_id": session_id,
+            "sweep_id": "RISK-SWEEP-SERVICE",
+            "risk_sweep_plan_sha256": risk_plan_digest,
+            "summary": "Direct path.",
+            "review_lenses": ["input acceptance"],
+            "architecture_boundaries": ["BOUNDARY-SERVICE"],
+            "implementation_planes": ["PLANE-SERVICE"],
+            "parallel_path_ids": [],
+        },
+        {
+            "observation_id": "OBS-2", "session_id": session_id,
+            "sweep_id": "RISK-SWEEP-AUDIT",
+            "risk_sweep_plan_sha256": risk_plan_digest,
+            "summary": "Audit path.",
+            "review_lenses": ["input acceptance"],
+            "architecture_boundaries": ["BOUNDARY-AUDIT"],
+            "implementation_planes": ["PLANE-AUDIT"],
+            "parallel_path_ids": [],
+        },
     ])
     findings = [
         {
@@ -325,7 +394,7 @@ def test_claims_prepare_writes_frozen_manifest_and_no_llm(replay_source, tmp_pat
     assert manifest["development_only"] is True
     assert manifest["llm_invoked"] is False
     assert manifest["runtime"] == {"provider": "provider-a", "model": "model-b"}
-    assert manifest["schema"]["contract_version"] == 11
+    assert manifest["schema"]["contract_version"] == 12
     assert len(manifest["source_digest"]) == 64
     assert len(manifest["replay_input_digest"]) == 64
     assert len(manifest["prompt"]["sha256"]) == 64
@@ -358,6 +427,13 @@ def test_claim_review_and_risk_replays_enforce_opposite_source_boundaries(
     assert not (claim_replay / "state" / "architecture_map.json").exists()
     assert (claim_replay / "state" / "design_claim_review.json").is_file()
 
+    # Deliberately put the audit slice first even though the architecture lists
+    # the service boundary first.  Replay must follow the validated plan, not a
+    # boundary-risk heuristic.
+    risk_plan_path = replay_source["state"] / "risk_sweep_plan.json"
+    risk_plan = ac.load_json(risk_plan_path)
+    risk_plan["slices"].reverse()
+    ac.save_json(risk_plan_path, risk_plan)
     risk_replay = tmp_path / "replay-risk"
     stage_replay.prepare_replay(
         source_state=replay_source["state"], replay_root=risk_replay, stage="risk",
@@ -368,13 +444,22 @@ def test_claim_review_and_risk_replays_enforce_opposite_source_boundaries(
     }
     assert risk_envelope["inputs"] == [
         "state/agent_loop_contract.json", "state/architecture_map.json",
+        "state/risk_sweep_plan.json",
     ]
     assert risk_envelope["selection"] == {
-        "architecture_boundaries": ["BOUNDARY-SERVICE"],
-        "implementation_planes": ["PLANE-SERVICE"],
+        "sweep_id": "RISK-SWEEP-AUDIT",
+        "architecture_boundaries": ["BOUNDARY-AUDIT"],
+        "implementation_planes": ["PLANE-AUDIT"],
+        "parallel_path_ids": [],
+        "anchor_paths": ["audit.py"],
         "review_lenses": ["input acceptance"],
+        "scope_rationale": "The audit API is an independent execution component.",
+        "risk_sweep_plan_sha256": ac.sha256_file(
+            risk_plan_path
+        ),
     }
     assert (risk_replay / "state" / "architecture_map.json").is_file()
+    assert (risk_replay / "state" / "risk_sweep_plan.json").is_file()
     assert not (risk_replay / "state" / "design_claims.jsonl").exists()
     assert not (risk_replay / "state" / "design_coverage.json").exists()
     assert not (risk_replay / "prompt-assets" / "output_schema.json").exists()
@@ -424,6 +509,8 @@ def test_investigator_replay_copies_only_selected_task_context(replay_source, tm
     assert [item["observation_id"] for item in _jsonl(
         replay / "state" / "risk_observations.jsonl",
     )] == ["OBS-2"]
+    envelope = ac.load_json(replay / "prompt_envelope.json")
+    assert "state/risk_sweep_plan.json" in envelope["inputs"]
     assert not (replay / "state" / "investigation_findings.jsonl").exists()
     assert not (replay / "state" / "unrelated-evaluation-data.json").exists()
     assert (replay / "state" / "handoff-templates" / "investigators" / "TASK-2.json").is_file()
@@ -436,8 +523,10 @@ def test_plan_replay_includes_current_claim_scope(replay_source, tmp_path):
     )
 
     assert (replay / "state" / "claim_review_scope.json").is_file()
+    assert (replay / "state" / "risk_sweep_plan.json").is_file()
     envelope = ac.load_json(replay / "prompt_envelope.json")
     assert "state/claim_review_scope.json" in envelope["inputs"]
+    assert "state/risk_sweep_plan.json" in envelope["inputs"]
 
 
 @pytest.mark.parametrize(
@@ -498,6 +587,8 @@ def test_gate_local_replay_uses_existing_deterministic_runner(
     )
     assert (replay / "state" / "review-inputs" / "code" / "service.py").is_file()
     assert (replay / "state" / "review-inputs" / "design" / "contract.md").is_file()
+    assert (replay / "state" / "risk_sweep_plan.json").is_file()
+    assert (replay / "logs" / "trace" / "risk_sweep_plan_validation.json").is_file()
     calls: list[list[str]] = []
 
     def fake_run(command, **kwargs):
@@ -539,6 +630,7 @@ def test_coverage_local_replay_uses_coverage_gate_only(
     assert envelope["read_only_source_roots"] == {}
     assert "state/claim_review_scope.json" in envelope["inputs"]
     assert "state/design_claim_review.json" in envelope["inputs"]
+    assert "state/risk_sweep_plan.json" in envelope["inputs"]
     assert "state/dynamic_probes.jsonl" not in envelope["inputs"]
     execution = ac.load_json(replay / "logs" / "trace" / "stage_replay_local.json")
     assert execution["kind"] == "coverage_validation"

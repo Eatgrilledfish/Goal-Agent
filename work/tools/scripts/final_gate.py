@@ -12,6 +12,7 @@ from typing import Any
 import agent_common as ac
 import handoff_merge as hm
 import report_writer as rw
+import risk_sweep_plan_validator as rpv
 import stage_artifact_validator as sav
 import verdict_validator as vv
 
@@ -343,15 +344,40 @@ def run(args: argparse.Namespace) -> int:
         if not stage_validation_current(stage):
             errors.append(f"passed digest-bound {stage} validation trace is missing or stale")
 
-    def valid_merge_report(path: Path, expected_ids: set[str], ledger_path: Path) -> bool:
+    def valid_merge_report(
+        path: Path, artifact_type: str, expected_ids: set[str], ledger_path: Path,
+    ) -> bool:
         if not path.is_file() or not ledger_path.is_file():
             return False
         report = ac.load_json(path)
-        return (
+        current = (
             report.get("passed") is True
             and set(report.get("validated_ids", [])) == expected_ids
             and report.get("ledger_sha256") == ac.sha256_file(ledger_path)
         )
+        if artifact_type == "risk":
+            plan_path = root / "risk_sweep_plan.json"
+            architecture_path = root / "architecture_map.json"
+            loaded_plan = ac.load_json(plan_path) if plan_path.is_file() else {}
+            plan = loaded_plan if isinstance(loaded_plan, dict) else {}
+            expected_sweeps = {
+                str(item.get("sweep_id"))
+                for item in plan.get("slices", [])
+                if isinstance(item, dict) and item.get("sweep_id")
+            }
+            current = current and (
+                report.get("risk_sweep_plan_sha256")
+                == (ac.sha256_file(plan_path) if plan_path.is_file() else "")
+                and report.get("architecture_map_sha256")
+                == (
+                    ac.sha256_file(architecture_path)
+                    if architecture_path.is_file() else ""
+                )
+                and set(report.get("expected_sweep_ids", [])) == expected_sweeps
+                and set(report.get("validated_sweep_ids", [])) == expected_sweeps
+                and report.get("missing_sweep_ids", []) == []
+            )
+        return current
 
     def current_merge_reports(
         artifact_type: str, expected_ids: set[str], ledger_path: Path,
@@ -363,7 +389,7 @@ def run(args: argparse.Namespace) -> int:
             report = ac.load_json(path)
             if report.get("artifact_type") != artifact_type:
                 continue
-            if valid_merge_report(path, expected_ids, ledger_path):
+            if valid_merge_report(path, artifact_type, expected_ids, ledger_path):
                 reports.add(path.resolve())
         return reports
 
@@ -689,6 +715,17 @@ def run(args: argparse.Namespace) -> int:
         str(item.get("plane_id")) for item in architecture.get("implementation_planes", [])
         if isinstance(item, dict) and item.get("plane_id")
     }
+    for index, item in enumerate(architecture.get("integration_boundaries", []), start=1):
+        if not isinstance(item, dict):
+            continue
+        label = f"architecture integration_boundaries[{index}]"
+        plane_ids = item.get("plane_ids")
+        if not isinstance(plane_ids, list) or not plane_ids:
+            errors.append(f"{label}: plane_ids must be a non-empty array")
+            continue
+        unknown = {str(value) for value in plane_ids if value} - architecture_plane_ids
+        if unknown:
+            errors.append(f"{label}: unknown plane_ids {sorted(unknown)}")
     parallel_behavior_paths: list[dict[str, Any]] = []
     parallel_path_ids: set[str] = set()
     for index, item in enumerate(architecture.get("parallel_behavior_paths", []), start=1):
@@ -718,6 +755,25 @@ def run(args: argparse.Namespace) -> int:
         errors.extend(hm._context_errors(
             observation, "risk", root, f"risk ({observation_id})",
         ))
+    risk_partition_errors, risk_partition_metrics = rpv.validate_risk_coverage(
+        risks, root,
+    )
+    errors.extend(risk_partition_errors)
+    risk_plan_trace_path = trace_root / "risk_sweep_plan_validation.json"
+    risk_plan_trace = (
+        ac.load_json(risk_plan_trace_path) if risk_plan_trace_path.is_file() else {}
+    )
+    expected_risk_plan_inputs, expected_risk_plan_combined = rpv.plan_input_digests(root)
+    risk_plan_validation_current = (
+        risk_plan_trace.get("passed") is True
+        and risk_plan_trace.get("session_id") == session_id
+        and risk_plan_trace.get("input_digests") == expected_risk_plan_inputs
+        and risk_plan_trace.get("combined_input_sha256") == expected_risk_plan_combined
+        and set(risk_plan_trace.get("validated_sweep_ids", []))
+        == set(risk_partition_metrics.get("expected_sweeps", []))
+    )
+    if not risk_plan_validation_current:
+        errors.append("passed digest-bound risk sweep plan validation is missing or stale")
     high_risk_boundary_ids = {
         str(item.get("boundary_id"))
         for item in architecture.get("integration_boundaries", [])
@@ -1260,8 +1316,9 @@ def run(args: argparse.Namespace) -> int:
         ),
         "architecture_mapped": bool(architecture) and "integration_boundaries" in architecture,
         "risk_backtracking_complete": (
-            bool(risks) and not missing_risk_boundaries and not missing_risk_planes
+            bool(risks) and not risk_partition_errors and risk_plan_validation_current
         ),
+        "risk_partition_complete": not risk_partition_errors and risk_plan_validation_current,
         "investigation_round_recorded": bool(rounds),
         "exploration_modes_complete": bool(expected_modes) and not missing_modes,
         "dynamic_probe_integrity": not probe_integrity_errors,
@@ -1287,6 +1344,7 @@ def run(args: argparse.Namespace) -> int:
             "design_document_groups": len(expected_groups),
             "design_claims": len(claims),
             "risk_observations": len(risks),
+            "risk_sweeps": len(risk_partition_metrics.get("observed_sweeps", [])),
             "investigation_rounds": len(rounds),
             "investigation_tasks": len(tasks),
             "investigation_findings": len(findings),

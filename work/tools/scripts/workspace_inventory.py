@@ -22,6 +22,7 @@ import agent_common as ac
 
 ARTIFACT_NAMES = {
     "architecture_map": "architecture_map.json",
+    "risk_sweep_plan": "risk_sweep_plan.json",
     "design_agent_manifest": "design_agent_manifest.json",
     "design_coverage": "design_coverage.json",
     "claim_review_scope": "claim_review_scope.json",
@@ -308,7 +309,7 @@ def loop_contract(paths: dict[str, str], session_id: str) -> dict[str, Any]:
     state_root = Path(paths["state_root"])
     artifacts = {name: str(state_root / filename) for name, filename in ARTIFACT_NAMES.items()}
     return {
-        "contract_version": 11,
+        "contract_version": 12,
         "execution_model": "opencode-owned-model-driven-loop",
         "session": {
             "session_id": session_id,
@@ -333,19 +334,19 @@ def loop_contract(paths: dict[str, str], session_id: str) -> dict[str, Any]:
                 "done_when": "Core implementation, adapters, fast/slow paths, configuration/capability surfaces, and integration boundaries are mapped from repository evidence.",
             },
             {
+                "id": "code_risk_backtracking",
+                "owner": "orchestrator_then_two_risk_explorers",
+                "output": [artifacts["risk_sweep_plan"], artifacts["risk_observations"]],
+                "done_when": (
+                    "A digest-bound plan assigns every required coupled architecture component to exactly one focused "
+                    "code-only sweep; ordered batches run at most two non-overlapping sweeps concurrently."
+                ),
+            },
+            {
                 "id": "design_analysis",
                 "owner": "spec_analyst",
                 "output": [artifacts["design_coverage"], artifacts["design_claims"]],
                 "done_when": "Every manifest document group has an evidence-backed disposition and a bounded difference-oriented claim portfolio with exact source locations.",
-            },
-            {
-                "id": "code_risk_backtracking",
-                "owner": "risk_explorer",
-                "output": artifacts["risk_observations"],
-                "done_when": (
-                    "Fresh code-only agents have inspected architecture planes and boundaries through generic semantic "
-                    "lenses, handing off exact code observations and design lookup questions without issuing verdicts."
-                ),
             },
             {
                 "id": "scoped_design_claim_review",
@@ -397,6 +398,11 @@ def loop_contract(paths: dict[str, str], session_id: str) -> dict[str, Any]:
         ],
         "handoffs": [
             {
+                "from": "orchestrator", "to": "risk_explorer",
+                "inputs": [artifacts["architecture_map"], artifacts["risk_sweep_plan"]],
+                "read_roots": [paths["review_code_root"]],
+            },
+            {
                 "from": "orchestrator", "to": "spec_analyst",
                 "inputs": [artifacts["design_agent_manifest"]],
                 "read_roots": [paths["review_design_root"]],
@@ -408,11 +414,6 @@ def loop_contract(paths: dict[str, str], session_id: str) -> dict[str, Any]:
                     artifacts["design_claims"], artifacts["claim_review_scope"],
                 ],
                 "read_roots": [paths["review_design_root"]],
-            },
-            {
-                "from": "orchestrator", "to": "risk_explorer",
-                "inputs": [artifacts["architecture_map"]],
-                "read_roots": [paths["review_code_root"]],
             },
             {
                 "from": "orchestrator", "to": "code_investigator",
@@ -458,6 +459,10 @@ def loop_contract(paths: dict[str, str], session_id: str) -> dict[str, Any]:
         ],
         "handoff_integrity": {
             "max_concurrent_subagent_tasks": 2,
+            "risk_discovery_batch": (
+                "After risk-plan-check, repeatedly launch the next two planned risk sweeps concurrently; "
+                "a singleton tail runs alone. Every sweep owns disjoint coupled architecture IDs and one isolated handoff."
+            ),
             "parallel_write_rule": "Each risk/investigator/probe/critic task writes one isolated JSON file under state/handoffs; never append to a shared JSONL from parallel tasks.",
             "merge_helper": str(Path(paths["state_root"]).parents[1] / "work" / "tools" / "scripts" / "handoff_merge.py"),
             "merge_semantics": "Syntax, artifact-shape, session, and stable-ID validation plus atomic replacement only; no semantic filtering or ranking.",
@@ -781,7 +786,7 @@ def prepare(args: argparse.Namespace) -> int:
         "next_actions": [
             "Read INSTRUCTION.md, the skill, workspace_manifest.json, and agent_loop_contract.json.",
             "Map repository architecture and integration boundaries.",
-            "After architecture-check, start design indexing and code-only risk sweeps in parallel.",
+            "After architecture-check, validate a focused multi-slice risk plan, run ordered batches of up to two code-only sweeps, and start design indexing only after the all-sweep atomic merge.",
         ],
         "stop_reason": "",
     }

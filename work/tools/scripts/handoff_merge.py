@@ -198,10 +198,39 @@ def validate_artifact(item: dict[str, Any], artifact_type: str, label: str) -> l
 
     if artifact_type == "risk":
         errors.extend(_require(item, (
-            "observation_id", "session_id", "behavior_question", "observed_code_behavior",
-            "review_lenses", "architecture_boundaries", "implementation_planes",
+            "observation_id", "session_id", "sweep_id", "risk_sweep_plan_sha256",
+            "behavior_question", "observed_code_behavior", "review_lenses",
             "code_evidence", "false_positive_checks", "design_lookup_questions", "tool_trace",
         ), label))
+        scoped_arrays: list[list[Any]] = []
+        for field in (
+            "architecture_boundaries", "implementation_planes", "parallel_path_ids",
+        ):
+            if field not in item:
+                errors.append(f"{label}: missing {field}")
+                continue
+            value = item.get(field)
+            if not isinstance(value, list):
+                errors.append(f"{label}: {field} must be an array")
+                continue
+            scoped_arrays.append(value)
+            for index, entry in enumerate(value, start=1):
+                if not isinstance(entry, str) or not entry.strip():
+                    errors.append(
+                        f"{label}: {field}[{index}] must be a concrete non-empty string"
+                    )
+        if len(scoped_arrays) == 3 and not any(
+            isinstance(entry, str) and entry.strip()
+            for values in scoped_arrays for entry in values
+        ):
+            errors.append(
+                f"{label}: architecture_boundaries, implementation_planes, and "
+                "parallel_path_ids must contain at least one entry in total"
+            )
+        for field in ("sweep_id", "risk_sweep_plan_sha256"):
+            value = item.get(field)
+            if _present(value) and (not isinstance(value, str) or not value.strip()):
+                errors.append(f"{label}: {field} must be a non-empty string")
         lenses = item.get("review_lenses")
         if not isinstance(lenses, list) or not 1 <= len(lenses) <= 3:
             errors.append(f"{label}: review_lenses must contain one to three focused lenses")
@@ -419,6 +448,42 @@ def _load_index(path: Path, key: str) -> tuple[dict[str, dict[str, Any]], list[s
     return indexed, errors
 
 
+def _risk_plan_validation_errors(
+    item: dict[str, Any], state_root: Path, label: str,
+) -> list[str]:
+    """Call the shared risk-plan validator without coupling non-risk imports to it."""
+    import risk_sweep_plan_validator as validator
+
+    try:
+        errors = validator.validate_observation_against_plan(item, state_root, label)
+    except (KeyError, TypeError) as exc:
+        return [f"{label}: risk plan context requires schema-valid values: {exc}"]
+    if not isinstance(errors, list) or not all(isinstance(error, str) for error in errors):
+        raise ValueError("risk sweep plan validator returned a non-string error list")
+    return errors
+
+
+def _expected_risk_sweep_ids(state_root: Path) -> set[str]:
+    """Return the sweep membership declared by the immutable risk sweep plan."""
+    import risk_sweep_plan_validator as validator
+
+    sweep_ids = validator.expected_sweep_ids(state_root)
+    if not isinstance(sweep_ids, set) or not all(
+        isinstance(sweep_id, str) and sweep_id.strip() for sweep_id in sweep_ids
+    ):
+        raise ValueError("risk sweep plan validator returned invalid sweep IDs")
+    return sweep_ids
+
+
+def _string_entries(value: Any) -> set[str]:
+    if not isinstance(value, list):
+        return set()
+    return {
+        entry for entry in value
+        if isinstance(entry, str) and entry
+    }
+
+
 def _context_errors(
     item: dict[str, Any], artifact_type: str, state_root: Path, label: str,
 ) -> list[str]:
@@ -485,11 +550,15 @@ def _context_errors(
     contract_path = state_root / "agent_loop_contract.json"
     architecture_path = state_root / "architecture_map.json"
     if not contract_path.is_file() or not architecture_path.is_file():
-        return []
+        return _risk_plan_validation_errors(item, state_root, label) if (
+            artifact_type == "risk"
+        ) else []
     contract = ac.load_json(contract_path)
     architecture = ac.load_json(architecture_path)
     if not contract or not architecture:
-        return []
+        return _risk_plan_validation_errors(item, state_root, label) if (
+            artifact_type == "risk"
+        ) else []
     lenses = set(contract.get("coverage_contract", {}).get("portfolio_lenses", []))
     modes = set(contract.get("coverage_contract", {}).get("exploration_modes", []))
     boundaries = {
@@ -508,9 +577,14 @@ def _context_errors(
         if isinstance(value, dict) and value.get("path_id")
     }
     errors: list[str] = []
-    unknown_lenses = set(item.get("review_lenses", [])) - lenses
-    unknown_boundaries = set(item.get("architecture_boundaries", [])) - boundaries
-    unknown_planes = set(item.get("implementation_planes", [])) - planes
+    if artifact_type == "risk":
+        unknown_lenses = _string_entries(item.get("review_lenses")) - lenses
+        unknown_boundaries = _string_entries(item.get("architecture_boundaries")) - boundaries
+        unknown_planes = _string_entries(item.get("implementation_planes")) - planes
+    else:
+        unknown_lenses = set(item.get("review_lenses", [])) - lenses
+        unknown_boundaries = set(item.get("architecture_boundaries", [])) - boundaries
+        unknown_planes = set(item.get("implementation_planes", [])) - planes
     if unknown_lenses:
         errors.append(f"{label}: unknown review lenses {sorted(unknown_lenses)}")
     if unknown_boundaries:
@@ -519,6 +593,10 @@ def _context_errors(
         errors.append(f"{label}: unknown implementation planes {sorted(unknown_planes)}")
 
     if artifact_type == "risk":
+        unknown_paths = _string_entries(item.get("parallel_path_ids")) - parallel_paths
+        if unknown_paths:
+            errors.append(f"{label}: unknown parallel_path_ids {sorted(unknown_paths)}")
+        errors.extend(_risk_plan_validation_errors(item, state_root, label))
         return errors
 
     claims, claim_errors = _load_index(state_root / "design_claims.jsonl", "claim_id")
@@ -673,6 +751,157 @@ def validate_item(
     return errors
 
 
+def _risk_state_root_for_handoff(path: Path) -> Path:
+    parent = path.resolve().parent
+    if parent.name != "risks" or parent.parent.name != "handoffs":
+        raise ValueError(
+            "risk --check-file must be located under <state-root>/handoffs/risks"
+        )
+    return parent.parent.parent
+
+
+def _validate_risk_handoff_file(
+    path: Path,
+    values: list[dict[str, Any]],
+    *,
+    state_root: Path,
+    session_id: str | None,
+    code_root: Path | None,
+    validate_items: bool,
+) -> tuple[str, list[str]]:
+    """Validate one sweep-owned risk slice, optionally including every item contract."""
+    if not values:
+        raise ValueError(f"risk sweep handoff must contain at least one object: {path}")
+
+    errors_by_id: dict[str, list[str]] = {}
+    labels: list[str] = []
+    identifiers: list[str] = []
+    seen_ids: set[str] = set()
+    sweep_ids: set[str] = set()
+    missing_sweep = False
+
+    for index, item in enumerate(values, start=1):
+        identifier = str(item.get("observation_id") or "")
+        error_id = identifier or f"{path.name}#{index}"
+        labels.append(error_id)
+        if identifier:
+            identifiers.append(identifier)
+            if identifier in seen_ids:
+                errors_by_id.setdefault(error_id, []).append(
+                    f"risk ({identifier}): duplicate observation_id in {path.name}"
+                )
+            seen_ids.add(identifier)
+
+        sweep_id = item.get("sweep_id")
+        if isinstance(sweep_id, str) and sweep_id:
+            sweep_ids.add(sweep_id)
+        else:
+            missing_sweep = True
+            errors_by_id.setdefault(error_id, []).append(
+                f"risk ({error_id}): risk slice item requires a non-empty sweep_id"
+            )
+
+        if validate_items:
+            item_errors = validate_item(
+                item,
+                artifact_type="risk",
+                identifier=error_id,
+                session_id=session_id,
+                code_root=code_root,
+            )
+            item_errors.extend(_context_errors(
+                item, "risk", state_root, f"risk ({error_id})",
+            ))
+            if item_errors:
+                errors_by_id.setdefault(error_id, []).extend(item_errors)
+
+    slice_error = ""
+    if missing_sweep or len(sweep_ids) != 1:
+        slice_error = (
+            f"risk slice {path.name} must contain exactly one shared sweep_id; "
+            f"found {sorted(sweep_ids)}"
+        )
+    else:
+        sweep_id = next(iter(sweep_ids))
+        expected_name = f"{sweep_id}.json"
+        if path.name != expected_name:
+            slice_error = (
+                f"risk slice filename must be {expected_name}; got {path.name}"
+            )
+    if slice_error:
+        for error_id in dict.fromkeys(labels):
+            errors_by_id.setdefault(error_id, []).append(slice_error)
+
+    if validate_items and not slice_error and len(sweep_ids) == 1:
+        import risk_sweep_plan_validator as validator
+
+        sweep_id = next(iter(sweep_ids))
+        coverage_errors = validator.validate_sweep_coverage(
+            values, state_root, sweep_id,
+        )
+        if coverage_errors:
+            errors_by_id.setdefault(labels[0], []).extend(coverage_errors)
+
+    if errors_by_id:
+        raise HandoffValidationError(errors_by_id)
+    return next(iter(sweep_ids)), identifiers
+
+
+def _validate_risk_batch(
+    input_dir: Path,
+    state_root: Path,
+    expected_sweep_ids: list[str] | None = None,
+) -> list[str]:
+    """Require every plan-owned sweep file before mutating the shared ledger."""
+    if not input_dir.is_dir():
+        raise ValueError(f"handoff directory is missing: {input_dir}")
+    if expected_sweep_ids is None:
+        expected_sweep_ids = sorted(_expected_risk_sweep_ids(state_root))
+    if len(expected_sweep_ids) < 2:
+        raise ValueError(
+            "risk sweep plan must declare at least two sweep IDs; "
+            f"found {expected_sweep_ids}"
+        )
+
+    expected_paths = {
+        input_dir / f"{sweep_id}.json" for sweep_id in expected_sweep_ids
+    }
+    actual_paths = {
+        path for path in input_dir.rglob("*")
+        if path.is_file() and path.suffix.lower() in {".json", ".jsonl"}
+    }
+    missing = sorted(path.name for path in expected_paths - actual_paths)
+    unexpected = sorted(
+        str(path.relative_to(input_dir)) for path in actual_paths - expected_paths
+    )
+    if missing or unexpected or len(actual_paths) != len(expected_paths):
+        details: list[str] = []
+        if missing:
+            details.append(f"missing {missing}")
+        if unexpected:
+            details.append(f"unexpected {unexpected}")
+        raise ValueError(
+            "risk merge requires exactly all planned sweep JSON files"
+            + (f": {'; '.join(details)}" if details else "")
+        )
+
+    for sweep_id in expected_sweep_ids:
+        path = input_dir / f"{sweep_id}.json"
+        file_sweep_id, _ = _validate_risk_handoff_file(
+            path,
+            _read_values(path),
+            state_root=state_root,
+            session_id=None,
+            code_root=None,
+            validate_items=False,
+        )
+        if file_sweep_id != sweep_id:
+            raise ValueError(
+                f"risk sweep file {path.name} contains sweep {file_sweep_id!r}"
+            )
+    return expected_sweep_ids
+
+
 def merge(
     input_dir: Path,
     output: Path,
@@ -687,7 +916,10 @@ def merge(
     if not input_dir.is_dir():
         raise ValueError(f"handoff directory is missing: {input_dir}")
     existing: list[dict[str, Any]] = []
-    if output.exists():
+    # A repaired architecture/plan invalidates every prior risk observation.  The
+    # The current sweep files are therefore the authoritative batch, not an
+    # incremental overlay on a stale ledger.
+    if output.exists() and artifact_type != "risk":
         existing, errors = ac.load_jsonl(output)
         if errors:
             raise ValueError(f"existing ledger is invalid: {'; '.join(errors)}")
@@ -753,6 +985,16 @@ def merge(
             validation_errors[identifier] = item_errors
     if validation_errors:
         raise HandoffValidationError(validation_errors)
+    if artifact_type == "risk":
+        if context_root is None:
+            raise ValueError("risk merge requires a state-root context")
+        import risk_sweep_plan_validator as validator
+
+        coverage_errors, _coverage = validator.validate_risk_coverage(
+            values, context_root,
+        )
+        if coverage_errors:
+            raise ValueError("; ".join(coverage_errors))
 
     ac.ensure_dir(output.parent)
     temporary = output.with_suffix(output.suffix + ".tmp")
@@ -845,6 +1087,10 @@ def main(argv: list[str] | None = None) -> int:
     batch_expected_ids: list[str] = []
     batch_missing_ids: list[str] = []
     batch_deferred_ids: list[str] = []
+    risk_expected_sweep_ids: list[str] = []
+    risk_validated_sweep_ids: list[str] = []
+    risk_plan_sha256 = ""
+    risk_architecture_sha256 = ""
     task_lifecycle: dict[str, Any] | None = None
     ledger_snapshot: dict[Path, bytes | None] = {}
     try:
@@ -863,30 +1109,77 @@ def main(argv: list[str] | None = None) -> int:
         if args.check_file:
             check_path = Path(args.check_file).resolve()
             values = _read_values(check_path)
-            if len(values) != 1:
-                raise ValueError("--check-file must contain exactly one object")
-            item = values[0]
-            identifier = str(item.get(key) or "")
-            if not identifier:
-                raise ValueError(f"checked handoff lacks {key}")
-            template_root = _template_root_for_handoff(check_path) if args.artifact_type == "finding" else None
-            template = _load_template(
-                template_root, item, required=template_root is not None,
-            ) if args.artifact_type == "finding" else None
-            errors = validate_item(
-                item, artifact_type=args.artifact_type, identifier=identifier,
-                session_id=args.session_id, code_root=code_root, design_root=design_root,
-                template=template,
-            )
-            if errors:
-                raise HandoffValidationError({identifier: errors})
-            result = {"files": 1, "validated_ids": [identifier]}
+            if args.artifact_type == "risk":
+                state_root = _risk_state_root_for_handoff(check_path)
+                risk_expected_sweep_ids = sorted(_expected_risk_sweep_ids(state_root))
+                plan_path = state_root / "risk_sweep_plan.json"
+                architecture_path = state_root / "architecture_map.json"
+                risk_plan_sha256 = (
+                    ac.sha256_file(plan_path) if plan_path.is_file() else ""
+                )
+                risk_architecture_sha256 = (
+                    ac.sha256_file(architecture_path)
+                    if architecture_path.is_file() else ""
+                )
+                sweep_id, identifiers = _validate_risk_handoff_file(
+                    check_path,
+                    values,
+                    state_root=state_root,
+                    session_id=args.session_id,
+                    code_root=code_root,
+                    validate_items=True,
+                )
+                risk_validated_sweep_ids = [sweep_id]
+                result = {
+                    "files": 1,
+                    "validated_ids": identifiers,
+                    "expected_sweep_ids": risk_expected_sweep_ids,
+                    "validated_sweep_ids": risk_validated_sweep_ids,
+                    "missing_sweep_ids": sorted(
+                        set(risk_expected_sweep_ids) - set(risk_validated_sweep_ids)
+                    ),
+                    "risk_sweep_plan_sha256": risk_plan_sha256,
+                    "architecture_map_sha256": risk_architecture_sha256,
+                }
+            else:
+                if len(values) != 1:
+                    raise ValueError("--check-file must contain exactly one object")
+                item = values[0]
+                identifier = str(item.get(key) or "")
+                if not identifier:
+                    raise ValueError(f"checked handoff lacks {key}")
+                template_root = _template_root_for_handoff(check_path) if args.artifact_type == "finding" else None
+                template = _load_template(
+                    template_root, item, required=template_root is not None,
+                ) if args.artifact_type == "finding" else None
+                errors = validate_item(
+                    item, artifact_type=args.artifact_type, identifier=identifier,
+                    session_id=args.session_id, code_root=code_root, design_root=design_root,
+                    template=template,
+                )
+                if errors:
+                    raise HandoffValidationError({identifier: errors})
+                result = {"files": 1, "validated_ids": [identifier]}
         else:
             if not args.output:
                 raise ValueError("--output is required with --input-dir")
             input_dir = Path(args.input_dir).resolve()
             output = Path(args.output).resolve()
             template_root = _template_root_for_handoff(input_dir / "placeholder.json") if args.artifact_type == "finding" else None
+            if args.artifact_type == "risk":
+                risk_expected_sweep_ids = sorted(_expected_risk_sweep_ids(output.parent))
+                plan_path = output.parent / "risk_sweep_plan.json"
+                architecture_path = output.parent / "architecture_map.json"
+                risk_plan_sha256 = (
+                    ac.sha256_file(plan_path) if plan_path.is_file() else ""
+                )
+                risk_architecture_sha256 = (
+                    ac.sha256_file(architecture_path)
+                    if architecture_path.is_file() else ""
+                )
+                _validate_risk_batch(
+                    input_dir, output.parent, risk_expected_sweep_ids,
+                )
             if args.artifact_type == "finding":
                 batch_expected_ids, batch_missing_ids, batch_deferred_ids = _finding_batch_expectation(output, input_dir)
                 if batch_missing_ids:
@@ -908,6 +1201,15 @@ def main(argv: list[str] | None = None) -> int:
                 context_root=output.parent,
             )
             result["ledger_sha256"] = ac.sha256_file(output)
+            if args.artifact_type == "risk":
+                risk_validated_sweep_ids = risk_expected_sweep_ids
+                result.update({
+                    "expected_sweep_ids": risk_expected_sweep_ids,
+                    "validated_sweep_ids": risk_validated_sweep_ids,
+                    "missing_sweep_ids": [],
+                    "risk_sweep_plan_sha256": risk_plan_sha256,
+                    "architecture_map_sha256": risk_architecture_sha256,
+                })
             if args.artifact_type == "finding":
                 result["expected_ids"] = batch_expected_ids
                 result["batch_validated_ids"] = sorted(
@@ -931,6 +1233,16 @@ def main(argv: list[str] | None = None) -> int:
             "expected_ids": batch_expected_ids, "deferred_ids": batch_deferred_ids,
             "errors": errors,
         }
+        if args.artifact_type == "risk":
+            report.update({
+                "expected_sweep_ids": risk_expected_sweep_ids,
+                "validated_sweep_ids": risk_validated_sweep_ids,
+                "missing_sweep_ids": sorted(
+                    set(risk_expected_sweep_ids) - set(risk_validated_sweep_ids)
+                ),
+                "risk_sweep_plan_sha256": risk_plan_sha256,
+                "architecture_map_sha256": risk_architecture_sha256,
+            })
         if report_path:
             ac.save_json(report_path, report)
         if batch_gate_path:

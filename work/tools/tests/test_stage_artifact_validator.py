@@ -285,6 +285,22 @@ def test_first_round_can_defer_other_parallel_planes_to_coverage(workspace):
         "evidence": "Both planes reach the public service boundary.",
     }]
     ac.save_json(architecture_path, architecture)
+    plan_path = state / "risk_sweep_plan.json"
+    plan = ac.load_json(plan_path)
+    plan["architecture_map_sha256"] = ac.sha256_file(architecture_path)
+    plan["required_coverage"]["plane_ids"].append("PLANE-ADAPTER")
+    plan["required_coverage"]["parallel_path_ids"] = ["PATH-SERVICE"]
+    plan["slices"][0]["implementation_planes"].append("PLANE-ADAPTER")
+    plan["slices"][0]["parallel_path_ids"] = ["PATH-SERVICE"]
+    ac.save_json(plan_path, plan)
+    plan_digest = ac.sha256_file(plan_path)
+    risks, errors = ac.load_jsonl(state / "risk_observations.jsonl")
+    assert errors == []
+    risks[0]["implementation_planes"].append("PLANE-ADAPTER")
+    risks[0]["parallel_path_ids"] = ["PATH-SERVICE"]
+    for risk in risks:
+        risk["risk_sweep_plan_sha256"] = plan_digest
+    _rewrite_jsonl(state / "risk_observations.jsonl", risks)
     tasks, errors = ac.load_jsonl(state / "investigation_tasks.jsonl")
     assert errors == []
     tasks[0]["parallel_path_ids"] = ["PATH-SERVICE"]

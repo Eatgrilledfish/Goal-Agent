@@ -15,6 +15,9 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 COMMANDS = {
     "prepare": ["workspace_inventory.py"],
     "architecture-check": ["stage_artifact_validator.py"],
+    "risk-plan-check": [
+        "stage_artifact_validator.py:architecture", "risk_sweep_plan_validator.py",
+    ],
     "design-check": ["design_artifact_validator.py"],
     "claim-check": ["claim_review_validator.py"],
     "task-check": ["stage_artifact_validator.py"],
@@ -26,12 +29,14 @@ COMMANDS = {
     "report": ["report_writer.py"],
     "gate": [
         "design_artifact_validator.py", "claim_review_validator.py",
-        "stage_artifact_validator.py:architecture", "stage_artifact_validator.py:task",
+        "stage_artifact_validator.py:architecture", "risk_sweep_plan_validator.py",
+        "stage_artifact_validator.py:task",
         "stage_artifact_validator.py:coverage", "verdict_validator.py", "final_gate.py",
     ],
     "finalize": [
         "design_artifact_validator.py", "claim_review_validator.py",
-        "stage_artifact_validator.py:architecture", "stage_artifact_validator.py:task",
+        "stage_artifact_validator.py:architecture", "risk_sweep_plan_validator.py",
+        "stage_artifact_validator.py:task",
         "stage_artifact_validator.py:coverage", "verdict_validator.py",
         "report_writer.py", "final_gate.py",
     ],

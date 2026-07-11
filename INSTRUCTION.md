@@ -74,22 +74,57 @@ python3 ${WORK_ROOT}/tools/scripts/goal_runner.py prepare \
 
 必须使用 opencode Task/子 agent。主 agent 只负责编排、路径隔离、批次推进和 deterministic gate，不得模拟 spec analyst、risk explorer、investigator、critic 或 judge，也不得用脚本补写这些角色缺失的语义字段。角色 handoff 校验失败时只能把原输入、原 handoff 和机器错误交给同角色的 fresh repair Task；主 agent 手工补成“fresh_subagent”仍属于无效交接。
 
-### 3.1 建图后并行做设计索引和代码风险扫描
+### 3.1 建图后先并行完成两个互斥 code-only risk sweep
 
-1. 主 agent 只在 `REVIEW_CODE_ROOT` 阅读仓库入口、构建/注册/配置和目录边界，写 `architecture_map.json`。明确 owned、adapter、imported、generated、fast/slow execution planes，为同一设计行为的平行实现写稳定 `path_id`；这里只做任务分区，不生成风险候选。记录仓库已有 build/test/runtime surface 与 dynamic probe 约束，不安装依赖。写完立即运行 `goal_runner.py architecture-check`；通过前不得启动语义调查。
-2. architecture-check 通过后，同时启动一个 fresh spec-analyst Task 和第一批 fresh risk-explorer Task，总并发仍不得超过 2。
-   - spec analyst 完整读取 `work/skills/spec-analyst.md`，只读 `REVIEW_DESIGN_ROOT`、`${STATE_ROOT}/design_agent_manifest.json` 与 catalog provenance，直接写 `${STATE_ROOT}/design_coverage.json` 与 `${STATE_ROOT}/design_claims.jsonl`。这里的 claims 是供后续检索和选题的设计索引，不等于每条都要在本次 6 小时内调查，更不需要在调查前逐条做 critic。
-   - risk explorer 完整读取 `work/skills/risk-explorer.md`，只读分配给它的 `REVIEW_CODE_ROOT` slice、boundary、plane 和通用 lens，禁止读取设计、claims、旧 findings 或任何预期答案。风险扫描必须从真实入口追控制流；一条 observation 不能替未读取的 boundary/plane 声称覆盖。
+1. 主 agent 只在 `REVIEW_CODE_ROOT` 阅读仓库入口、构建/注册/配置和目录边界，写 `architecture_map.json`。明确 owned、adapter、imported、generated、fast/slow execution planes；每个 integration boundary 还必须用 `plane_ids` 明确关联的 execution planes。plane 应是有真实入口/调用关系的行为 facet，paths 要精确到足以分配上下文；不要用一个仓库级父目录 plane 把本可独立调查的多个域粘成一个巨大 component，也不能为负载均衡拆开真实耦合或漏掉 broad path。为同一设计行为的平行实现写稳定 `path_id`；这里只做任务分区，不生成风险候选。记录仓库已有 build/test/runtime surface 与 dynamic probe 约束，不安装依赖。写完立即运行 `goal_runner.py architecture-check`；通过前不得启动语义调查。
 
-spec analyst 返回后立即运行：
+2. architecture-check 通过后，主 agent 写 `${STATE_ROOT}/risk_sweep_plan.json`。plan 必须绑定当前 `architecture_map.json` 的 SHA-256，并且 required coverage 恰好等于 architecture map 中全部 boundaries、全部 reachable implementation planes 和全部 `parallel_behavior_paths.path_id`；risk 等级只供后续 frontier 排序，不能从这次 breadth pass 删除 medium/low 范围：
+
+```json
+{
+  "session_id": "当前 session",
+  "plan_id": "RISK-PLAN-001",
+  "architecture_map_sha256": "当前 architecture_map.json 的 SHA-256",
+  "required_coverage": {
+    "boundary_ids": ["全部 BOUNDARY-..."],
+    "plane_ids": ["全部 reachable PLANE-..."],
+    "parallel_path_ids": ["全部 PARALLEL-..."]
+  },
+  "slices": [{
+    "sweep_id": "RISK-SWEEP-01",
+    "architecture_boundaries": ["BOUNDARY-..."],
+    "implementation_planes": ["PLANE-..."],
+    "parallel_path_ids": ["PARALLEL-..."],
+    "anchor_paths": ["分配 boundary/plane paths 的完整规范化并集"],
+    "review_lenses": ["完整 contract portfolio lenses"],
+    "scope_rationale": "为什么该切片是独立且不可再拆的执行范围"
+  }, {
+    "sweep_id": "RISK-SWEEP-02",
+    "architecture_boundaries": ["BOUNDARY-..."],
+    "implementation_planes": ["PLANE-..."],
+    "parallel_path_ids": ["PARALLEL-..."],
+    "anchor_paths": ["分配 boundary/plane paths 的完整规范化并集"],
+    "review_lenses": ["完整 contract portfolio lenses"],
+    "scope_rationale": "为什么该切片是独立且不可再拆的执行范围"
+  }]
+}
+```
+
+plan 必须包含至少两个非空 focused slice；slice 数量由真实不可拆 component 和上下文规模决定，不得把整次 breadth pass 强压成两个超大 Task。三类 required ID 在所有 slice 中分别精确覆盖且互不重复；同一 parallel path 的 `path_id` 与其全部 planes、同一 boundary 与其全部 `plane_ids` 必须在同一 slice。共享 plane，或 boundary/plane path 相同、互为父子，会把相关 IDs 连成不可拆单元。`anchor_paths` 必须等于本 slice 分配的全部 architecture paths，不能用一个 leaf 文件冒充整个 directory。每个 slice 都收到完整 contract lens checklist；单条 observation 仍只取 1–3 个 lens，但该 slice 的 observations 合计必须精确覆盖全部 checklist。若真实 architecture 只有一个不可拆单元，明确记录 plan 阻塞，不能伪造第二个范围或按 lens 重复检查同一范围。
+
+写完 plan 必须先运行 deterministic gate：
 
 ```bash
-python3 ${WORK_ROOT}/tools/scripts/goal_runner.py design-check \
+python3 ${WORK_ROOT}/tools/scripts/goal_runner.py risk-plan-check \
   --code-root ${CODE_ROOT} --design-root ${DESIGN_ROOT} \
   --result-root ${RESULT_ROOT} --log-root ${LOG_ROOT} --state-root ${STATE_ROOT}
 ```
 
-design-check 只验证设计证据、原子 claim 字段和真实行号，不做实现判断。失败时只让 fresh spec-analyst repair Task 按 `design_validation.json` 修复。通过后继续 risk 批次，直到每个 high-risk boundary、每个 `parallel_behavior_paths` plane 都有 fresh code-only sweep；在这些 slice 上轮换集合完整性、时序副作用、链式遍历、边界分派、能力注册、平行路径和状态/配置等通用 lens。每批最多两个 Task，每项写 `${STATE_ROOT}/handoffs/risks/<sweep_id>.json` 并先自检。risk ledger 不得为空：
+非 0 时只修 `architecture_map.json` / `risk_sweep_plan.json` 并重新执行该命令；`risk_sweep_plan_validation.json` 未达到 `passed=true` 前禁止启动任何 risk Task。
+
+plan 完成后，按 plan 顺序反复取最前两个 pending slices，在同一批恰好同时启动两个 fresh risk-explorer Task；全局并发上限始终为 2，此时不得启动 spec analyst 或第三个 Task。若最后只余一个 slice，则单独完成尾批，不能复制范围来凑并发。每个 prompt 必须逐字给出 plan 路径及 digest、自己的完整 slice、所有其他 slices 的 ownership IDs、独立 output/report 路径和包含 `--artifact-type risk --session-id ${SESSION_ID} --code-root ${REVIEW_CODE_ROOT}` 的 self-check 命令。并发 pair 的 ownership 与整个 plan 的 ownership 都必须互斥。explorer 可在整个 `REVIEW_CODE_ROOT` 导航并沿调用链跨目录读取，但只能拥有自己的 boundary/plane/path；跨 slice 内容只能用于导航，不能写入 observation 的 coverage ID 或 `code_evidence`。若形成可核验证据必须依赖另一 slice 的实现，说明 plan 漏掉真实耦合：Task 返回 `plan_repair_required` 与路径/可达性证据，不写 handoff。orchestrator 修 architecture/plan 后因 digest 已变化，所有旧 handoff 都必须用 fresh Tasks 重做，不能复用。
+
+每个 explorer 只写自己的 `${STATE_ROOT}/handoffs/risks/<sweep_id>.json` JSON 数组和独立 self-check report；禁止写 `risk_sweep_plan.json`、`architecture_map.json` 或共享 `risk_observations.jsonl`。数组可包含任意数量的真实中性 observations；即使实现看起来合规，也要用可由设计回答的问题和精确代码证据交代分配范围。plan 中全部 slice 的 handoff 都 self-check passed 后，主 agent 才执行一次原子 merge：
 
 ```bash
 python3 ${WORK_ROOT}/tools/scripts/handoff_merge.py \
@@ -100,7 +135,17 @@ python3 ${WORK_ROOT}/tools/scripts/handoff_merge.py \
   --report ${LOG_ROOT}/trace/risk-handoff-merge.json
 ```
 
-risk observation 只描述代码实际语义和设计检索问题，不产生 verdict。把去除代码路径、snippet 和实现名称后的 `design_lookup_questions` 交给 fresh spec-expansion Task；它复用 `spec-analyst.md`，只在设计原文支持时补充 claim，然后只重跑 design-check。不得因新增 claim 重做全量 spec critic。
+每个 observation 必须逐值复制自己的 `sweep_id` 和当前 `risk_sweep_plan_sha256`，且其 boundary/plane/path IDs 都是该 slice 的子集。每个声明的 boundary/plane 必须有落在该 ID 自身 path 内、同时属于本 slice anchor 的代码证据；每个 parallel path 的每个 plane 都必须有同时引用 path+plane 的本地证据。同一 slice 全部 observations 的 boundary/plane/path/lens 并集必须精确覆盖该 slice 的分配范围。merge 只有在全部 planned sweeps 均通过、plan digest 当前且 required coverage 全部由唯一 slice 覆盖时才算成功；risk ledger 不得为空。
+
+risk merge 成功后才启动一个 fresh spec-analyst Task。它完整读取 `work/skills/spec-analyst.md`，只读 `REVIEW_DESIGN_ROOT`、`${STATE_ROOT}/design_agent_manifest.json` 与 catalog provenance，直接写 `${STATE_ROOT}/design_coverage.json` 与 `${STATE_ROOT}/design_claims.jsonl`。这里的 claims 是供后续检索和选题的设计索引，不等于每条都要在本次 6 小时内调查，更不需要在调查前逐条做 critic。spec analyst 返回后立即运行：
+
+```bash
+python3 ${WORK_ROOT}/tools/scripts/goal_runner.py design-check \
+  --code-root ${CODE_ROOT} --design-root ${DESIGN_ROOT} \
+  --result-root ${RESULT_ROOT} --log-root ${LOG_ROOT} --state-root ${STATE_ROOT}
+```
+
+design-check 只验证设计证据、原子 claim 字段和真实行号，不做实现判断。失败时只让 fresh spec-analyst repair Task 按 `design_validation.json` 修复。risk observation 只描述代码实际语义和设计检索问题，不产生 verdict。把其中去除代码路径、snippet 和实现名称后的 `design_lookup_questions` 交给 fresh spec-expansion Task；它复用 `spec-analyst.md`，只在设计原文支持时补充 claim，然后只重跑 design-check。不得因新增 claim 重做全量 spec critic。
 
 ### 3.2 选择并冻结一轮证据 frontier
 

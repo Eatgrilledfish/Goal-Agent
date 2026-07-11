@@ -67,6 +67,11 @@ def workspace(tmp_path: Path) -> dict[str, Path | str]:
         "    return events[-9:] + [event]\n",
         encoding="utf-8",
     )
+    (code / "audit.py").write_text(
+        "def publish_event(event):\n"
+        "    return {\"published\": True, \"event\": event}\n",
+        encoding="utf-8",
+    )
     run_runner("prepare", code, design, result, logs)
     state = ac.load_json(logs / "state" / "agent_loop_state.json")
     return {
@@ -92,11 +97,28 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
         "languages": ["Python"],
         "entrypoints": [{"path": "service.py", "purpose": "service API", "evidence": "top-level functions"}],
         "subsystems": [{"subsystem_id": "SUBSYSTEM-SERVICE", "name": "service", "paths": ["service.py"], "role": "business behavior"}],
-        "implementation_planes": [{
-            "plane_id": "PLANE-SERVICE", "kind": "owned", "paths": ["service.py"],
-            "reachable_evidence": "The public functions execute directly.",
-        }],
-        "integration_boundaries": [{"boundary_id": "BOUNDARY-API", "name": "callers to service", "paths": ["service.py"], "risk": "high", "why": "externally visible behavior"}],
+        "implementation_planes": [
+            {
+                "plane_id": "PLANE-SERVICE", "kind": "owned", "paths": ["service.py"],
+                "reachable_evidence": "The public service functions execute directly.",
+            },
+            {
+                "plane_id": "PLANE-AUDIT", "kind": "adapter", "paths": ["audit.py"],
+                "reachable_evidence": "The audit publishing adapter executes independently.",
+            },
+        ],
+        "integration_boundaries": [
+            {
+                "boundary_id": "BOUNDARY-API", "name": "callers to service",
+                "paths": ["service.py"], "plane_ids": ["PLANE-SERVICE"],
+                "risk": "high", "why": "externally visible behavior",
+            },
+            {
+                "boundary_id": "BOUNDARY-AUDIT", "name": "audit publisher",
+                "paths": ["audit.py"], "plane_ids": ["PLANE-AUDIT"],
+                "risk": "high", "why": "externally visible audit behavior",
+            },
+        ],
         "capability_surfaces": [{
             "surface_id": "CAPABILITY-API", "paths": ["service.py"],
             "declares_or_registers": "Public service functions.",
@@ -113,14 +135,49 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
     })
     contract = ac.load_json(state / "agent_loop_contract.json")
     lenses = contract["coverage_contract"]["portfolio_lenses"]
+    architecture_digest = ac.sha256_file(state / "architecture_map.json")
+    ac.save_json(state / "risk_sweep_plan.json", {
+        "session_id": workspace["session_id"],
+        "plan_id": "RISK-PLAN-001",
+        "architecture_map_sha256": architecture_digest,
+        "required_coverage": {
+            "boundary_ids": ["BOUNDARY-API", "BOUNDARY-AUDIT"],
+            "plane_ids": ["PLANE-SERVICE", "PLANE-AUDIT"],
+            "parallel_path_ids": [],
+        },
+        "slices": [
+            {
+                "sweep_id": "RISK-SWEEP-API",
+                "architecture_boundaries": ["BOUNDARY-API"],
+                "implementation_planes": ["PLANE-SERVICE"],
+                "parallel_path_ids": [],
+                "anchor_paths": ["service.py"],
+                "review_lenses": lenses,
+                "scope_rationale": "Own the public service API component.",
+            },
+            {
+                "sweep_id": "RISK-SWEEP-AUDIT",
+                "architecture_boundaries": ["BOUNDARY-AUDIT"],
+                "implementation_planes": ["PLANE-AUDIT"],
+                "parallel_path_ids": [],
+                "anchor_paths": ["audit.py"],
+                "review_lenses": lenses,
+                "scope_rationale": "Own the independent audit publishing component.",
+            },
+        ],
+    })
+    risk_plan_digest = ac.sha256_file(state / "risk_sweep_plan.json")
     risk = {
         "observation_id": "RISK-API-001",
         "session_id": workspace["session_id"],
+        "sweep_id": "RISK-SWEEP-API",
+        "risk_sweep_plan_sha256": risk_plan_digest,
         "behavior_question": "What behavior is exposed when the public charge entry point is called?",
         "observed_code_behavior": "The public entry point accepts an amount and returns an accepted result without a guard.",
-        "review_lenses": [lenses[0]],
+        "review_lenses": lenses[:3],
         "architecture_boundaries": ["BOUNDARY-API"],
         "implementation_planes": ["PLANE-SERVICE"],
+        "parallel_path_ids": [],
         "code_evidence": [{
             "file": "service.py", "line_start": 1, "line_end": 2,
             "symbol": "charge", "snippet": 'def charge(amount):\n    return {"accepted": True}',
@@ -153,7 +210,65 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
             },
         ],
     }
-    append(state / "risk_observations.jsonl", risk)
+    audit_risk = {
+        "observation_id": "RISK-AUDIT-001",
+        "session_id": workspace["session_id"],
+        "sweep_id": "RISK-SWEEP-AUDIT",
+        "risk_sweep_plan_sha256": risk_plan_digest,
+        "behavior_question": "What behavior is exposed when an audit event is published?",
+        "observed_code_behavior": "The independent adapter immediately reports the event as published.",
+        "review_lenses": lenses[:3],
+        "architecture_boundaries": ["BOUNDARY-AUDIT"],
+        "implementation_planes": ["PLANE-AUDIT"],
+        "parallel_path_ids": [],
+        "code_evidence": [{
+            "file": "audit.py", "line_start": 1, "line_end": 2,
+            "symbol": "publish_event",
+            "snippet": 'def publish_event(event):\n    return {"published": True, "event": event}',
+        }],
+        "false_positive_checks": [
+            {
+                "question": "Is another publisher called first?", "method": "control-flow read",
+                "target": "publish_event", "result": "The adapter returns directly.",
+            },
+            {
+                "question": "Is this adapter unreachable?", "method": "entry review",
+                "target": "audit.py", "result": "It is a public adapter function.",
+            },
+        ],
+        "design_lookup_questions": [
+            "Does the service contract constrain how audit publication is acknowledged?",
+        ],
+        "tool_trace": [
+            {
+                "seq": 1, "kind": "code_search", "tool": "search",
+                "target": "publish_event", "purpose": "Locate the adapter entry point.",
+                "result": "Found audit.py:1.",
+            },
+            {
+                "seq": 2, "kind": "code_read", "tool": "read",
+                "target": "audit.py:1-2", "purpose": "Derive the adapter behavior.",
+                "result": "The adapter reports publication directly.",
+            },
+            {
+                "seq": 3, "kind": "reverse_check", "tool": "search",
+                "target": "audit publisher alternatives", "purpose": "Check compensation paths.",
+                "result": "No alternate publisher exists.",
+            },
+        ],
+    }
+    risk_observations: list[dict] = []
+    for prefix, base in (("RISK-API", risk), ("RISK-AUDIT", audit_risk)):
+        for chunk_index, start in enumerate(range(0, len(lenses), 3), start=1):
+            item = dict(base)
+            item["observation_id"] = f"{prefix}-{chunk_index:03d}"
+            item["review_lenses"] = lenses[start:start + 3]
+            item["behavior_question"] = (
+                f"Under the assigned lens group {chunk_index}, "
+                + str(base["behavior_question"])
+            )
+            risk_observations.append(item)
+            append(state / "risk_observations.jsonl", item)
     specs = [
         (3, "The service must reject negative amounts.", 1, 2, "charge", 'def charge(amount):\n    return {"accepted": True}'),
         (4, "The service must expire sessions after 30 minutes.", 4, 5, "session_expired", "def session_expired(minutes):\n    return minutes > 60"),
@@ -192,6 +307,10 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
             lenses[index - 1::count]
             if count >= 3 else lenses[(index - 1) * 2:index * 2]
         )
+        audit_scope = index >= 3
+        task_boundary = "BOUNDARY-AUDIT" if audit_scope else "BOUNDARY-API"
+        task_plane = "PLANE-AUDIT" if audit_scope else "PLANE-SERVICE"
+        task_risk = "RISK-AUDIT-001" if audit_scope else "RISK-API-001"
         append(state / "investigation_tasks.jsonl", {
             "task_id": task_id,
             "session_id": workspace["session_id"],
@@ -204,10 +323,10 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
             "defer_reason": "",
             "review_lenses": task_lenses,
             "exploration_mode": contract["coverage_contract"]["exploration_modes"][index % 3],
-            "architecture_boundaries": ["BOUNDARY-API"],
-            "implementation_planes": ["PLANE-SERVICE"],
+            "architecture_boundaries": [task_boundary],
+            "implementation_planes": [task_plane],
             "parallel_path_ids": [],
-            "risk_observation_ids": ["RISK-API-001"] if (
+            "risk_observation_ids": [task_risk] if (
                 contract["coverage_contract"]["exploration_modes"][index % 3]
                 == "code-to-design risk backtracking"
             ) else [],
@@ -394,6 +513,7 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
         lens: str(task["task_id"])
         for task in tasks_for_templates for lens in task.get("review_lenses", [])
     }
+    tasks_by_id = {str(task["task_id"]): task for task in tasks_for_templates}
     ac.save_json(state / "semantic_coverage.json", {
         "session_id": workspace["session_id"],
         "lenses": [{
@@ -403,7 +523,9 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
             "task_ids": [lens_task_ids.get(lens, "TASK-001")],
             "finding_ids": [f"FINDING-{lens_task_ids.get(lens, 'TASK-001')}"],
             "design_group_refs": ["contract"],
-            "boundary_refs": ["BOUNDARY-API"],
+            "boundary_refs": tasks_by_id.get(
+                lens_task_ids.get(lens, "TASK-001"), {},
+            ).get("architecture_boundaries", ["BOUNDARY-API"]),
             "counterfactual": "",
         } for index, lens in enumerate(lenses)],
     })
@@ -413,8 +535,12 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
         "strategy": "Check externally visible service behaviors.",
         "exploration_modes": contract["coverage_contract"]["exploration_modes"],
         "document_groups": ["contract"],
-        "architecture_boundaries": ["BOUNDARY-API"],
-        "implementation_planes": ["PLANE-SERVICE"],
+        "architecture_boundaries": (
+            ["BOUNDARY-API", "BOUNDARY-AUDIT"] if count >= 3 else ["BOUNDARY-API"]
+        ),
+        "implementation_planes": (
+            ["PLANE-SERVICE", "PLANE-AUDIT"] if count >= 3 else ["PLANE-SERVICE"]
+        ),
         "lenses": lenses,
         "claim_ids": [f"CLAIM-{index:03d}" for index in range(1, count + 1)],
         "task_ids": [f"TASK-{index:03d}" for index in range(1, count + 1)],
@@ -431,11 +557,17 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
         "exploration_modes_completed": contract["coverage_contract"]["exploration_modes"],
         "document_groups_total": 1,
         "document_groups_accounted": 1,
-        "code_areas_reviewed": ["service.py"],
-        "architecture_boundaries": [{
-            "boundary_id": "BOUNDARY-API", "status": "investigated",
-            "evidence": "All public service entry points were inspected.",
-        }],
+        "code_areas_reviewed": ["service.py", "audit.py"],
+        "architecture_boundaries": [
+            {
+                "boundary_id": "BOUNDARY-API", "status": "investigated",
+                "evidence": "The public service entry points were inspected.",
+            },
+            {
+                "boundary_id": "BOUNDARY-AUDIT", "status": "investigated",
+                "evidence": "The independent audit adapter was inspected.",
+            },
+        ],
         "remaining_scoped_claims": [],
         "deferred_claims": [],
         "false_positive_samples_rechecked": [f"FINDING-TASK-{index:03d}" for index in range(1, count + 1)],
@@ -464,12 +596,20 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
     })
     ac.save_json(risk_report, {
         "passed": True, "artifact_type": "risk", "errors": [],
-        "validated_ids": [risk["observation_id"]],
+        "validated_ids": [item["observation_id"] for item in risk_observations],
+        "expected_sweep_ids": ["RISK-SWEEP-API", "RISK-SWEEP-AUDIT"],
+        "validated_sweep_ids": ["RISK-SWEEP-API", "RISK-SWEEP-AUDIT"],
+        "missing_sweep_ids": [],
+        "risk_sweep_plan_sha256": risk_plan_digest,
+        "architecture_map_sha256": architecture_digest,
         "ledger_sha256": ac.sha256_file(state / "risk_observations.jsonl"),
     })
     provenance = {
         "task": (task_ids, state / "investigation_tasks.jsonl", task_report, "investigation_planning"),
-        "risk": ([risk["observation_id"]], state / "risk_observations.jsonl", risk_report, "code_risk_backtracking"),
+        "risk": (
+            [item["observation_id"] for item in risk_observations],
+            state / "risk_observations.jsonl", risk_report, "code_risk_backtracking",
+        ),
         "finding": (finding_ids, state / "investigation_findings.jsonl", finding_report, "investigation"),
         "critic": (finding_ids, state / "critic_reviews.jsonl", critic_report, "critic_review"),
     }
@@ -484,7 +624,7 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
             "ledger_sha256": ac.sha256_file(ledger_path),
         })
     validation_commands = [
-        "architecture-check", "design-check", "claim-check", "task-check",
+        "architecture-check", "risk-plan-check", "design-check", "claim-check", "task-check",
     ]
     if count >= 3:
         validation_commands.append("coverage-check")
@@ -645,19 +785,20 @@ def test_prepare_is_semantic_neutral_and_writes_agent_contract(workspace):
     contract = ac.load_json(state / "agent_loop_contract.json")
     assert manifest["semantic_analysis_performed"] is False
     assert manifest["design"]["document_count"] == 1
-    assert manifest["code"]["suffix_counts"] == {".py": 1}
+    assert manifest["code"]["suffix_counts"] == {".py": 2}
     assert design_manifest["session_id"] == manifest["session_id"]
     assert design_manifest["design"]["document_groups"] == manifest["design"]["document_groups"]
     assert "code" not in design_manifest
     assert "paths" not in design_manifest
     assert "code_root" not in json.dumps(design_manifest)
     assert contract["execution_model"] == "opencode-owned-model-driven-loop"
-    assert contract["contract_version"] == 11
+    assert contract["contract_version"] == 12
     assert contract["handoff_integrity"]["max_concurrent_subagent_tasks"] == 2
     assert len(contract["coverage_contract"]["exploration_modes"]) == 3
     assert "dynamic_probe" in contract["coverage_contract"]
     assert [phase["owner"] for phase in contract["phases"]][:9] == [
-        "orchestrator", "spec_analyst", "risk_explorer", "orchestrator_then_spec_critic",
+        "orchestrator", "orchestrator_then_two_risk_explorers", "spec_analyst",
+        "orchestrator_then_spec_critic",
         "orchestrator", "code_investigator", "coverage_critic_then_orchestrator",
         "orchestrator_then_code_investigator", "evidence_critic",
     ]
@@ -676,6 +817,29 @@ def test_prepare_is_semantic_neutral_and_writes_agent_contract(workspace):
         ("target_source_write", "denied"),
         ("external_side_effect", "external_approval_required"),
     }
+
+
+def test_risk_plan_check_revalidates_repaired_architecture(workspace):
+    populate_handoffs(workspace)
+    state = workspace["state"]
+    assert isinstance(state, Path)
+    architecture_path = state / "architecture_map.json"
+    architecture = ac.load_json(architecture_path)
+    architecture["integration_boundaries"][0]["plane_ids"] = ["PLANE-UNKNOWN"]
+    ac.save_json(architecture_path, architecture)
+    plan_path = state / "risk_sweep_plan.json"
+    plan = ac.load_json(plan_path)
+    plan["architecture_map_sha256"] = ac.sha256_file(architecture_path)
+    ac.save_json(plan_path, plan)
+
+    proc = run_runner(
+        "risk-plan-check", workspace["code"], workspace["design"],
+        workspace["result"], workspace["logs"], check=False,
+    )
+
+    assert proc.returncode == 1
+    trace = ac.load_json(Path(workspace["logs"]) / "trace" / "architecture_validation.json")
+    assert any("unknown plane_ids ['PLANE-UNKNOWN']" in error for error in trace["errors"])
 
 
 def test_goal_runner_stops_helpers_after_persisted_session_deadline(workspace):
@@ -1477,6 +1641,15 @@ def test_instruction_makes_successful_batch_report_a_hard_progression_gate():
     assert "investigator_batch_gate.json" in instruction
 
 
+def test_instruction_requires_risk_plan_gate_before_parallel_risk_tasks():
+    instruction = (ROOT / "INSTRUCTION.md").read_text(encoding="utf-8")
+    gate_position = instruction.index("goal_runner.py risk-plan-check")
+    launch_position = instruction.index("按 plan 顺序反复取最前两个 pending slices")
+    assert gate_position < launch_position
+    assert "risk_sweep_plan_validation.json" in instruction
+    assert "passed=true" in instruction[gate_position:launch_position]
+
+
 def test_prepare_resumes_same_session_without_erasing_handoffs(workspace):
     state = workspace["state"]
     assert isinstance(state, Path)
@@ -1646,6 +1819,41 @@ def test_full_handoff_review_report_and_gate(workspace):
     assert all(issue["agent_review"]["critic_review"]["decision"] == "confirm_contradiction" for issue in result["issues"])
     assert gate["passed"] is True
     assert gate["checks"]["handoff_chain_complete"] is True
+
+
+def test_gate_rejects_risk_merge_report_bound_to_stale_plan(workspace):
+    populate_handoffs(workspace)
+    run_runner("review", workspace["code"], workspace["design"], workspace["result"], workspace["logs"])
+    run_runner("report", workspace["code"], workspace["design"], workspace["result"], workspace["logs"])
+    state = workspace["state"]
+    assert isinstance(state, Path)
+    report_path = Path(workspace["logs"]) / "trace" / "risk-handoff-merge.json"
+    report = ac.load_json(report_path)
+    report["risk_sweep_plan_sha256"] = "stale-plan-digest"
+    ac.save_json(report_path, report)
+    risks, errors = ac.load_jsonl(state / "risk_observations.jsonl")
+    assert errors == []
+    ac.append_jsonl(state / "agent_run_ledger.jsonl", {
+        "recorded_at": ac.now_iso(), "session_id": workspace["session_id"],
+        "event": "handoff_merge", "actor": "fixture_handoff_merge",
+        "phase": "code_risk_backtracking", "status": "complete",
+        "artifact_type": "risk",
+        "validated_ids": [risk["observation_id"] for risk in risks],
+        "report": str(report_path), "report_sha256": ac.sha256_file(report_path),
+        "ledger_sha256": ac.sha256_file(state / "risk_observations.jsonl"),
+    })
+
+    proc = run_runner(
+        "gate", workspace["code"], workspace["design"],
+        workspace["result"], workspace["logs"], check=False,
+    )
+
+    assert proc.returncode == 1
+    gate = ac.load_json(Path(workspace["logs"]) / "trace" / "final_gate.json")
+    assert any(
+        "risk handoff merge trace does not validate the current ledger" in error
+        for error in gate["errors"]
+    )
 
 
 def test_coverage_passed_is_not_closed_while_next_round_tasks_exist(workspace):
@@ -1857,7 +2065,7 @@ def test_parallel_path_can_be_covered_by_linked_split_plane_tasks(workspace):
     assert isinstance(state, Path)
     architecture = ac.load_json(state / "architecture_map.json")
     architecture["implementation_planes"].append({
-        "plane_id": "PLANE-ALTERNATE", "kind": "adapter", "paths": ["alternate/"],
+        "plane_id": "PLANE-ALTERNATE", "kind": "adapter", "paths": ["service.py"],
         "reachable_evidence": "A second entry plane reaches the same contract.",
     })
     architecture["parallel_behavior_paths"] = [{
@@ -1867,6 +2075,18 @@ def test_parallel_path_can_be_covered_by_linked_split_plane_tasks(workspace):
         "evidence": "Both public entry planes expose the designed behavior.",
     }]
     ac.save_json(state / "architecture_map.json", architecture)
+    plan = ac.load_json(state / "risk_sweep_plan.json")
+    plan["architecture_map_sha256"] = ac.sha256_file(state / "architecture_map.json")
+    plan["required_coverage"]["plane_ids"] = [
+        "PLANE-SERVICE", "PLANE-AUDIT", "PLANE-ALTERNATE",
+    ]
+    plan["required_coverage"]["parallel_path_ids"] = [
+        "PARALLEL-SERVICE-CONTRACT",
+    ]
+    plan["slices"][0]["implementation_planes"].append("PLANE-ALTERNATE")
+    plan["slices"][0]["parallel_path_ids"] = ["PARALLEL-SERVICE-CONTRACT"]
+    ac.save_json(state / "risk_sweep_plan.json", plan)
+    risk_plan_digest = ac.sha256_file(state / "risk_sweep_plan.json")
     tasks, _ = ac.load_jsonl(state / "investigation_tasks.jsonl")
     tasks[0]["parallel_path_ids"] = ["PARALLEL-SERVICE-CONTRACT"]
     tasks[1]["parallel_path_ids"] = ["PARALLEL-SERVICE-CONTRACT"]
@@ -1880,6 +2100,9 @@ def test_parallel_path_can_be_covered_by_linked_split_plane_tasks(workspace):
     )
     risks, _ = ac.load_jsonl(state / "risk_observations.jsonl")
     risks[0]["implementation_planes"] = ["PLANE-SERVICE", "PLANE-ALTERNATE"]
+    risks[0]["parallel_path_ids"] = ["PARALLEL-SERVICE-CONTRACT"]
+    for risk in risks:
+        risk["risk_sweep_plan_sha256"] = risk_plan_digest
     (state / "risk_observations.jsonl").write_text(
         "\n".join(json.dumps(item) for item in risks) + "\n", encoding="utf-8"
     )
@@ -1898,12 +2121,15 @@ def test_parallel_path_can_be_covered_by_linked_split_plane_tasks(workspace):
     risk_report_path = Path(workspace["logs"]) / "trace" / "risk-handoff-merge.json"
     risk_report = ac.load_json(risk_report_path)
     risk_report["ledger_sha256"] = ac.sha256_file(state / "risk_observations.jsonl")
+    risk_report["risk_sweep_plan_sha256"] = risk_plan_digest
+    risk_report["architecture_map_sha256"] = plan["architecture_map_sha256"]
     ac.save_json(risk_report_path, risk_report)
     ac.append_jsonl(state / "agent_run_ledger.jsonl", {
         "recorded_at": ac.now_iso(), "session_id": workspace["session_id"],
         "event": "handoff_merge", "actor": "fixture_handoff_merge",
         "phase": "code_risk_backtracking", "status": "complete", "artifact_type": "risk",
-        "validated_ids": ["RISK-API-001"], "report": str(risk_report_path),
+            "validated_ids": [risk["observation_id"] for risk in risks],
+            "report": str(risk_report_path),
         "report_sha256": ac.sha256_file(risk_report_path),
         "ledger_sha256": ac.sha256_file(state / "risk_observations.jsonl"),
     })
