@@ -10,6 +10,7 @@ existing helpers against the replay copy.
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import shutil
@@ -19,6 +20,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import agent_common as ac
+import handoff_merge as hm
 import handoff_template as ht
 import risk_sweep_plan_validator as rpv
 
@@ -28,27 +30,36 @@ REPO_ROOT = SCRIPT_DIR.parents[2]
 SHARED_SKILL = REPO_ROOT / "work" / "skill" / "SKILL.md"
 
 STAGES = (
-    "claims", "claim-review", "risk", "plan", "investigator", "critic",
-    "judge", "coverage", "gate",
+    "inventory", "claims", "claim-review", "risk", "plan", "investigator", "probe",
+    "critic", "judge", "coverage", "gate",
 )
-ITEM_STAGES = {"investigator", "critic", "judge"}
-LOCAL_STAGES = {"claims", "claim-review", "coverage", "gate"}
+ITEM_STAGES = {"risk", "investigator", "probe", "critic", "judge"}
+LOCAL_STAGES = {"inventory", "claims", "claim-review", "plan", "coverage", "gate"}
 
 ROLE_SKILLS = {
+    "inventory": REPO_ROOT / "work" / "skills" / "spec-analyst.md",
     "claims": REPO_ROOT / "work" / "skills" / "spec-analyst.md",
     "claim-review": REPO_ROOT / "work" / "skills" / "spec-critic.md",
     "risk": REPO_ROOT / "work" / "skills" / "risk-explorer.md",
     "plan": REPO_ROOT / "work" / "skills" / "orchestrator.md",
     "investigator": REPO_ROOT / "work" / "skills" / "code-investigator.md",
+    "probe": REPO_ROOT / "work" / "skills" / "code-investigator.md",
     "critic": REPO_ROOT / "work" / "skills" / "evidence-critic.md",
     "judge": REPO_ROOT / "work" / "skills" / "final-judge.md",
     "coverage": REPO_ROOT / "work" / "skills" / "coverage-critic.md",
 }
 
 PROMPTS = {
+    "inventory": (
+        "Re-run only the light design inventory for the supplied frozen session inputs. "
+        "Map every document group to its source-grounded scope relation and sections, and write "
+        "design_inventory.json only under the replay state root."
+    ),
     "claims": (
-        "Re-run only design claim extraction for the supplied frozen session inputs. "
-        "Write design_coverage.json and design_claims.jsonl only under the replay state root."
+        "Materialize only the on-demand design obligations requested by the supplied frontier "
+        "signals. Preserve the light inventory as the breadth map; do not expand every section "
+        "into claims. Write design_coverage.json and design_claims.jsonl only under the replay "
+        "state root."
     ),
     "claim-review": (
         "Independently re-review only the frozen scoped design claims against the supplied design "
@@ -59,15 +70,21 @@ PROMPTS = {
         "Do not read design artifacts; write risk handoffs only under the replay state root."
     ),
     "plan": (
-        "Re-run only investigation planning from the supplied architecture, design claims, "
-        "coverage, and code-risk observations. Write planning artifacts only under the replay state root."
+        "Re-run only task-plan construction from accepted, digest-bound claims and code-risk "
+        "observations. Create one atomic claim branch and one hypothesis per task. Write the task "
+        "plan artifacts only under the replay state root; do not mutate lifecycle state."
     ),
     "investigator": (
         "Re-run exactly the selected investigation task. Use the frozen task and its single design "
         "claim, inspect only the declared review roots, and write only the replay finding handoff."
     ),
+    "probe": (
+        "Re-run only the selected finding's focused dynamic probe in a replay-owned workspace. "
+        "Use the frozen claim oracle and finding evidence, preserve the original review roots, "
+        "and write only the nested replay probe handoff."
+    ),
     "critic": (
-        "Adversarially re-review exactly the selected finding using its frozen claim, task, finding, "
+        "Adversarially re-review exactly the selected finding using its frozen claim, finding, "
         "and optional probe evidence. Write only the replay critic handoff."
     ),
     "judge": (
@@ -76,7 +93,8 @@ PROMPTS = {
     ),
     "coverage": (
         "Re-run only the coverage audit from the frozen architecture, claims, risks, tasks, "
-        "findings, scope, and rounds. Write semantic_coverage.json and coverage_audit.json only."
+        "findings, probes, early critics, scope, and rounds. Write semantic_coverage.json and "
+        "coverage_audit.json only."
     ),
     "gate": (
         "Replay the existing deterministic validation and final gate against the isolated copied "
@@ -91,9 +109,12 @@ CORE_FILES = (
 )
 
 GATE_STATE_FILES = (
+    "run_clock.json",
     "architecture_map.json",
     "risk_sweep_plan.json",
     "design_agent_manifest.json",
+    "design_inventory.json",
+    "design_lookup_requests.jsonl",
     "design_coverage.json",
     "claim_review_scope.json",
     "semantic_coverage.json",
@@ -105,8 +126,10 @@ GATE_STATE_FILES = (
     "investigation_findings.jsonl",
     "dynamic_probes.jsonl",
     "critic_reviews.jsonl",
+    "critic_review_history.jsonl",
     "agent_review_verdicts.jsonl",
     "coverage_audit.json",
+    "coverage_supplement_history.json",
     "validated_issues.json",
     "probable_review_queue.json",
     "agent_run_ledger.jsonl",
@@ -311,21 +334,6 @@ def _rewrite_state(
     ac.save_json(destination, value)
 
 
-def _rewrite_claim_review(
-    source: Path, destination: Path, replay_root: Path,
-) -> None:
-    value = ac.load_json(source)
-    state_root = replay_root / "state"
-    value["input_digests"] = {
-        name: ac.sha256_file(state_root / name) if (state_root / name).is_file() else ""
-        for name in (
-            "design_claims.jsonl", "design_coverage.json", "design_agent_manifest.json",
-            "claim_review_scope.json",
-        )
-    }
-    ac.save_json(destination, value)
-
-
 def _sanitize_design_manifest(source: Path, destination: Path) -> None:
     value = ac.load_json(source)
     design = value.get("design", {}) if isinstance(value.get("design"), dict) else {}
@@ -414,12 +422,93 @@ def _copy_named(copier: ArtifactCopier, names: list[tuple[str, bool]]) -> None:
                     logical_name=f"state/{name}",
                 )
                 continue
-            transform = None
-            if name == "design_claim_review.json":
-                transform = lambda source, destination: _rewrite_claim_review(
-                    source, destination, copier.replay_root,
-                )
-            copier.copy_file(name, required=required, transform=transform)
+            copier.copy_file(name, required=required)
+
+
+def _source_ref_draft(value: dict[str, Any]) -> dict[str, Any]:
+    """Strip fields that the deterministic source materializer must derive."""
+    draft = copy.deepcopy(value)
+    source_ref = draft.get("source_ref")
+    if isinstance(source_ref, dict):
+        draft["source_ref"] = {
+            key: source_ref[key]
+            for key in ("path", "line_start", "line_end")
+            if key in source_ref
+        }
+    for field in (
+        "path", "line_start", "line_end", "section", "heading", "quote", "document",
+    ):
+        draft.pop(field, None)
+    return draft
+
+
+def _inventory_to_draft(source: Path, destination: Path) -> None:
+    """Project a frozen materialized inventory back to the model-owned raw shape."""
+    value = ac.load_json(source)
+    draft = copy.deepcopy(value)
+    groups = draft.get("document_groups")
+    if not isinstance(groups, list):
+        raise ReplayError("design_inventory.json document_groups must be an array")
+    draft_groups: list[dict[str, Any]] = []
+    for index, group in enumerate(groups, start=1):
+        if not isinstance(group, dict):
+            raise ReplayError(f"design_inventory.json document_groups[{index}] must be an object")
+        raw_group = copy.deepcopy(group)
+        evidence = raw_group.get("scope_evidence")
+        if not isinstance(evidence, dict):
+            raise ReplayError(
+                f"design_inventory.json document_groups[{index}].scope_evidence must be an object"
+            )
+        raw_group["scope_evidence"] = _source_ref_draft(evidence)
+        sections = raw_group.get("sections")
+        if not isinstance(sections, list):
+            raise ReplayError(
+                f"design_inventory.json document_groups[{index}].sections must be an array"
+            )
+        if any(not isinstance(section, dict) for section in sections):
+            raise ReplayError(
+                f"design_inventory.json document_groups[{index}].sections entries must be objects"
+            )
+        raw_group["sections"] = [_source_ref_draft(section) for section in sections]
+        raw_group.pop("group_sha256", None)
+        draft_groups.append(raw_group)
+    draft["document_groups"] = draft_groups
+    ac.save_json(destination, draft)
+
+
+def _claims_to_draft(source: Path, destination: Path) -> None:
+    """Project frozen materialized claims back to source-ref-only raw drafts."""
+    values, errors = ac.load_jsonl(source)
+    if errors:
+        raise ReplayError("; ".join(errors))
+    destination.write_text(
+        "".join(
+            json.dumps(_source_ref_draft(value), ensure_ascii=False) + "\n"
+            for value in values
+        ),
+        encoding="utf-8",
+    )
+
+
+def _copy_trace(copier: ArtifactCopier, name: str, *, required: bool) -> Path | None:
+    """Copy a validation trace while preserving its item-level digest bindings."""
+    workspace = ac.load_json(copier.source_state / "workspace_manifest.json")
+    paths = workspace.get("paths", {}) if isinstance(workspace, dict) else {}
+    log_root = paths.get("log_root") if isinstance(paths, dict) else None
+    source_trace = (
+        Path(str(log_root)).resolve() / "trace"
+        if isinstance(log_root, str) and log_root
+        else copier.source_state.parent / "trace"
+    )
+    source = source_trace / name
+    if not source.is_file() or source.is_symlink():
+        if required:
+            raise ReplayError(f"missing regular source trace: {source}")
+        return None
+    destination = copier.replay_root / "logs" / "trace" / name
+    shutil.copy2(source, destination)
+    copier._record(source, destination, f"logs/trace/{name}", None)
+    return destination
 
 
 def _risk_ids(task: dict[str, Any]) -> list[str]:
@@ -434,19 +523,40 @@ def _prepare_stage_inputs(
 ) -> dict[str, Any]:
     state = copier.source_state
     selection: dict[str, Any] = {}
-    if stage == "claims":
+    if stage == "inventory":
         _copy_named(copier, [
             ("design_agent_manifest.json", True), ("design_source_plan.json", False),
         ])
         if run_local:
-            _copy_named(copier, [
-                ("design_coverage.json", True), ("design_claims.jsonl", True),
-            ])
+            copier.copy_file(
+                "design_inventory.json",
+                destination=copier.state_root / "handoffs" / "design" / "inventory.raw.json",
+                transform=_inventory_to_draft,
+                selection={"mode": "raw_source_ref_projection"},
+                logical_name="state/handoffs/design/inventory.raw.json",
+            )
+        return selection
+
+    if stage == "claims":
+        _copy_named(copier, [
+            ("design_agent_manifest.json", True), ("design_source_plan.json", False),
+            ("design_inventory.json", True), ("design_lookup_requests.jsonl", False),
+        ])
+        if run_local:
+            _copy_named(copier, [("design_coverage.json", True)])
+            copier.copy_file(
+                "design_claims.jsonl",
+                destination=copier.state_root / "handoffs" / "design" / "claims.raw.jsonl",
+                transform=_claims_to_draft,
+                selection={"mode": "raw_source_ref_projection"},
+                logical_name="state/handoffs/design/claims.raw.jsonl",
+            )
         return selection
 
     if stage == "claim-review":
         _copy_named(copier, [
-            ("design_agent_manifest.json", True), ("design_coverage.json", True),
+            ("design_agent_manifest.json", True), ("design_inventory.json", True),
+            ("design_coverage.json", True),
             ("design_claims.jsonl", True), ("claim_review_scope.json", True),
             ("design_claim_review.json", False),
         ])
@@ -458,16 +568,15 @@ def _prepare_stage_inputs(
         _copy_named(copier, [
             ("architecture_map.json", True), ("risk_sweep_plan.json", True),
         ])
-        plan, index, errors = rpv.load_validated_plan(copier.state_root)
+        _plan, index, errors = rpv.load_validated_plan(copier.state_root)
         if errors:
             raise ReplayError(
                 "risk replay requires a currently validated risk sweep plan: "
                 + "; ".join(errors)
             )
-        raw_slices = plan.get("slices", []) if isinstance(plan, dict) else []
-        selected = raw_slices[0] if raw_slices and isinstance(raw_slices[0], dict) else None
-        if not selected or selected.get("sweep_id") not in index.get("slices", {}):
-            raise ReplayError("risk replay cannot select the first validated risk sweep slice")
+        selected = index.get("slices", {}).get(item_id)
+        if not isinstance(selected, dict):
+            raise ReplayError(f"risk sweep selector {item_id!r} matched 0 validated slices")
         return dict(selected) | {
             "risk_sweep_plan_sha256": ac.sha256_file(
                 copier.state_root / "risk_sweep_plan.json"
@@ -477,24 +586,39 @@ def _prepare_stage_inputs(
     if stage == "plan":
         _copy_named(copier, [
             ("architecture_map.json", True), ("risk_sweep_plan.json", True),
-            ("design_coverage.json", True),
-            ("design_claims.jsonl", True), ("claim_review_scope.json", True),
+            ("coverage_supplement_history.json", True),
+            ("design_agent_manifest.json", True),
+            ("design_inventory.json", True), ("design_lookup_requests.jsonl", False),
+            ("design_coverage.json", True), ("design_claims.jsonl", True),
+            ("claim_review_scope.json", True), ("design_claim_review.json", True),
             ("risk_observations.jsonl", False),
             ("coverage_audit.json", False), ("semantic_coverage.json", False),
         ])
+        _copy_trace(copier, "claim_review_validation.json", required=True)
+        if run_local:
+            _copy_named(copier, [
+                ("investigation_tasks.jsonl", True),
+                ("investigation_rounds.jsonl", True),
+            ])
         return selection
 
     if stage == "coverage":
         _copy_named(copier, [
             ("architecture_map.json", True), ("risk_sweep_plan.json", True),
-            ("design_agent_manifest.json", True),
+            ("design_agent_manifest.json", True), ("design_inventory.json", True),
+            ("design_lookup_requests.jsonl", False),
             ("design_coverage.json", True), ("design_claims.jsonl", True),
             ("claim_review_scope.json", True), ("design_claim_review.json", True),
             ("risk_observations.jsonl", True),
             ("investigation_tasks.jsonl", True),
             ("investigation_findings.jsonl", True),
+            ("dynamic_probes.jsonl", True), ("critic_reviews.jsonl", True),
+            ("critic_review_history.jsonl", True),
+            ("agent_run_ledger.jsonl", True),
             ("investigation_rounds.jsonl", True),
+            ("coverage_supplement_history.json", True),
         ])
+        _copy_trace(copier, "claim_review_validation.json", required=True)
         if run_local:
             _copy_named(copier, [
                 ("semantic_coverage.json", True), ("coverage_audit.json", True),
@@ -583,9 +707,11 @@ def _prepare_stage_inputs(
     copier.copy_jsonl_selection(
         "investigation_findings.jsonl", findings, key="finding_id", identifiers=[item_id],
     )
-    _copy_named(copier, [
-        ("architecture_map.json", False), ("design_coverage.json", False),
-    ])
+    if stage == "probe":
+        return {
+            "finding_id": item_id, "task_id": task_id, "claim_id": claim_id,
+            "probe_ids": [],
+        }
     probe_ids: list[str] = []
     probe_path = state / "dynamic_probes.jsonl"
     if probe_path.is_file():
@@ -623,24 +749,106 @@ def _copy_gate_support(copier: ArtifactCopier, manifest: dict[str, Any]) -> None
         destination = replay_root / "state" / "review-inputs" / destination_name
         shutil.copytree(source, destination, symlinks=True)
 
+    materialization = manifest.get("design", {}).get("materialization_source") \
+        if isinstance(manifest.get("design"), dict) else None
+    if isinstance(materialization, dict):
+        source_value = str(materialization.get("source_root") or "")
+        plan_value = str(materialization.get("plan_path") or "")
+        source_root = Path(source_value).resolve() if source_value else None
+        plan_path = Path(plan_value).resolve() if plan_value else None
+        if source_root is None or source_root.is_symlink() or not source_root.is_dir():
+            raise ReplayError(
+                f"gate replay requires the original materialization source: {source_root}"
+            )
+        if plan_path is None or plan_path.is_symlink() or not plan_path.is_file():
+            raise ReplayError(
+                f"gate replay requires the original materialization plan: {plan_path}"
+            )
+        replay_source = replay_root / "state" / "materialization-inputs" / "source"
+        shutil.copytree(source_root, replay_source, symlinks=True)
+        for source in ac.iter_integrity_files(source_root):
+            relative = source.relative_to(source_root)
+            destination = replay_source / relative
+            logical_name = f"state/materialization-inputs/source/{relative}"
+            if source.is_symlink():
+                source_digest = ac.stable_id(
+                    "symlink", str(source.readlink()), length=64,
+                )
+                replay_digest = ac.stable_id(
+                    "symlink", str(destination.readlink()), length=64,
+                )
+                copier.records.append({
+                    "logical_name": logical_name,
+                    "source_path": str(source.absolute()),
+                    "source_sha256": source_digest,
+                    "replay_path": str(
+                        destination.absolute().relative_to(replay_root.resolve())
+                    ),
+                    "replay_sha256": replay_digest,
+                    "selection": {"mode": "materialization_source_tree"},
+                })
+                copier.copied.add(logical_name)
+            elif source.is_file():
+                copier._record(
+                    source, destination, logical_name,
+                    {"mode": "materialization_source_tree"},
+                )
+        replay_plan = copier.state_root / "design_source_plan.json"
+        if not replay_plan.is_file():
+            replay_plan.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(plan_path, replay_plan)
+            copier._record(
+                plan_path, replay_plan, "state/design_source_plan.json",
+                {"mode": "materialization_plan"},
+            )
+        replay_manifest_path = copier.state_root / "workspace_manifest.json"
+        replay_manifest = ac.load_json(replay_manifest_path)
+        replay_materialization = replay_manifest.get("design", {}).get(
+            "materialization_source"
+        )
+        if not isinstance(replay_materialization, dict):
+            raise ReplayError("gate replay materialization snapshot is missing")
+        replay_materialization["source_root"] = str(replay_source.resolve())
+        replay_materialization["plan_path"] = str(replay_plan.resolve())
+        source_manifest = replay_manifest.get("design", {}).get("source_manifest")
+        if isinstance(source_manifest, dict):
+            source_manifest["source_root"] = str(replay_source.resolve())
+            source_manifest["plan_path"] = str(replay_plan.resolve())
+        ac.save_json(replay_manifest_path, replay_manifest)
+        _refresh_record(
+            copier, "state/workspace_manifest.json", replay_manifest_path,
+        )
+        contract_path = copier.state_root / "agent_loop_contract.json"
+        contract = ac.load_json(contract_path)
+        target_roots = contract.get("guardrails", {}).get("target_roots_read_only") \
+            if isinstance(contract, dict) else None
+        if isinstance(target_roots, list):
+            contract["guardrails"]["target_roots_read_only"] = [
+                str(replay_source.resolve()) if value == source_value else value
+                for value in target_roots
+            ]
+            ac.save_json(contract_path, contract)
+            _refresh_record(copier, "state/agent_loop_contract.json", contract_path)
+
     design_manifest_path = copier.state_root / "design_agent_manifest.json"
     if design_manifest_path.is_file():
         design_manifest = ac.load_json(design_manifest_path)
+        current_workspace = ac.load_json(
+            copier.state_root / "workspace_manifest.json"
+        )
         design_manifest["review_design_root"] = str(
             (replay_root / "state" / "review-inputs" / "design").resolve()
         )
+        if isinstance(design_manifest.get("design"), dict) and isinstance(
+            current_workspace.get("design"), dict
+        ):
+            design_manifest["design"]["source_manifest"] = current_workspace[
+                "design"
+            ].get("source_manifest")
         ac.save_json(design_manifest_path, design_manifest)
         for record in copier.records:
             if record["logical_name"] == "state/design_agent_manifest.json":
                 record["replay_sha256"] = ac.sha256_file(design_manifest_path)
-    review_path = copier.state_root / "design_claim_review.json"
-    source_review = copier.source_state / "design_claim_review.json"
-    if review_path.is_file() and source_review.is_file():
-        _rewrite_claim_review(source_review, review_path, replay_root)
-        for record in copier.records:
-            if record["logical_name"] == "state/design_claim_review.json":
-                record["replay_sha256"] = ac.sha256_file(review_path)
-
     source_log_value = manifest.get("paths", {}).get("log_root")
     source_trace = (
         Path(str(source_log_value)).resolve() / "trace"
@@ -654,9 +862,9 @@ def _copy_gate_support(copier: ArtifactCopier, manifest: dict[str, Any]) -> None
             name = source.name
             if not (
                 name in {
-                    "design_validation.json", "claim_review_validation.json",
+                    "run_clock.json", "design_validation.json", "claim_review_validation.json",
                     "architecture_validation.json", "risk_sweep_plan_validation.json",
-                    "task_validation.json",
+                    "task_plan_validation.json", "task_lifecycle_validation.json",
                     "coverage_validation.json", "evidence_validation.json",
                 }
                 or name.endswith("-handoff-merge.json")
@@ -714,19 +922,181 @@ def _copy_gate_support(copier: ArtifactCopier, manifest: dict[str, Any]) -> None
                 record["replay_sha256"] = ac.sha256_file(ledger)
 
 
+def _refresh_record(copier: ArtifactCopier, logical_name: str, path: Path) -> None:
+    for record in copier.records:
+        if record["logical_name"] == logical_name:
+            record["replay_sha256"] = ac.sha256_file(path)
+            return
+
+
+def _copy_probe_support(copier: ArtifactCopier, *, refresh_gate_traces: bool) -> None:
+    """Relocate probe workspaces and refresh their deterministic bindings.
+
+    A probe records an absolute session-owned workspace.  A replay therefore
+    cannot merely copy its JSONL ledger: it must copy that workspace below the
+    replay state and update the path-dependent critic digest.  Semantic fields
+    are preserved byte-for-byte.
+    """
+    probe_path = copier.state_root / "dynamic_probes.jsonl"
+    if not probe_path.is_file():
+        return
+    probes = _load_jsonl(probe_path)
+    if not probes:
+        return
+    source_probe_root = copier.source_state / "probes"
+    replay_probe_root = copier.state_root / "probes"
+    for probe in probes:
+        isolation = probe.get("isolation")
+        if not isinstance(isolation, dict):
+            raise ReplayError("dynamic probe lacks an isolation object")
+        source_value = isolation.get("workspace")
+        source_workspace = Path(str(source_value)).resolve() if source_value else None
+        if source_workspace is None or not source_workspace.is_dir() or source_workspace.is_symlink():
+            raise ReplayError(f"dynamic probe workspace is unavailable: {source_workspace}")
+        try:
+            relative = source_workspace.relative_to(source_probe_root.resolve())
+        except ValueError as exc:
+            raise ReplayError(
+                f"dynamic probe workspace is outside source state/probes: {source_workspace}"
+            ) from exc
+        destination_workspace = replay_probe_root / relative
+        destination_workspace.mkdir(parents=True, exist_ok=True)
+        for source in sorted(source_workspace.rglob("*")):
+            if source.is_symlink():
+                raise ReplayError(f"dynamic probe workspace contains a symlink: {source}")
+            relative_file = source.relative_to(source_workspace)
+            destination = destination_workspace / relative_file
+            if source.is_dir():
+                destination.mkdir(parents=True, exist_ok=True)
+                continue
+            if not source.is_file():
+                raise ReplayError(f"dynamic probe workspace contains a non-file: {source}")
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
+            copier._record(
+                source, destination,
+                f"state/probes/{relative}/{relative_file}",
+                {"mode": "probe_workspace", "probe_id": probe.get("probe_id")},
+            )
+        isolation["workspace"] = str(destination_workspace.resolve())
+        isolation["command_cwd"] = str(destination_workspace.resolve())
+    probe_path.write_text(
+        "".join(json.dumps(probe, ensure_ascii=False) + "\n" for probe in probes),
+        encoding="utf-8",
+    )
+    _refresh_record(copier, "state/dynamic_probes.jsonl", probe_path)
+
+    critic_path = copier.state_root / "critic_reviews.jsonl"
+    history_path = copier.state_root / "critic_review_history.jsonl"
+    if not critic_path.is_file() or not history_path.is_file():
+        raise ReplayError("probe replay requires critic reviews and critic review history")
+    critics = _load_jsonl(critic_path)
+    rebound_critics: list[dict[str, Any]] = []
+    for critic in critics:
+        draft = dict(critic)
+        draft.pop("input_digests", None)
+        draft.pop("evidence_critic_prompt_version", None)
+        rebound_critics.append(hm.materialize_critic_bindings(
+            draft, copier.state_root,
+            f"critic ({draft.get('finding_id') or draft.get('review_id') or '?'})",
+        ))
+    critic_path.write_text(
+        "".join(json.dumps(critic, ensure_ascii=False) + "\n" for critic in rebound_critics),
+        encoding="utf-8",
+    )
+    _refresh_record(copier, "state/critic_reviews.jsonl", critic_path)
+
+    history = _load_jsonl(history_path)
+    by_key = {
+        str(entry.get("review_key") or ""): entry
+        for entry in history if entry.get("review_key")
+    }
+    for critic in rebound_critics:
+        review_key = hm.canonical_digest({
+            "finding_id": critic.get("finding_id"),
+            "input_digests": critic.get("input_digests"),
+            "evidence_critic_prompt_version": critic.get(
+                "evidence_critic_prompt_version"
+            ),
+        })
+        critic_sha256 = hm.canonical_digest(critic)
+        existing = by_key.get(review_key)
+        if existing is not None and existing.get("critic_sha256") != critic_sha256:
+            raise ReplayError("critic history conflicts with the relocated probe binding")
+        if existing is None:
+            entry = {
+                "recorded_at": ac.now_iso(),
+                "session_id": critic.get("session_id"),
+                "finding_id": critic.get("finding_id"),
+                "review_key": review_key,
+                "input_digests": critic.get("input_digests"),
+                "evidence_critic_prompt_version": critic.get(
+                    "evidence_critic_prompt_version"
+                ),
+                "critic_sha256": critic_sha256,
+                "replay_relocation": True,
+            }
+            history.append(entry)
+            by_key[review_key] = entry
+    history_path.write_text(
+        "".join(json.dumps(entry, ensure_ascii=False) + "\n" for entry in history),
+        encoding="utf-8",
+    )
+    _refresh_record(copier, "state/critic_review_history.jsonl", history_path)
+
+    if not refresh_gate_traces:
+        return
+    replay_trace = copier.replay_root / "logs" / "trace"
+    ledger_digests = {
+        "probe": ac.sha256_file(probe_path),
+        "critic": ac.sha256_file(critic_path),
+    }
+    for report_path in sorted(replay_trace.glob("*merge*.json")):
+        if not report_path.is_file() or report_path.is_symlink():
+            continue
+        report = ac.load_json(report_path)
+        artifact_type = report.get("artifact_type") if isinstance(report, dict) else None
+        if artifact_type not in ledger_digests:
+            continue
+        report["ledger_sha256"] = ledger_digests[artifact_type]
+        ac.save_json(report_path, report)
+        _refresh_record(copier, f"logs/trace/{report_path.name}", report_path)
+
+    ledger_path = copier.state_root / "agent_run_ledger.jsonl"
+    ledger = _load_jsonl(ledger_path)
+    for event in ledger:
+        artifact_type = event.get("artifact_type")
+        if event.get("event") != "handoff_merge" or artifact_type not in ledger_digests:
+            continue
+        event["ledger_sha256"] = ledger_digests[artifact_type]
+        report_value = event.get("report")
+        report_path = Path(str(report_value)) if report_value else None
+        if report_path is not None and report_path.is_file():
+            event["report_sha256"] = ac.sha256_file(report_path)
+    ledger_path.write_text(
+        "".join(json.dumps(event, ensure_ascii=False) + "\n" for event in ledger),
+        encoding="utf-8",
+    )
+    _refresh_record(copier, "state/agent_run_ledger.jsonl", ledger_path)
+
+
 def _outputs(stage: str, item_id: str | None) -> list[dict[str, str]]:
-    if stage == "claims":
+    if stage == "inventory":
+        paths = ("state/design_inventory.json",)
+    elif stage == "claims":
         paths = ("state/design_coverage.json", "state/design_claims.jsonl")
     elif stage == "claim-review":
         paths = ("state/design_claim_review.json",)
     elif stage == "risk":
-        paths = ("state/handoffs/risks/*.json",)
+        paths = (f"state/handoffs/risks/{item_id}/{item_id}.json",)
     elif stage == "plan":
         paths = ("state/investigation_tasks.jsonl", "state/investigation_rounds.jsonl")
     elif stage == "investigator":
-        paths = (f"state/handoffs/investigators/{item_id}.json",)
+        paths = (f"state/handoffs/investigators/{item_id}/{item_id}.json",)
+    elif stage == "probe":
+        paths = (f"state/handoffs/probes/{item_id}/{item_id}.json",)
     elif stage == "critic":
-        paths = (f"state/handoffs/critics/{item_id}.json",)
+        paths = (f"state/handoffs/critics/{item_id}/{item_id}.json",)
     elif stage == "judge":
         paths = ("state/agent_review_verdicts.jsonl",)
     elif stage == "coverage":
@@ -739,24 +1109,32 @@ def _outputs(stage: str, item_id: str | None) -> list[dict[str, str]]:
 def _prompt_inputs(stage: str, records: list[dict[str, Any]]) -> list[str]:
     """Expose only role-owned artifacts; copied core files remain validator infrastructure."""
     allowed: dict[str, set[str]] = {
-        "claims": {
+        "inventory": {
             "state/design_agent_manifest.json", "state/design_source_plan.json",
         },
+        "claims": {
+            "state/design_agent_manifest.json", "state/design_source_plan.json",
+            "state/design_inventory.json", "state/design_lookup_requests.jsonl",
+        },
         "claim-review": {
-            "state/design_agent_manifest.json", "state/design_coverage.json",
+            "state/design_agent_manifest.json", "state/design_inventory.json",
+            "state/design_coverage.json",
             "state/design_claims.jsonl", "state/claim_review_scope.json",
             "state/design_claim_review.json",
         },
         "risk": {
             "state/agent_loop_contract.json", "state/architecture_map.json",
-            "state/risk_sweep_plan.json",
+            "state/risk_sweep_plan.json", "state/coverage_supplement_history.json",
         },
         "plan": {
             "state/agent_loop_contract.json", "state/architecture_map.json",
             "state/risk_sweep_plan.json",
+            "state/design_inventory.json", "state/design_lookup_requests.jsonl",
             "state/design_coverage.json", "state/design_claims.jsonl",
-            "state/claim_review_scope.json", "state/risk_observations.jsonl", "state/coverage_audit.json",
+            "state/claim_review_scope.json", "state/design_claim_review.json",
+            "state/risk_observations.jsonl", "state/coverage_audit.json",
             "state/semantic_coverage.json",
+            "logs/trace/claim_review_validation.json",
         },
         "investigator": {
             "state/architecture_map.json", "state/risk_sweep_plan.json",
@@ -765,24 +1143,30 @@ def _prompt_inputs(stage: str, records: list[dict[str, Any]]) -> list[str]:
             "state/risk_observations.jsonl",
         },
         "critic": {
-            "state/architecture_map.json", "state/design_coverage.json",
-            "state/design_claims.jsonl", "state/investigation_tasks.jsonl",
+            "state/design_claims.jsonl",
             "state/investigation_findings.jsonl", "state/dynamic_probes.jsonl",
         },
+        "probe": {
+            "state/design_claims.jsonl", "state/investigation_findings.jsonl",
+        },
         "judge": {
-            "state/design_claims.jsonl", "state/investigation_tasks.jsonl",
+            "state/design_claims.jsonl",
             "state/investigation_findings.jsonl", "state/dynamic_probes.jsonl",
             "state/critic_reviews.jsonl",
         },
         "coverage": {
             "state/agent_loop_contract.json", "state/workspace_manifest.json",
             "state/architecture_map.json", "state/risk_sweep_plan.json",
-            "state/design_agent_manifest.json",
+            "state/design_agent_manifest.json", "state/design_inventory.json",
+            "state/design_lookup_requests.jsonl",
             "state/design_coverage.json", "state/design_claims.jsonl",
             "state/claim_review_scope.json", "state/design_claim_review.json",
             "state/risk_observations.jsonl",
             "state/investigation_tasks.jsonl", "state/investigation_findings.jsonl",
+            "state/dynamic_probes.jsonl", "state/critic_reviews.jsonl",
             "state/investigation_rounds.jsonl",
+            "state/coverage_supplement_history.json",
+            "logs/trace/claim_review_validation.json",
         },
     }
     if stage == "gate":
@@ -820,7 +1204,8 @@ def prepare_replay(
         raise ReplayError(f"--item-id is not valid for stage {stage}")
     if run_local and stage not in LOCAL_STAGES:
         raise ReplayError(
-            "--run-local is supported only for claims, claim-review, coverage, and gate"
+            "--run-local is supported only for inventory, claims, claim-review, plan, "
+            "coverage, and gate"
         )
 
     source_state = source_state.resolve()
@@ -858,6 +1243,14 @@ def prepare_replay(
             }
             and isinstance(value, str) and value
         )
+    materialization = source_manifest.get("design", {}).get(
+        "materialization_source"
+    ) if isinstance(source_manifest.get("design"), dict) else None
+    if isinstance(materialization, dict):
+        for key in ("source_root", "plan_path"):
+            value = materialization.get(key)
+            if isinstance(value, str) and value:
+                protected_roots.append(Path(value))
     _prepare_empty_root(source_state, replay_root, force, protected_roots)
     copier = ArtifactCopier(source_state, replay_root)
     copier.copy_file(
@@ -875,8 +1268,11 @@ def prepare_replay(
         transform=lambda source, destination: _rewrite_state(source, destination, replay_root),
     )
     selection = _prepare_stage_inputs(copier, stage, item_id, run_local)
+    if stage == "coverage":
+        _copy_probe_support(copier, refresh_gate_traces=False)
     if stage == "gate":
         _copy_gate_support(copier, source_manifest)
+        _copy_probe_support(copier, refresh_gate_traces=True)
 
     prompt, prompt_digest, skills, schema = _copy_prompt_assets(
         replay_root, stage, prompt_file,
@@ -903,9 +1299,9 @@ def prepare_replay(
     replay_manifest = ac.load_json(replay_root / "state" / "workspace_manifest.json")
     paths = replay_manifest.get("paths", {})
     read_roots: dict[str, str] = {}
-    if stage in {"risk", "investigator", "critic"} and paths.get("review_code_root"):
+    if stage in {"risk", "investigator", "probe", "critic"} and paths.get("review_code_root"):
         read_roots["code"] = str(paths["review_code_root"])
-    if stage in {"claims", "claim-review", "investigator", "critic"} and paths.get(
+    if stage in {"inventory", "claims", "claim-review", "investigator", "critic"} and paths.get(
         "review_design_root"
     ):
         read_roots["design"] = str(paths["review_design_root"])
@@ -994,12 +1390,60 @@ def run_local(replay_root: Path) -> int:
         "--state-root", str((replay_root / "state").resolve()),
     ]
     preflight_command: list[str] | None = None
-    if stage == "claims":
-        command = [sys.executable, str(SCRIPT_DIR / "design_artifact_validator.py"), *base]
+    if stage == "inventory":
+        design_manifest = ac.load_json(replay_root / "state" / "design_agent_manifest.json")
+        materializer_design_root = str(
+            design_manifest.get("review_design_root")
+            or paths.get("review_design_root")
+            or paths.get("design_root")
+            or ""
+        )
+        materialized_output = replay_root / "state" / "design_inventory.json"
+        materialized_output.unlink(missing_ok=True)
+        preflight_command = [
+            sys.executable, str(SCRIPT_DIR / "design_source_materializer.py"),
+            "--materialize", "inventory",
+            "--design-root", materializer_design_root,
+            "--input", str(replay_root / "state" / "handoffs" / "design" / "inventory.raw.json"),
+            "--output", str(materialized_output),
+            "--trace", str(replay_root / "logs" / "trace" / "design_inventory_materialization.json"),
+        ]
+        command = [
+            sys.executable, str(SCRIPT_DIR / "design_artifact_validator.py"),
+            *base, "--mode", "inventory",
+        ]
+        kind = "design_inventory_validation"
+    elif stage == "claims":
+        design_manifest = ac.load_json(replay_root / "state" / "design_agent_manifest.json")
+        materializer_design_root = str(
+            design_manifest.get("review_design_root")
+            or paths.get("review_design_root")
+            or paths.get("design_root")
+            or ""
+        )
+        materialized_output = replay_root / "state" / "design_claims.jsonl"
+        materialized_output.unlink(missing_ok=True)
+        preflight_command = [
+            sys.executable, str(SCRIPT_DIR / "design_source_materializer.py"),
+            "--materialize", "claims",
+            "--design-root", materializer_design_root,
+            "--input", str(replay_root / "state" / "handoffs" / "design" / "claims.raw.jsonl"),
+            "--output", str(materialized_output),
+            "--trace", str(replay_root / "logs" / "trace" / "design_claim_materialization.json"),
+        ]
+        command = [
+            sys.executable, str(SCRIPT_DIR / "design_artifact_validator.py"),
+            *base, "--mode", "claims",
+        ]
         kind = "design_schema_validation"
     elif stage == "claim-review":
         command = [sys.executable, str(SCRIPT_DIR / "claim_review_validator.py"), *base]
         kind = "claim_review_validation"
+    elif stage == "plan":
+        command = [
+            sys.executable, str(SCRIPT_DIR / "goal_runner.py"), "task-plan-check", *base,
+        ]
+        kind = "task_plan_validation"
     elif stage == "coverage":
         preflight_command = [
             sys.executable, str(SCRIPT_DIR / "claim_review_validator.py"), *base,

@@ -12,12 +12,13 @@ from typing import Any
 import agent_common as ac
 import handoff_merge as hm
 import report_writer as rw
+import run_clock as rc
+import session_event as se
 import risk_sweep_plan_validator as rpv
 import stage_artifact_validator as sav
 import verdict_validator as vv
 
 
-FINAL_CONFIRMED_QUOTA = 4
 MAX_SECONDS = 21600
 
 
@@ -71,10 +72,14 @@ def _check_issue(issue: dict[str, Any], session_id: str, result_root: Path) -> l
     return errors
 
 
-def _tree_changes(root: Path, records: list[dict[str, Any]], label: str = "target") -> list[str]:
+def _tree_changes(
+    root: Path, records: list[dict[str, Any]], label: str = "target",
+    *, complete_tree: bool = False,
+) -> list[str]:
     """Compare current target files with the prepare-time content snapshot."""
     expected = {str(record.get("path")): record for record in records if record.get("path")}
-    current = {ac.relative_path(root, path): path for path in ac.iter_files(root)}
+    iterator = ac.iter_integrity_files(root) if complete_tree else ac.iter_files(root)
+    current = {ac.relative_path(root, path): path for path in iterator}
     errors: list[str] = []
     added = sorted(set(current) - set(expected))
     removed = sorted(set(expected) - set(current))
@@ -117,6 +122,34 @@ def run(args: argparse.Namespace) -> int:
     session_id = str(state.get("session_id") or "")
     errors: list[str] = []
     checks: dict[str, bool] = {}
+    run_clock_path = root / "run_clock.json"
+    run_clock = ac.load_json(run_clock_path) if run_clock_path.is_file() else {}
+    run_clock_trace_path = trace_root / "run_clock.json"
+    run_clock_trace = (
+        ac.load_json(run_clock_trace_path)
+        if run_clock_trace_path.is_file() else {}
+    )
+    clock_errors: list[str] = []
+    if run_clock_path.is_symlink() or not isinstance(run_clock, dict) or not run_clock:
+        clock_errors.append("immutable run_clock.json is missing or invalid")
+    else:
+        clock_errors.extend(
+            f"immutable run_clock.json: {error}"
+            for error in rc.validate_clock(run_clock)
+        )
+        if (
+            state.get("started_at") != run_clock.get("started_at")
+            or state.get("deadline_at") != run_clock.get("deadline_at")
+            or run_clock.get("maximum_seconds") != MAX_SECONDS
+        ):
+            clock_errors.append("session timing does not match immutable run_clock.json")
+        if (
+            run_clock_trace_path.is_symlink()
+            or not isinstance(run_clock_trace, dict)
+            or run_clock_trace != run_clock
+        ):
+            clock_errors.append("run_clock.json differs from its original trace baseline")
+    errors.extend(clock_errors)
 
     result_path = result_root / "issues.json"
     result = ac.load_json(result_path) if result_path.exists() else {}
@@ -213,15 +246,11 @@ def run(args: argparse.Namespace) -> int:
         + critic_errors + probe_errors + verdict_errors
     )
     errors.extend(round_errors)
-    reviewable_finding_ids = {
-        finding_id for finding_id, finding in findings.items()
-        if finding.get("assessment") in {"contradiction_supported", "uncertain"}
-    }
-    if not reviewable_finding_ids.issubset(critiques) or set(critiques) - set(findings):
-        missing = sorted(reviewable_finding_ids - set(critiques))
+    if not set(findings).issubset(critiques) or set(critiques) - set(findings):
+        missing = sorted(set(findings) - set(critiques))
         extra = sorted(set(critiques) - set(findings))
         errors.append(
-            "critic coverage does not cover every reviewable finding: "
+            "critic coverage does not cover every finding: "
             f"missing={missing}, extra={extra}"
         )
     if set(verdicts) != set(findings):
@@ -237,12 +266,13 @@ def run(args: argparse.Namespace) -> int:
     }
 
     design_validation = ac.load_json(trace_root / "design_validation.json") if (trace_root / "design_validation.json").is_file() else {}
-    if design_validation.get("passed") is not True:
+    if design_validation.get("passed") is not True or design_validation.get("mode") != "all":
         errors.append("passed design-validation trace is missing")
     expected_design_digests = {
+        "design_inventory.json": ac.sha256_file(root / "design_inventory.json")
+        if (root / "design_inventory.json").is_file() else "",
         "design_claims.jsonl": ac.sha256_file(root / "design_claims.jsonl"),
-        "design_coverage.json": ac.sha256_file(root / "design_coverage.json")
-        if (root / "design_coverage.json").is_file() else "",
+        "design_coverage.json": ac.sha256_file(root / "design_coverage.json"),
         "workspace_manifest.json": ac.sha256_file(root / "workspace_manifest.json"),
     }
     if design_validation.get("input_digests") != expected_design_digests:
@@ -259,8 +289,6 @@ def run(args: argparse.Namespace) -> int:
         errors.append("claim_review_scope.json is missing")
     elif scope.get("session_id") != session_id:
         errors.append("claim review scope does not match current session")
-    elif scope.get("design_claims_sha256") != expected_design_digests["design_claims.jsonl"]:
-        errors.append("claim review scope is stale for current design claims")
     if not scoped_claim_ids or len(scoped_claim_ids) != len(raw_scope_claim_ids):
         errors.append("claim review scope must contain unique non-empty claim IDs")
     unknown_scoped_claims = scoped_claim_ids - set(claims)
@@ -274,44 +302,68 @@ def run(args: argparse.Namespace) -> int:
         ac.load_json(claim_review_validation_path)
         if claim_review_validation_path.is_file() else {}
     )
-    expected_claim_review_digests = {
-        "design_claims.jsonl": expected_design_digests["design_claims.jsonl"],
-        "design_coverage.json": expected_design_digests["design_coverage.json"],
-        "design_agent_manifest.json": ac.sha256_file(root / "design_agent_manifest.json")
-        if (root / "design_agent_manifest.json").is_file() else "",
-        "claim_review_scope.json": ac.sha256_file(scope_path) if scope_path.is_file() else "",
-    }
     if not (root / "design_agent_manifest.json").is_file():
         errors.append("design_agent_manifest.json is missing")
-    if claim_review.get("decision") != "accept":
-        errors.append("fresh spec critic has not accepted the current scoped design claims")
-    if claim_review.get("input_digests") != expected_claim_review_digests:
-        errors.append("design claim review is stale for current design artifacts")
     if (
         claim_review_validation.get("passed") is not True
-        or claim_review_validation.get("decision") != "accept"
-        or claim_review_validation.get("input_digests") != expected_claim_review_digests
+        or claim_review_validation.get("session_id") != session_id
     ):
-        errors.append("passed digest-bound claim-review validation trace is missing or stale")
+        errors.append("passed per-claim-bound claim-review validation trace is missing")
     accepted_claim_ids = {
         str(value) for value in claim_review_validation.get("accepted_claim_ids", [])
         if isinstance(value, str) and value
     }
-    if accepted_claim_ids != scoped_claim_ids:
-        errors.append("accepted claim-review scope does not match current claim_review_scope.json")
+    repaired_claim_ids = {
+        str(value) for value in claim_review_validation.get("repaired_claim_ids", [])
+        if isinstance(value, str) and value
+    }
+    if accepted_claim_ids.intersection(repaired_claim_ids):
+        errors.append("claim review validation accepts and repairs the same claim")
+    if accepted_claim_ids.union(repaired_claim_ids) != scoped_claim_ids:
+        errors.append("claim review validation does not account for every scoped claim")
     used_claim_ids = {
         str(item.get("claim_id") or "") for item in [*tasks.values(), *findings.values()]
         if item.get("claim_id")
     }
     unreviewed_used_claims = used_claim_ids - accepted_claim_ids
     if unreviewed_used_claims:
-        errors.append(f"tasks/findings use claims outside accepted review scope: {sorted(unreviewed_used_claims)}")
+        errors.append(f"tasks/findings use claims without a current accepted review: {sorted(unreviewed_used_claims)}")
 
     def stage_validation_current(stage: str) -> bool:
-        path = trace_root / f"{stage}_validation.json"
+        trace_name = {
+            "task-plan": "task_plan_validation.json",
+            "task-lifecycle": "task_lifecycle_validation.json",
+        }.get(stage, f"{stage}_validation.json")
+        path = trace_root / trace_name
         if not path.is_file():
             return False
         report = ac.load_json(path)
+        if stage == "task-plan":
+            contract_value = ac.load_json(root / "agent_loop_contract.json")
+            architecture_value = ac.load_json(root / "architecture_map.json")
+            expected_plan_sha256 = sav.task_plan_snapshot_sha256(
+                root,
+                contract=contract_value,
+                architecture=architecture_value,
+                claims=claims,
+                risks=risks,
+                tasks=tasks,
+                rounds=list(rounds.values()),
+            )
+            return (
+                report.get("passed") is True
+                and report.get("session_id") == session_id
+                and report.get("task_plan_sha256") == expected_plan_sha256
+            )
+        if stage == "task-lifecycle":
+            expected_lifecycle_sha256 = sav.task_lifecycle_snapshot_sha256(
+                tasks=tasks, findings=findings, rounds=list(rounds.values()),
+            )
+            return (
+                report.get("passed") is True
+                and report.get("session_id") == session_id
+                and report.get("task_lifecycle_sha256") == expected_lifecycle_sha256
+            )
         expected_inputs, expected_combined = sav._input_digests(
             root, sav._stage_inputs(root, stage),
         )
@@ -322,7 +374,14 @@ def run(args: argparse.Namespace) -> int:
             and report.get("combined_input_sha256") == expected_combined
         )
         if stage == "coverage":
-            current = current and report.get("closed") is True
+            current = (
+                current
+                and report.get("closed") is True
+                and report.get("coverage_provenance_sha256")
+                == sav.coverage_provenance_sha256(root)
+                and report.get("claim_review_provenance_sha256")
+                == sav.claim_review_provenance_sha256(root)
+            )
         return current
 
     evidence_validation_path = trace_root / "evidence_validation.json"
@@ -340,9 +399,24 @@ def run(args: argparse.Namespace) -> int:
     if not evidence_validation_current:
         errors.append("passed digest-bound evidence validation trace is missing or stale")
 
-    for stage in ("architecture", "task", "coverage"):
+    for stage in ("architecture", "task-plan", "task-lifecycle", "coverage"):
         if not stage_validation_current(stage):
             errors.append(f"passed digest-bound {stage} validation trace is missing or stale")
+    published_task_ids = {
+        str(findings[finding_id].get("task_id") or "")
+        for finding_id in published_finding_ids.intersection(findings)
+        if findings[finding_id].get("task_id")
+    }
+    for stage, trace_name in (
+        ("task-plan", "task_plan_validation.json"),
+        ("task-lifecycle", "task_lifecycle_validation.json"),
+    ):
+        trace = ac.load_json(trace_root / trace_name) if (trace_root / trace_name).is_file() else {}
+        missing_valid_tasks = published_task_ids - set(trace.get("valid_task_ids", []))
+        if missing_valid_tasks:
+            errors.append(
+                f"published issue tasks are invalid in {stage}: {sorted(missing_valid_tasks)}"
+            )
 
     def valid_merge_report(
         path: Path, artifact_type: str, expected_ids: set[str], ledger_path: Path,
@@ -353,8 +427,12 @@ def run(args: argparse.Namespace) -> int:
         current = (
             report.get("passed") is True
             and set(report.get("validated_ids", [])) == expected_ids
-            and report.get("ledger_sha256") == ac.sha256_file(ledger_path)
         )
+        if artifact_type == "task":
+            current = current and report.get("task_plan_ledger_sha256") == \
+                hm.task_plan_ledger_sha256(tasks)
+        else:
+            current = current and report.get("ledger_sha256") == ac.sha256_file(ledger_path)
         if artifact_type == "risk":
             plan_path = root / "risk_sweep_plan.json"
             architecture_path = root / "architecture_map.json"
@@ -374,8 +452,15 @@ def run(args: argparse.Namespace) -> int:
                     if architecture_path.is_file() else ""
                 )
                 and set(report.get("expected_sweep_ids", [])) == expected_sweeps
-                and set(report.get("validated_sweep_ids", [])) == expected_sweeps
+                and set(report.get("completed_sweep_ids", [])) == expected_sweeps
                 and report.get("missing_sweep_ids", []) == []
+                and report.get("closed") is True
+                and report.get("global_coverage_validated") is True
+                and set(report.get("submitted_sweep_ids", []))
+                == set(report.get("validated_sweep_ids", []))
+                and set(report.get("submitted_sweep_ids", [])).issubset(
+                    expected_sweeps
+                )
             )
         return current
 
@@ -410,12 +495,140 @@ def run(args: argparse.Namespace) -> int:
             )
     run_ledger, run_ledger_errors = ac.load_jsonl(root / "agent_run_ledger.jsonl")
     errors.extend(run_ledger_errors)
+    contract_value = ac.load_json(root / "agent_loop_contract.json")
+    event_contract = contract_value.get("tool_protocol", {}).get(
+        "agent_event_contract", {}
+    ) if isinstance(contract_value, dict) else {}
+    required_phase_roles = event_contract.get("required_phase_roles", []) \
+        if isinstance(event_contract, dict) else []
+    trace_contract_errors: list[str] = []
+    required_pairs = {
+        (str(item.get("phase") or ""), str(item.get("role") or ""))
+        for item in required_phase_roles if isinstance(item, dict)
+    }
+    if probes:
+        required_pairs.add(("dynamic_probe", "code-investigator"))
+    valid_checkpoints_by_pair: dict[
+        tuple[str, str], list[dict[str, Any]]
+    ] = {}
+    fresh_provider_uses: dict[str, set[tuple[str, str, str]]] = {}
+    for phase, role in sorted(required_pairs):
+        candidates = [
+            event for event in run_ledger
+            if event.get("phase") == phase and event.get("role") == role
+            and event.get("status") == "complete"
+            and isinstance(event.get("event"), str)
+            and str(event.get("event")).endswith(".checkpoint")
+        ]
+        valid_candidates = [
+            event for event in candidates
+            if not se.checkpoint_event_errors(
+                event, session_id=session_id, role=role, phase=phase,
+            )
+        ]
+        valid_checkpoints_by_pair[(phase, role)] = valid_candidates
+        if not valid_candidates:
+            trace_contract_errors.append(
+                f"missing valid complete trace checkpoint for {phase}/{role}"
+            )
+        elif not any(event.get("output_count", 0) > 0 for event in valid_candidates):
+            trace_contract_errors.append(
+                f"complete trace checkpoint for {phase}/{role} records no output"
+            )
+        if role != "orchestrator":
+            for event in valid_candidates:
+                provider_session_id = str(event.get("provider_session_id") or "")
+                if provider_session_id:
+                    fresh_provider_uses.setdefault(provider_session_id, set()).add(
+                        (phase, role, str(event.get("task_id") or ""))
+                    )
+        for event in candidates:
+            trace_contract_errors.extend(se.checkpoint_event_errors(
+                event, session_id=session_id, role=role, phase=phase,
+            ))
+    checkpoint_risk_plan_path = root / "risk_sweep_plan.json"
+    checkpoint_risk_plan = (
+        ac.load_json(checkpoint_risk_plan_path)
+        if checkpoint_risk_plan_path.is_file() else {}
+    )
+    checkpoint_risk_slices = checkpoint_risk_plan.get("slices", []) \
+        if isinstance(checkpoint_risk_plan, dict) else []
+    candidate_checkpoint_requirements = {
+        ("code_risk_backtracking", "risk-explorer"): {
+            str(item.get("sweep_id") or "")
+            for item in checkpoint_risk_slices
+            if isinstance(item, dict) and item.get("sweep_id")
+        },
+        ("investigation", "code-investigator"): {
+            str(finding.get("task_id") or "")
+            for finding in findings.values() if finding.get("task_id")
+        },
+        ("critic_review", "evidence-critic"): set(findings),
+    }
+    if probes:
+        candidate_checkpoint_requirements[("dynamic_probe", "code-investigator")] = {
+            str(probe.get("finding_id") or "")
+            for probe in probes.values() if probe.get("finding_id")
+        }
+    for pair, expected_candidate_ids in candidate_checkpoint_requirements.items():
+        checkpoints = valid_checkpoints_by_pair.get(pair, [])
+        observed_candidate_ids = {
+            str(event.get("task_id") or "") for event in checkpoints
+            if event.get("task_id")
+        }
+        missing_candidate_ids = expected_candidate_ids - observed_candidate_ids
+        if missing_candidate_ids:
+            trace_contract_errors.append(
+                f"missing candidate-level trace checkpoints for {pair[0]}/{pair[1]}: "
+                f"{sorted(missing_candidate_ids)}"
+            )
+    for provider_session_id, uses in sorted(fresh_provider_uses.items()):
+        if len(uses) > 1:
+            trace_contract_errors.append(
+                "fresh semantic tasks reuse provider session "
+                f"{provider_session_id}: {sorted(uses)}"
+            )
+
+    retry_state: dict[
+        tuple[str, str, str, tuple[str, ...]], tuple[str, int]
+    ] = {}
+    for event in run_ledger:
+        if not (
+            event.get("session_id") == session_id
+            and isinstance(event.get("event"), str)
+            and str(event.get("event")).endswith(".checkpoint")
+        ):
+            continue
+        artifacts = tuple(sorted(
+            str(value) for value in event.get("artifacts", [])
+            if isinstance(value, str) and value
+        )) if isinstance(event.get("artifacts"), list) else ()
+        base = (
+            str(event.get("phase") or ""), str(event.get("role") or ""),
+            str(event.get("scope") or ""), artifacts,
+        )
+        signature = json.dumps({
+            "input_sha256": event.get("input_sha256"),
+            "validation_error_categories": event.get(
+                "validation_error_categories", {}
+            ),
+        }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        previous_signature, previous_count = retry_state.get(base, ("", 0))
+        count = previous_count + 1 if signature == previous_signature else 1
+        retry_state[base] = (signature, count)
+        if count == 3:
+            trace_contract_errors.append(
+                "same phase/artifact/input/error checkpoint was repeated a third time "
+                f"without progress: {base[0]}/{base[1]}"
+            )
+    errors.extend(trace_contract_errors)
     def valid_merge_event(
         artifact_type: str, expected_ids: set[str], ledger_path: Path, report_paths: set[Path],
     ) -> bool:
         if not ledger_path.is_file():
             return False
         ledger_sha256 = ac.sha256_file(ledger_path)
+        task_plan_sha256 = hm.task_plan_ledger_sha256(tasks)
         for event in run_ledger:
             if not (
                 event.get("event") == "handoff_merge"
@@ -423,8 +636,12 @@ def run(args: argparse.Namespace) -> int:
                 and event.get("session_id") == session_id
                 and event.get("artifact_type") == artifact_type
                 and set(event.get("validated_ids", [])) == expected_ids
-                and event.get("ledger_sha256") == ledger_sha256
             ):
+                continue
+            if artifact_type == "task":
+                if event.get("task_plan_ledger_sha256") != task_plan_sha256:
+                    continue
+            elif event.get("ledger_sha256") != ledger_sha256:
                 continue
             report_path = ac.contained_path(trace_root, str(event.get("report") or ""))
             if report_path not in report_paths or not report_path or not report_path.is_file():
@@ -539,6 +756,65 @@ def run(args: argparse.Namespace) -> int:
         manifest.get("design", {}).get("source_files", manifest.get("design", {}).get("documents", [])),
     ))
     errors.extend(target_integrity_errors)
+    supplied_source_integrity_errors: list[str] = []
+    materialization_source = manifest.get("design", {}).get("materialization_source")
+    if materialization_source is not None:
+        if not isinstance(materialization_source, dict):
+            supplied_source_integrity_errors.append(
+                "prepared design materialization source snapshot is invalid"
+            )
+        else:
+            source_root_value = str(materialization_source.get("source_root") or "")
+            source_root = (
+                Path(os.path.abspath(source_root_value)) if source_root_value else None
+            )
+            source_records = materialization_source.get("files")
+            if not isinstance(source_records, list):
+                supplied_source_integrity_errors.append(
+                    "prepared design materialization source snapshot lacks file records"
+                )
+                source_records = []
+            expected_tree_sha256 = ac.stable_id(
+                json.dumps(
+                    source_records,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                length=64,
+            )
+            if materialization_source.get("file_count") != len(source_records):
+                supplied_source_integrity_errors.append(
+                    "prepared design materialization source file count is inconsistent"
+                )
+            if materialization_source.get("tree_sha256") != expected_tree_sha256:
+                supplied_source_integrity_errors.append(
+                    "prepared design materialization source tree digest is inconsistent"
+                )
+            plan_path_value = str(materialization_source.get("plan_path") or "")
+            plan_path = (
+                Path(os.path.abspath(plan_path_value)) if plan_path_value else None
+            )
+            if plan_path is None or plan_path.is_symlink() or not plan_path.is_file():
+                supplied_source_integrity_errors.append(
+                    "design materialization plan is missing or changed to a symlink after prepare"
+                )
+            elif materialization_source.get("plan_sha256") != ac.sha256_file(plan_path):
+                supplied_source_integrity_errors.append(
+                    "design materialization plan changed after prepare"
+                )
+            if source_root is None or source_root.is_symlink() or not source_root.is_dir():
+                supplied_source_integrity_errors.append(
+                    "supplied design source root is missing or changed to a symlink after prepare"
+                )
+            else:
+                supplied_source_integrity_errors.extend(_tree_changes(
+                    source_root,
+                    source_records,
+                    "supplied design source",
+                    complete_tree=True,
+                ))
+    errors.extend(supplied_source_integrity_errors)
     review_workspace = manifest.get("review_workspace", {})
     review_integrity_errors: list[str] = []
     review_code_value = str(manifest_paths.get("review_code_root") or "")
@@ -633,41 +909,48 @@ def run(args: argparse.Namespace) -> int:
         errors.append(f"design coverage missing document groups: {missing_groups[:10]}")
     if extra_groups:
         errors.append(f"design coverage contains unknown document groups: {extra_groups[:10]}")
-    valid_dispositions = {"applicable", "inapplicable", "superseded", "supporting"}
+    member_group = {
+        str(member): str(group.get("document_key"))
+        for group in manifest.get("design", {}).get("document_groups", [])
+        if isinstance(group, dict) and group.get("document_key")
+        for member in group.get("members", [])
+        if isinstance(member, str) and member
+    }
+    mapped_claim_ids: set[str] = set()
     for key, group in coverage_groups.items():
-        disposition = group.get("disposition")
-        if disposition not in valid_dispositions:
-            errors.append(f"design coverage {key}: invalid disposition {disposition!r}")
-        if not group.get("evidence"):
-            errors.append(f"design coverage {key}: missing applicability evidence")
-        if disposition == "applicable" and not group.get("behavior_families"):
-            errors.append(f"design coverage {key}: applicable group has no behavior_families")
-        group_claims = [str(value) for value in group.get("claim_ids", []) if value]
-        if disposition == "applicable" and not group_claims:
-            errors.append(f"design coverage {key}: applicable group has no claims")
+        raw_group_claims = group.get("claim_ids")
+        if not isinstance(raw_group_claims, list):
+            errors.append(f"design coverage {key}: claim_ids must be an array")
+            continue
+        group_claims = [str(value) for value in raw_group_claims if value]
+        if len(group_claims) != len(raw_group_claims) or len(set(group_claims)) != len(group_claims):
+            errors.append(f"design coverage {key}: claim_ids must be unique non-empty strings")
         for claim_id in group_claims:
+            if claim_id in mapped_claim_ids:
+                errors.append(f"design coverage assigns claim {claim_id} to multiple groups")
+            mapped_claim_ids.add(claim_id)
             if claim_id not in claims:
                 errors.append(f"design coverage {key}: unknown claim_id {claim_id}")
             else:
                 claim_path = str(claims[claim_id].get("path") or "")
-                claim_key = str(Path(claim_path).with_suffix("")).lower() if claim_path else ""
+                claim_key = str(
+                    claims[claim_id].get("document_key") or member_group.get(claim_path) or ""
+                )
                 if claim_key != key:
                     errors.append(f"design coverage {key}: claim {claim_id} cites different document group {claim_key}")
-        represented_families = {
-            str(claims[claim_id].get("behavior_family"))
-            for claim_id in group_claims
-            if claim_id in claims and claims[claim_id].get("behavior_family")
-        }
-        missing_families = sorted(set(group.get("behavior_families", [])) - represented_families)
-        if disposition == "applicable" and missing_families:
-            errors.append(f"design coverage {key}: behavior families lack claims {missing_families}")
+    unmapped_used_claims = used_claim_ids - mapped_claim_ids
+    if unmapped_used_claims:
+        errors.append(
+            f"used claims are not mapped into design coverage groups: {sorted(unmapped_used_claims)}"
+        )
 
     for claim_id, claim in claims.items():
         if claim.get("session_id") != session_id:
             errors.append(f"design claim {claim_id}: session does not match current session")
         for field in (
-            "path", "section", "line_start", "line_end", "quote", "behavior", "behavior_family",
-            "normative_strength", "applicability", "priority",
+            "path", "section", "line_start", "line_end", "quote", "subject", "trigger",
+            "obligation", "observable_result", "normative_strength",
+            "applicability",
         ):
             if claim.get(field) in (None, "", [], {}):
                 errors.append(f"design claim {claim_id}: missing/empty {field}")
@@ -677,23 +960,34 @@ def run(args: argparse.Namespace) -> int:
             "mandatory", "recommended", "optional", "declared_capability", "informational",
         }:
             errors.append(f"design claim {claim_id}: invalid normative_strength")
-        if claim.get("priority") not in {"high", "medium", "low"}:
+        if "priority" in claim and claim.get("priority") not in {"high", "medium", "low"}:
             errors.append(f"design claim {claim_id}: invalid priority")
         oracle = claim.get("probe_oracle") if isinstance(claim.get("probe_oracle"), dict) else {}
-        if oracle.get("testability") not in {"candidate", "not_suitable", "unknown"}:
-            errors.append(f"design claim {claim_id}: invalid or missing probe_oracle.testability")
-        if "preconditions" not in oracle or not isinstance(oracle.get("preconditions"), list):
-            errors.append(f"design claim {claim_id}: probe_oracle.preconditions must be an array")
-        if oracle.get("testability") == "candidate":
-            if not oracle.get("stimulus") or not oracle.get("expected_observation"):
-                errors.append(f"design claim {claim_id}: candidate probe oracle needs stimulus and expected_observation")
-        if oracle.get("testability") == "not_suitable" and not oracle.get("non_testable_reason"):
-            errors.append(f"design claim {claim_id}: not_suitable probe oracle needs non_testable_reason")
+        if oracle:
+            if oracle.get("testability") not in {"candidate", "not_suitable", "unknown"}:
+                errors.append(f"design claim {claim_id}: invalid probe_oracle.testability")
+            if "preconditions" not in oracle or not isinstance(oracle.get("preconditions"), list):
+                errors.append(f"design claim {claim_id}: probe_oracle.preconditions must be an array")
+            if oracle.get("testability") in {"candidate", "unknown"}:
+                if not oracle.get("stimulus") or not oracle.get("expected_observation"):
+                    errors.append(f"design claim {claim_id}: runnable/unknown probe oracle needs stimulus and expected_observation")
+            if oracle.get("testability") == "not_suitable" and not oracle.get("non_testable_reason"):
+                errors.append(f"design claim {claim_id}: not_suitable probe oracle needs non_testable_reason")
 
     contract_path = root / "agent_loop_contract.json"
     contract = ac.load_json(contract_path) if contract_path.exists() else {}
     expected_lenses = set(contract.get("coverage_contract", {}).get("portfolio_lenses", []))
     expected_modes = set(contract.get("coverage_contract", {}).get("exploration_modes", []))
+    coverage_path = root / "coverage_audit.json"
+    coverage = ac.load_json(coverage_path) if coverage_path.exists() else {}
+    remaining_gap_refs: dict[str, set[str]] = {}
+    for item in coverage.get("remaining_gaps", []):
+        if not isinstance(item, dict):
+            continue
+        kind = item.get("kind")
+        ref_id = item.get("ref_id")
+        if isinstance(kind, str) and isinstance(ref_id, str) and kind and ref_id:
+            remaining_gap_refs.setdefault(kind, set()).add(ref_id)
 
     architecture_path = root / "architecture_map.json"
     architecture = ac.load_json(architecture_path) if architecture_path.exists() else {}
@@ -812,10 +1106,17 @@ def run(args: argparse.Namespace) -> int:
 
     for task_id, task in tasks.items():
         errors.extend(_require_fields(task, (
-            "session_id", "claim_id", "question", "starting_points", "supporting_evidence_needed",
-            "disconfirming_evidence_needed", "review_lenses", "exploration_mode", "architecture_boundaries", "status",
+            "session_id", "claim_id", "claim_branch", "hypothesis", "obligation_sha256",
+            "starting_points", "supporting_evidence_needed", "disconfirming_evidence_needed",
+            "review_lenses", "exploration_mode", "architecture_boundaries", "status",
             "implementation_planes",
         ), f"investigation task {task_id}"))
+        errors.extend(hm.validate_item(
+            task, artifact_type="task", identifier=task_id, session_id=session_id,
+        ))
+        errors.extend(hm._context_errors(
+            task, "task", root, f"investigation task {task_id}",
+        ))
         if task.get("session_id") != session_id:
             errors.append(f"investigation task {task_id}: session does not match current session")
         errors.extend(hm.validate_task_defer_evidence(task, f"investigation task {task_id}"))
@@ -1005,8 +1306,12 @@ def run(args: argparse.Namespace) -> int:
             if str(finding.get("claim_id") or "") not in round_claims:
                 errors.append(f"investigation round {round_id}: finding {finding_id} claim is absent from claim_ids")
     missing_modes = sorted(expected_modes - observed_modes)
-    if missing_modes:
-        errors.append(f"investigation rounds missing exploration modes: {missing_modes}")
+    unrecorded_modes = set(missing_modes) - remaining_gap_refs.get("exploration_mode", set())
+    if unrecorded_modes:
+        errors.append(
+            "investigation modes lack completed evidence or a recorded coverage gap: "
+            f"{sorted(unrecorded_modes)}"
+        )
 
     tasks_by_claim: dict[str, list[dict[str, Any]]] = {}
     findings_by_task: dict[str, list[dict[str, Any]]] = {}
@@ -1049,13 +1354,13 @@ def run(args: argparse.Namespace) -> int:
             if plane_id in required_planes
         }
         missing_planes = required_planes - covered_planes
-        if missing_planes:
+        if missing_planes and path_id not in remaining_gap_refs.get("parallel_path", set()):
             errors.append(
-                f"parallel behavior path {path_id or index} lacks linked task/finding evidence "
+                f"parallel behavior path {path_id or index} lacks linked evidence or a recorded gap "
                 f"for planes {sorted(missing_planes)}"
             )
     uninvestigated_scoped_claims: list[str] = []
-    for claim_id in sorted(scoped_claim_ids):
+    for claim_id in sorted(accepted_claim_ids):
         completed = [task for task in tasks_by_claim.get(claim_id, []) if task.get("status") == "complete"]
         if not completed or not any(findings_by_task.get(str(task.get("task_id") or "")) for task in completed):
             uninvestigated_scoped_claims.append(claim_id)
@@ -1075,7 +1380,7 @@ def run(args: argparse.Namespace) -> int:
         errors.append(f"semantic coverage contains unknown portfolio lenses: {extra_lenses}")
     for lens, entry in lens_entries.items():
         disposition = entry.get("disposition")
-        if disposition not in {"investigated", "inapplicable"}:
+        if disposition not in {"investigated", "inapplicable", "gap_recorded"}:
             errors.append(f"semantic coverage {lens}: invalid disposition {disposition!r}")
             continue
         if not entry.get("evidence"):
@@ -1090,8 +1395,17 @@ def run(args: argparse.Namespace) -> int:
         lens_findings = [str(value) for value in entry.get("finding_ids", []) if value]
         if disposition == "investigated" and (not lens_tasks or not lens_findings):
             errors.append(f"semantic coverage {lens}: investigated lens needs task_ids and finding_ids")
-        if disposition == "inapplicable" and not entry.get("counterfactual"):
-            errors.append(f"semantic coverage {lens}: inapplicable lens needs counterfactual")
+        if disposition in {"inapplicable", "gap_recorded"} and not entry.get("counterfactual"):
+            errors.append(f"semantic coverage {lens}: {disposition} lens needs counterfactual")
+        if disposition == "gap_recorded":
+            if lens_tasks or lens_findings:
+                errors.append(
+                    f"semantic coverage {lens}: gap_recorded must not claim task/finding evidence"
+                )
+            if lens not in remaining_gap_refs.get("lens", set()):
+                errors.append(
+                    f"semantic coverage {lens}: gap_recorded lacks coverage_audit remaining gap"
+                )
         for task_id in lens_tasks:
             if task_id not in tasks:
                 errors.append(f"semantic coverage {lens}: unknown task_id {task_id}")
@@ -1136,7 +1450,13 @@ def run(args: argparse.Namespace) -> int:
                     f"{sorted(uncovered_boundaries)}"
                 )
             task_groups = {
-                str(Path(str(claims[str(task.get('claim_id'))].get("path") or "")).with_suffix("")).lower()
+                str(
+                    claims[str(task.get("claim_id"))].get("document_key")
+                    or member_group.get(
+                        str(claims[str(task.get("claim_id"))].get("path") or ""),
+                    )
+                    or ""
+                )
                 for task in referenced_tasks.values()
                 if str(task.get("claim_id") or "") in claims
             }
@@ -1160,19 +1480,21 @@ def run(args: argparse.Namespace) -> int:
             f"{overloaded_lens_findings}"
         )
 
-    coverage_path = root / "coverage_audit.json"
-    coverage = ac.load_json(coverage_path) if coverage_path.exists() else {}
     coverage_required = [
         "session_id", "design_documents_reviewed", "claims_total", "claims_investigated",
         "rounds_completed", "exploration_modes_completed", "document_groups_total", "document_groups_accounted",
         "code_areas_reviewed", "architecture_boundaries", "remaining_scoped_claims",
-        "deferred_claims", "stop_reason",
+        "deferred_claims", "supplement_rounds", "remaining_gaps", "stop_reason",
     ]
     for field in coverage_required:
         if field not in coverage:
             errors.append(f"coverage_audit.json missing {field}")
     if coverage.get("session_id") not in (None, session_id):
         errors.append("coverage audit session does not match current session")
+    if coverage.get("supplement_rounds") not in {0, 1}:
+        errors.append("coverage audit supplement_rounds must be 0 or 1")
+    if not isinstance(coverage.get("remaining_gaps"), list):
+        errors.append("coverage audit remaining_gaps must be an array")
     if set(coverage.get("exploration_modes_completed", [])) != observed_modes:
         errors.append("coverage audit exploration_modes_completed does not match round evidence")
     deferred_ids: set[str] = set()
@@ -1260,7 +1582,8 @@ def run(args: argparse.Namespace) -> int:
         item = boundary_coverage.get(boundary_id)
         if not item:
             errors.append(f"high-risk architecture boundary is not covered: {boundary_id}")
-        elif item.get("status") != "investigated" or not item.get("evidence"):
+            continue
+        if item.get("status") not in {"investigated", "gap_recorded"} or not item.get("evidence"):
             errors.append(f"architecture boundary {boundary_id} lacks status/evidence")
         linked_tasks = [
             task_id for task_id, task in tasks.items()
@@ -1268,9 +1591,16 @@ def run(args: argparse.Namespace) -> int:
             and boundary_id in task.get("architecture_boundaries", [])
             and findings_by_task.get(task_id)
         ]
-        if not linked_tasks:
+        if item.get("status") == "investigated" and not linked_tasks:
             errors.append(
                 f"high-risk architecture boundary lacks completed task/finding evidence: {boundary_id}"
+            )
+        if (
+            item.get("status") == "gap_recorded"
+            and boundary_id not in remaining_gap_refs.get("architecture_boundary", set())
+        ):
+            errors.append(
+                f"high-risk architecture boundary gap is not recorded: {boundary_id}"
             )
 
     started_at = str(state.get("started_at") or "")
@@ -1281,23 +1611,17 @@ def run(args: argparse.Namespace) -> int:
         errors.append("session started_at missing")
     if elapsed_seconds > MAX_SECONDS:
         errors.append(f"review elapsed time {elapsed_seconds}s exceeds {MAX_SECONDS}s")
-    if confirmed_count < FINAL_CONFIRMED_QUOTA:
-        errors.append(
-            f"only {confirmed_count} unique validated confirmed findings; final quota is "
-            f"{FINAL_CONFIRMED_QUOTA}"
-        )
-
     checks.update({
         "result_artifacts_exist": all((result_root / name).is_file() for name in ("issues.json", "issues.jsonl", "00-summary.md")),
         "preflight_passed": not preflight_problems,
         "design_claim_review_passed": (
-            claim_review.get("decision") == "accept"
-            and claim_review_validation.get("passed") is True
+            claim_review_validation.get("passed") is True
+            and not unreviewed_used_claims
         ),
         "stage_validations_current": all(
-            stage_validation_current(stage) for stage in ("architecture", "task", "coverage")
+            stage_validation_current(stage)
+            for stage in ("architecture", "task-plan", "task-lifecycle", "coverage")
         ),
-        "confirmed_quota_met": confirmed_count >= FINAL_CONFIRMED_QUOTA,
         "only_confirmed_published": all(issue.get("status") == "confirmed" for issue in issues),
         "handoff_chain_complete": not any("handoff" in error for error in errors),
         "coverage_complete": (
@@ -1320,11 +1644,19 @@ def run(args: argparse.Namespace) -> int:
         ),
         "risk_partition_complete": not risk_partition_errors and risk_plan_validation_current,
         "investigation_round_recorded": bool(rounds),
-        "exploration_modes_complete": bool(expected_modes) and not missing_modes,
+        "exploration_modes_complete": (
+            bool(expected_modes)
+            and not (set(missing_modes) - remaining_gap_refs.get("exploration_mode", set()))
+        ),
         "dynamic_probe_integrity": not probe_integrity_errors,
-        "target_roots_unchanged": not target_integrity_errors,
+        "target_roots_unchanged": not (
+            target_integrity_errors or supplied_source_integrity_errors
+        ),
+        "supplied_design_source_unchanged": not supplied_source_integrity_errors,
         "review_snapshots_unchanged": not review_integrity_errors,
         "within_time_budget": elapsed_seconds <= MAX_SECONDS,
+        "run_clock_unchanged": not clock_errors,
+        "rich_trace_complete": not trace_contract_errors,
         "evidence_validation_passed": evidence_validation_current,
     })
     for name, passed in checks.items():
@@ -1338,7 +1670,6 @@ def run(args: argparse.Namespace) -> int:
         "checks": checks,
         "metrics": {
             "confirmed": confirmed_count,
-            "final_confirmed_quota": FINAL_CONFIRMED_QUOTA,
             "elapsed_seconds": elapsed_seconds,
             "maximum_seconds": MAX_SECONDS,
             "design_document_groups": len(expected_groups),

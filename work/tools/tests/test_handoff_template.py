@@ -8,6 +8,7 @@ from pathlib import Path
 from test_agent_pipeline import SCRIPTS, populate_handoffs, run_runner, workspace  # noqa: F401
 
 import agent_common as ac
+import handoff_template
 
 
 def _rewrite_jsonl(path: Path, values: list[dict]) -> None:
@@ -26,7 +27,6 @@ def _prepare_pending_frontier(workspace) -> tuple[Path, list[dict]]:
     ac.save_json(state / "claim_review_scope.json", {
         "session_id": workspace["session_id"],
         "round_id": "ROUND-001",
-        "design_claims_sha256": ac.sha256_file(state / "design_claims.jsonl"),
         "claim_ids": [claim["claim_id"] for claim in claims],
     })
     review_path = state / "design_claim_review.json"
@@ -34,7 +34,8 @@ def _prepare_pending_frontier(workspace) -> tuple[Path, list[dict]]:
     review["input_digests"] = {
         name: ac.sha256_file(state / name)
         for name in (
-            "design_claims.jsonl", "design_coverage.json", "design_agent_manifest.json",
+            "design_claims.jsonl", "design_coverage.json", "design_inventory.json",
+            "design_agent_manifest.json",
             "claim_review_scope.json",
         )
     }
@@ -79,24 +80,24 @@ def _generate(state: Path, task_id: str, *, force: bool = False):
     return subprocess.run(command, text=True, capture_output=True)
 
 
-def test_template_requires_current_passed_task_validation(workspace):
+def test_template_requires_current_plan_and_lifecycle_validation(workspace):
     state, tasks = _prepare_pending_frontier(workspace)
-    trace_path = workspace["logs"] / "trace" / "task_validation.json"
+    trace_path = workspace["logs"] / "trace" / "task_plan_validation.json"
     trace_path.unlink()
 
     missing = _generate(state, "TASK-001")
     assert missing.returncode == 3
-    assert "current passed task validation is required" in missing.stdout
+    assert "current task plan and lifecycle validation is required" in missing.stdout
 
     run_runner(
         "task-check", workspace["code"], workspace["design"],
         workspace["result"], workspace["logs"],
     )
-    tasks[0]["question"] = "A changed question invalidates the frozen frontier."
+    tasks[0]["hypothesis"] = "A changed hypothesis invalidates the frozen candidate plan."
     _rewrite_jsonl(state / "investigation_tasks.jsonl", tasks)
     stale = _generate(state, "TASK-001")
     assert stale.returncode == 3
-    assert "stale for current frontier inputs" in stale.stdout
+    assert "task plan validation is stale for current stable plan inputs" in stale.stdout
 
 
 def test_template_allows_only_first_two_pending_tasks_in_earliest_open_round(workspace):
@@ -109,6 +110,32 @@ def test_template_allows_only_first_two_pending_tasks_in_earliest_open_round(wor
     assert second.returncode == 0, second.stdout + second.stderr
     first = _generate(state, "TASK-001")
     assert first.returncode == 0, first.stdout + first.stderr
+
+
+def test_template_rejects_stale_candidate_lifecycle(workspace):
+    state, tasks = _prepare_pending_frontier(workspace)
+    tasks[0]["status"] = "in_progress"
+    _rewrite_jsonl(state / "investigation_tasks.jsonl", tasks)
+
+    stale = _generate(state, "TASK-001")
+    assert stale.returncode == 3
+    assert "task lifecycle validation is stale for current lifecycle inputs" in stale.stdout
+
+
+def test_finding_template_preserves_atomic_task_identity(workspace):
+    state, tasks = _prepare_pending_frontier(workspace)
+    claims = {
+        item["claim_id"]: item
+        for item in ac.load_jsonl(state / "design_claims.jsonl")[0]
+    }
+    task = tasks[0]
+    claim = claims[task["claim_id"]]
+    template = handoff_template.finding_template(task, claim)
+    assert template["claim_branch"] == task["claim_branch"]
+    assert template["obligation_sha256"] == task["obligation_sha256"]
+    assert template["hypothesis"] == task["hypothesis"]
+    assert claim["obligation"] in template["expected_behavior"]
+    assert claim["observable_result"] in template["expected_behavior"]
 
 
 def test_template_rejects_precreated_later_round_as_stale_frontier(workspace):
@@ -132,4 +159,21 @@ def test_template_rejects_precreated_later_round_as_stale_frontier(workspace):
 
     later = _generate(state, "TASK-004")
     assert later.returncode == 3
-    assert "stale for current frontier inputs" in later.stdout
+    assert "task plan validation is stale for current stable plan inputs" in later.stdout
+
+
+def test_template_allows_valid_candidate_when_another_plan_candidate_is_invalid(workspace):
+    state, tasks = _prepare_pending_frontier(workspace)
+    tasks[3]["obligation_sha256"] = "0" * 64
+    _rewrite_jsonl(state / "investigation_tasks.jsonl", tasks)
+    plan = run_runner(
+        "task-plan-check", workspace["code"], workspace["design"],
+        workspace["result"], workspace["logs"], check=False,
+    )
+    assert plan.returncode == 1
+    trace = ac.load_json(workspace["logs"] / "trace" / "task_plan_validation.json")
+    assert trace["global_passed"] is True
+    assert "TASK-001" in trace["valid_task_ids"]
+    assert trace["invalid_task_ids"] == ["TASK-004"]
+    generated = _generate(state, "TASK-001")
+    assert generated.returncode == 0, generated.stdout + generated.stderr

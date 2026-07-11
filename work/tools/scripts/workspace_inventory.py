@@ -13,7 +13,6 @@ import os
 import shutil
 import sys
 from collections import Counter
-from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -24,7 +23,9 @@ ARTIFACT_NAMES = {
     "architecture_map": "architecture_map.json",
     "risk_sweep_plan": "risk_sweep_plan.json",
     "design_agent_manifest": "design_agent_manifest.json",
+    "design_inventory": "design_inventory.json",
     "design_coverage": "design_coverage.json",
+    "design_lookup_requests": "design_lookup_requests.jsonl",
     "claim_review_scope": "claim_review_scope.json",
     "design_claim_review": "design_claim_review.json",
     "semantic_coverage": "semantic_coverage.json",
@@ -35,13 +36,16 @@ ARTIFACT_NAMES = {
     "investigation_findings": "investigation_findings.jsonl",
     "dynamic_probes": "dynamic_probes.jsonl",
     "critic_reviews": "critic_reviews.jsonl",
+    "critic_review_history": "critic_review_history.jsonl",
     "verdicts": "agent_review_verdicts.jsonl",
     "coverage_audit": "coverage_audit.json",
+    "coverage_supplement_history": "coverage_supplement_history.json",
     "validated_issues": "validated_issues.json",
     "ledger": "agent_run_ledger.jsonl",
     "state": "agent_loop_state.json",
     "approval_events": "approval_events.jsonl",
     "investigator_batch_gate": "investigator_batch_gate.json",
+    "run_clock": "run_clock.json",
 }
 
 PORTFOLIO_LENSES = [
@@ -305,11 +309,73 @@ def record_integrity_errors(expected_records: list[dict], current_records: list[
     return errors
 
 
-def loop_contract(paths: dict[str, str], session_id: str) -> dict[str, Any]:
+def materialization_source_snapshot(
+    source_manifest: dict[str, Any] | None,
+) -> tuple[dict[str, Any] | None, list[str]]:
+    """Freeze the supplied catalog/source tree used to build a design bundle."""
+    if source_manifest is None:
+        return None, []
+    errors: list[str] = []
+    source_root_value = str(source_manifest.get("source_root") or "")
+    plan_path_value = str(source_manifest.get("plan_path") or "")
+    plan_sha256_value = str(source_manifest.get("plan_sha256") or "")
+    if not source_root_value:
+        errors.append("design source manifest is missing source_root")
+    if not plan_path_value:
+        errors.append("design source manifest is missing plan_path")
+    if not plan_sha256_value:
+        errors.append("design source manifest is missing plan_sha256")
+    if errors:
+        return None, errors
+
+    source_root = Path(source_root_value).resolve()
+    plan_path = Path(plan_path_value).resolve()
+    if not source_root.is_dir():
+        errors.append(f"design materialization source root is missing: {source_root}")
+    if not plan_path.is_file():
+        errors.append(f"design source plan is missing: {plan_path}")
+    elif plan_sha256_value != ac.sha256_file(plan_path):
+        errors.append("design source manifest plan_sha256 does not match plan_path")
+    if errors:
+        return None, errors
+    try:
+        plan = ac.load_json(plan_path)
+    except (OSError, json.JSONDecodeError) as exc:
+        return None, [f"design source plan is invalid: {exc}"]
+    if not isinstance(plan, dict):
+        return None, ["design source plan must be an object"]
+    catalog_path = str(plan.get("catalog_path") or "")
+    catalog = ac.contained_path(source_root, catalog_path)
+    if not catalog_path or catalog is None or not catalog.is_file():
+        return None, ["design source plan catalog_path is missing or outside source_root"]
+
+    files = [
+        file_record(source_root, path, include_hash=True)
+        for path in ac.iter_integrity_files(source_root)
+    ]
+    tree_sha256 = ac.stable_id(
+        json.dumps(files, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+        length=64,
+    )
+    return {
+        "source_root": str(source_root),
+        "catalog_path": catalog_path,
+        "plan_path": str(plan_path),
+        "plan_sha256": plan_sha256_value,
+        "file_count": len(files),
+        "tree_sha256": tree_sha256,
+        "files": files,
+    }, []
+
+
+def loop_contract(
+    paths: dict[str, str], session_id: str,
+    materialization_source: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     state_root = Path(paths["state_root"])
     artifacts = {name: str(state_root / filename) for name, filename in ARTIFACT_NAMES.items()}
     return {
-        "contract_version": 12,
+        "contract_version": 13,
         "execution_model": "opencode-owned-model-driven-loop",
         "session": {
             "session_id": session_id,
@@ -334,27 +400,42 @@ def loop_contract(paths: dict[str, str], session_id: str) -> dict[str, Any]:
                 "done_when": "Core implementation, adapters, fast/slow paths, configuration/capability surfaces, and integration boundaries are mapped from repository evidence.",
             },
             {
-                "id": "code_risk_backtracking",
-                "owner": "orchestrator_then_two_risk_explorers",
-                "output": [artifacts["risk_sweep_plan"], artifacts["risk_observations"]],
+                "id": "design_inventory",
+                "owner": "spec-analyst",
+                "output": artifacts["design_inventory"],
                 "done_when": (
-                    "A digest-bound plan assigns every required coupled architecture component to exactly one focused "
-                    "code-only sweep; ordered batches run at most two non-overlapping sweeps concurrently."
+                    "Every manifest document group has an evidence-backed scope relation and a light section/behavior map; "
+                    "no full claim portfolio or implementation verdict is produced."
                 ),
             },
             {
-                "id": "design_analysis",
-                "owner": "spec_analyst",
-                "output": [artifacts["design_coverage"], artifacts["design_claims"]],
-                "done_when": "Every manifest document group has an evidence-backed disposition and a bounded difference-oriented claim portfolio with exact source locations.",
+                "id": "code_risk_backtracking",
+                "owner": "risk-explorer",
+                "output": [artifacts["risk_sweep_plan"], artifacts["risk_observations"]],
+                "done_when": (
+                    "A digest-bound plan assigns every required coupled architecture component to exactly one focused "
+                    "code-only sweep; the scheduler runs at most two mutually exclusive tasks at once while design inventory may occupy one slot."
+                ),
             },
             {
-                "id": "scoped_design_claim_review",
-                "owner": "orchestrator_then_spec_critic",
+                "id": "design_claim_resolution",
+                "owner": "spec-analyst",
+                "output": [
+                    artifacts["design_lookup_requests"], artifacts["design_coverage"],
+                    artifacts["design_claims"],
+                ],
+                "done_when": (
+                    "Only evidence-pair frontier obligations are materialized as atomic claims from source_ref spans; "
+                    "exact quotes and source hashes are derived deterministically."
+                ),
+            },
+            {
+                "id": "design_claim_review",
+                "owner": "spec-critic",
                 "output": [artifacts["claim_review_scope"], artifacts["design_claim_review"]],
                 "done_when": (
-                    "A fresh design-only critic accepted the cumulative investigation scope for quote entailment, "
-                    "normative strength, atomicity, and applicability against current artifact digests."
+                    "A fresh design-only critic accepted each executable claim for quote entailment, normative strength, "
+                    "atomicity, and applicability using per-claim/source digests; unrelated group gaps remain expansion signals."
                 ),
             },
             {
@@ -364,59 +445,67 @@ def loop_contract(paths: dict[str, str], session_id: str) -> dict[str, Any]:
                 "done_when": "Claims are converted into evidence questions without assuming project vocabulary.",
             },
             {
-                "id": "code_investigation",
-                "owner": "code_investigator",
+                "id": "investigation",
+                "owner": "code-investigator",
                 "output": artifacts["investigation_findings"],
                 "done_when": "Each investigated claim has code evidence, reverse checks, and a real tool trace.",
             },
             {
-                "id": "coverage_audit",
-                "owner": "coverage_critic_then_orchestrator",
-                "output": [artifacts["semantic_coverage"], artifacts["coverage_audit"]],
-                "done_when": "All exploration modes ran; lens, high-risk boundary, parallel-plane, and capability dispositions have referenced evidence or an explicit evidence limitation.",
-            },
-            {
                 "id": "dynamic_probe",
-                "owner": "orchestrator_then_code_investigator",
+                "owner": "code-investigator",
                 "output": artifacts["dynamic_probes"],
                 "done_when": (
-                    "Coverage is closed and selected low-cost probes use a design-derived oracle in an isolated copy."
+                    "Selected low-cost candidate probes use a design-derived oracle and an independent control/reference "
+                    "when feasible, entirely inside a session-owned isolated copy."
                 ),
             },
             {
-                "id": "adversarial_critique",
-                "owner": "evidence_critic",
+                "id": "critic_review",
+                "owner": "evidence-critic",
                 "output": artifacts["critic_reviews"],
-                "done_when": "Coverage is closed and a fresh-context critic challenged each candidate.",
+                "done_when": "Every finding, including design_satisfied, is challenged promptly by one fresh-context critic before any portfolio-wide coverage decision.",
+            },
+            {
+                "id": "coverage_audit",
+                "owner": "coverage-critic",
+                "output": [artifacts["semantic_coverage"], artifacts["coverage_audit"]],
+                "done_when": (
+                    "The initial frontier is drained and one evidence-driven supplement decision accounts for in-scope "
+                    "documents, architecture boundaries, parallel planes, modes, lenses, unmapped risks, and critic evidence requests."
+                ),
             },
             {
                 "id": "final_judgement",
-                "owner": "final_judge",
+                "owner": "final-judge",
                 "output": artifacts["verdicts"],
-                "done_when": "Closed coverage and every finding have one evidence-bound final verdict.",
+                "done_when": "The frontier and optional single supplement are drained and every finding has one evidence-bound final verdict.",
             },
         ],
         "handoffs": [
             {
-                "from": "orchestrator", "to": "risk_explorer",
+                "from": "orchestrator", "to": "risk-explorer",
                 "inputs": [artifacts["architecture_map"], artifacts["risk_sweep_plan"]],
                 "read_roots": [paths["review_code_root"]],
             },
             {
-                "from": "orchestrator", "to": "spec_analyst",
-                "inputs": [artifacts["design_agent_manifest"]],
-                "read_roots": [paths["review_design_root"]],
-            },
-            {
-                "from": "spec_analyst", "to": "spec_critic",
+                "from": "orchestrator", "to": "spec-analyst",
                 "inputs": [
-                    artifacts["design_agent_manifest"], artifacts["design_coverage"],
-                    artifacts["design_claims"], artifacts["claim_review_scope"],
+                    artifacts["design_agent_manifest"], artifacts["design_inventory"],
+                    artifacts["design_lookup_requests"],
                 ],
                 "read_roots": [paths["review_design_root"]],
             },
             {
-                "from": "orchestrator", "to": "code_investigator",
+                "from": "spec-analyst", "to": "spec-critic",
+                "inputs": [
+                    artifacts["design_agent_manifest"], artifacts["design_coverage"],
+                    artifacts["design_inventory"], artifacts["design_claims"],
+                    artifacts["claim_review_scope"],
+                ],
+                "read_roots": [paths["review_design_root"]],
+            },
+            {
+                "from": "orchestrator", "to": "code-investigator",
                 "inputs": [
                     artifacts["architecture_map"], artifacts["design_claims"],
                     artifacts["risk_observations"], artifacts["investigation_tasks"],
@@ -424,7 +513,7 @@ def loop_contract(paths: dict[str, str], session_id: str) -> dict[str, Any]:
                 "read_roots": [paths["review_code_root"], paths["review_design_root"]],
             },
             {
-                "from": "code_investigator", "to": "evidence_critic",
+                "from": "code-investigator", "to": "evidence-critic",
                 "inputs": [
                     artifacts["design_claims"], artifacts["investigation_findings"],
                     artifacts["dynamic_probes"],
@@ -432,7 +521,7 @@ def loop_contract(paths: dict[str, str], session_id: str) -> dict[str, Any]:
                 "read_roots": [paths["review_code_root"], paths["review_design_root"]],
             },
             {
-                "from": "evidence_critic", "to": "final_judge",
+                "from": "evidence-critic", "to": "final-judge",
                 "inputs": [
                     artifacts["design_claims"], artifacts["investigation_findings"],
                     artifacts["critic_reviews"], artifacts["dynamic_probes"],
@@ -440,35 +529,40 @@ def loop_contract(paths: dict[str, str], session_id: str) -> dict[str, Any]:
                 "read_roots": [paths["review_code_root"], paths["review_design_root"]],
             },
             {
-                "from": "orchestrator", "to": "coverage_critic",
+                "from": "orchestrator", "to": "coverage-critic",
                 "inputs": [
                     str(state_root / "workspace_manifest.json"),
                     str(state_root / "agent_loop_contract.json"),
-                    artifacts["architecture_map"], artifacts["design_coverage"],
+                    artifacts["architecture_map"], artifacts["design_inventory"], artifacts["design_coverage"],
                     artifacts["design_claims"], artifacts["claim_review_scope"],
                     artifacts["risk_observations"],
                     artifacts["investigation_tasks"], artifacts["investigation_findings"],
-                    artifacts["rounds"],
+                    artifacts["dynamic_probes"], artifacts["critic_reviews"],
+                    artifacts["rounds"], artifacts["coverage_supplement_history"],
                 ],
                 "read_roots": [],
             },
             {
-                "from": "final_judge", "to": "helper_validator",
+                "from": "final-judge", "to": "helper-validator",
                 "inputs": [artifacts["verdicts"]], "read_roots": [],
             },
         ],
         "handoff_integrity": {
             "max_concurrent_subagent_tasks": 2,
             "risk_discovery_batch": (
-                "After risk-plan-check, repeatedly launch the next two planned risk sweeps concurrently; "
-                "a singleton tail runs alone. Every sweep owns disjoint coupled architecture IDs and one isolated handoff."
+                "After risk-plan-check, keep at most two tasks active. Start one design-inventory task and one risk sweep; "
+                "as either completes, fill the free slot with the next disjoint risk slice or bounded design-resolution task. "
+                "Every sweep owns disjoint coupled architecture IDs and one isolated handoff."
             ),
             "parallel_write_rule": "Each risk/investigator/probe/critic task writes one isolated JSON file under state/handoffs; never append to a shared JSONL from parallel tasks.",
             "merge_helper": str(Path(paths["state_root"]).parents[1] / "work" / "tools" / "scripts" / "handoff_merge.py"),
             "merge_semantics": "Syntax, artifact-shape, session, and stable-ID validation plus atomic replacement only; no semantic filtering or ranking.",
         },
         "guardrails": {
-            "target_roots_read_only": [paths["code_root"], paths["design_root"]],
+            "target_roots_read_only": list(dict.fromkeys(filter(None, [
+                paths["code_root"], paths["design_root"],
+                str((materialization_source or {}).get("source_root") or ""),
+            ]))),
             "agent_read_roots": [paths["review_code_root"], paths["review_design_root"]],
             "source_path_rule": (
                 "Model agents read/search only the session-local review roots and cite paths relative to them. "
@@ -506,6 +600,38 @@ def loop_contract(paths: dict[str, str], session_id: str) -> dict[str, Any]:
         },
         "tool_protocol": {
             "principle": "Use tools for just-in-time retrieval; semantic decisions belong to the model, not search syntax.",
+            "agent_event_contract": {
+                "required_fields": [
+                    "event", "role", "phase", "scope", "input_artifacts",
+                    "input_sha256",
+                    "started_at", "ended_at", "wall_time_seconds",
+                    "provider_attempt", "provider_session_id", "output_count",
+                    "repair_count", "outcome", "stop_reason",
+                ],
+                "validation_errors": "Aggregate repeated validator failures as ERROR_CODE=count.",
+                "input_digest": (
+                    "session_event.py must hash at least one real regular input file, "
+                    "record each path/digest, and derive input_sha256; the model never supplies the digest."
+                ),
+                "required_phase_roles": [
+                    {"phase": "architecture_mapping", "role": "orchestrator"},
+                    {"phase": "design_inventory", "role": "spec-analyst"},
+                    {"phase": "code_risk_backtracking", "role": "risk-explorer"},
+                    {"phase": "design_claim_resolution", "role": "spec-analyst"},
+                    {"phase": "design_claim_review", "role": "spec-critic"},
+                    {"phase": "investigation_planning", "role": "orchestrator"},
+                    {"phase": "investigation", "role": "code-investigator"},
+                    {"phase": "critic_review", "role": "evidence-critic"},
+                    {"phase": "coverage_audit", "role": "coverage-critic"},
+                    {"phase": "final_judgement", "role": "final-judge"},
+                ],
+                "candidate_checkpoint_ids": {
+                    "code_risk_backtracking/risk-explorer": "sweep_id",
+                    "investigation/code-investigator": "task_id",
+                    "dynamic_probe/code-investigator": "finding_id",
+                    "critic_review/evidence-critic": "finding_id",
+                },
+            },
             "minimum_confirmed_trace": {
                 "required": ["design_read", "code_read", "reverse_check"],
                 "one_of": [["code_search", "code_navigation"]],
@@ -516,8 +642,9 @@ def loop_contract(paths: dict[str, str], session_id: str) -> dict[str, Any]:
             "design": [
                 "Account for every document_key in workspace_manifest.design.document_groups.",
                 "A supplied document is potentially applicable by default. Absence of matching symbols is not evidence of inapplicability; it may indicate a feature gap.",
-                "Applicable document groups must reference one or more design claim IDs.",
-                "Inapplicable/superseded/supporting dispositions need document or repository evidence, not project reputation.",
+                "Every document group needs a source-grounded scope_relation and section map in design_inventory; only frontier obligations need materialized claims.",
+                "A catalog link proves provenance, not a product capability commitment. required/in_scope capability claims need positive supplied-design scope evidence.",
+                "Informational/superseded/ambiguous scope relations need supplied-design evidence, not project reputation or missing code symbols.",
             ],
             "architecture": [
                 "Map the apparent core implementation and at least the repository's adapters/integration layer, configuration/capability surface, and alternate execution paths when present.",
@@ -527,24 +654,28 @@ def loop_contract(paths: dict[str, str], session_id: str) -> dict[str, Any]:
             "portfolio_lenses": PORTFOLIO_LENSES,
             "exploration_modes": EXPLORATION_MODES,
             "mode_rule": (
-                "Before successful completion, rounds must collectively use every exploration mode. Design-to-code traces obligations; "
+                "Use the exploration mode that best tests each evidence-pair hypothesis. Design-to-code traces obligations; "
                 "code-to-design starts from risky execution boundaries and maps observations back to supplied claims; capability-absence "
-                "reconciles designed capabilities with build, registration, entrypoint, configuration, and adjacent implementation evidence."
+                "reconciles designed capabilities with build, registration, entrypoint, configuration, and adjacent implementation evidence. "
+                "Modes not exercised by the drained frontier are recorded as coverage gaps, not fabricated work."
             ),
             "semantic_coverage_artifact": artifacts["semantic_coverage"],
             "lens_rule": (
-                "Every portfolio lens must be marked investigated or inapplicable with evidence. An investigated lens must reference "
+                "Every portfolio lens must be marked investigated, inapplicable, or gap_recorded with evidence. An investigated lens must reference "
                 "real task IDs and finding IDs whose artifacts explicitly name that lens. Inapplicable requires referenced design groups "
-                "and architecture boundaries plus a counterfactual explanation. Listing a lens only in a round is insufficient."
+                "and architecture boundaries plus a counterfactual explanation. gap_recorded names the missing evidence and may motivate the "
+                "single coverage supplement. Listing a lens only in a round is insufficient."
             ),
             "claim_rule": (
-                "Design claims form a searchable index; only the cumulative accepted claim-review scope is the executable session frontier. "
-                "Use a risk-diverse portfolio rather than treating every extracted sentence or every high label as mandatory work. A compliant finding is valid coverage but cannot be published. "
+                "Design inventory is the searchable breadth map; only on-demand claims with accepted per-claim reviews form the executable frontier. "
+                "Use a risk-diverse evidence-pair portfolio rather than materializing every sentence or treating every high label as mandatory work. A compliant finding is valid evidence but cannot be published. "
                 "Optional/recommended behavior and completely absent capabilities remain eligible design claims; normative strength affects "
-                "classification and severity. Each behavior family declared for an applicable design "
-                "group must be represented by at least one claim before that group is considered covered."
+                "classification and severity. Unmaterialized inventory sections remain coverage gaps, not invalid claims."
             ),
-            "boundary_rule": "A high-risk integration boundary must be investigated, not merely deferred, for a successful gate.",
+            "boundary_rule": (
+                "Code-only risk sweeps account for every high-risk integration boundary. Candidate investigation either links a completed "
+                "task/finding or records the concrete unmapped boundary as a coverage gap; a gap does not invalidate an already confirmed candidate."
+            ),
             "risk_backtracking_rule": (
                 "Fresh code-only risk explorers inspect every high-risk boundary and every plane in a parallel behavior path. "
                 "A code-to-design task must reference at least one validated risk observation sharing a boundary and plane; "
@@ -559,7 +690,8 @@ def loop_contract(paths: dict[str, str], session_id: str) -> dict[str, Any]:
                 ),
                 "oracle_independence": (
                     "The spec analyst defines preconditions, stimulus, and expected observation from design evidence before code mapping. "
-                    "The investigator may map that oracle to an interface but must not rewrite it to match current behavior."
+                    "The investigator may map that oracle to an interface but must not rewrite it to match current behavior. "
+                    "When feasible, a reference model, known-good path, or negative control must show the generated probe is non-trivial."
                 ),
                 "isolation": (
                     "Write harnesses and build outputs only below state/probes in a copied workspace. Never run a command that can write "
@@ -574,12 +706,17 @@ def loop_contract(paths: dict[str, str], session_id: str) -> dict[str, Any]:
         "iteration_policy": {
             "round_artifact": artifacts["rounds"],
             "max_tasks_per_round": 4,
+            "maximum_coverage_supplement_rounds": 1,
+            "coverage_supplement_history": (
+                "prepare and coverage-check exclusively write the history artifact. Agents read it but never create, reset, or edit it; "
+                "the first valid non-empty next-task snapshot is immutable and any different second request is rejected."
+            ),
             "on_failed_gate": (
                 "If time remains, start another frozen round only from a concrete uncovered design behavior, risk observation, "
                 "architecture boundary, execution plane, or critic evidence request; never choose work from a count target."
             ),
             "zero_finding_response": (
-                "Finding counts are not a coverage input. Run coverage after every investigation round and follow its evidence-backed gaps."
+                "Finding counts are not a coverage input. Critique completed candidates promptly, then run coverage after the initial frontier and allow at most one evidence-backed supplement."
             ),
             "minimum_strategy_change": (
                 "A retry must change an exploration mode and at least one of document group, architecture boundary, or portfolio lens."
@@ -588,16 +725,17 @@ def loop_contract(paths: dict[str, str], session_id: str) -> dict[str, Any]:
         "timing": {
             "hard_limit_seconds": 21600,
             "review_stop_target_seconds": 19800,
-            "policy": "Reserve time for validation, report generation, and one repair iteration.",
+            "first_confirmed_target_seconds": 5400,
+            "policy": "Use progressive candidate validation and reserve 30-45 minutes for final judgement, report generation, and deterministic gate repair.",
         },
         "stop_conditions": {
             "success": [
-                "Coverage audit explains remaining gaps and completes the required lens, mode, boundary, and execution-plane portfolio.",
+                "Coverage audit explains remaining gaps after the initial frontier and at most one evidence-driven supplement.",
                 "Every confirmed finding passed independent critique and source verification.",
                 "The final gate passes within the time budget.",
             ],
             "never": "Do not use a candidate or issue count to select tasks, stop coverage, or lower evidence standards.",
-            "failed_gate": "A failed gate is an iteration signal, not a completed run, while the hard time limit has not been reached.",
+            "failed_gate": "Repair only the earliest invalid candidate/artifact once; do not reopen a drained semantic portfolio merely to satisfy formatting or a count target.",
         },
     }
 
@@ -625,6 +763,8 @@ def prepare(args: argparse.Namespace) -> int:
     design_docs, document_groups, entry_problems = design_manifest(design_root, args.design_entry)
     design_source_files = [file_record(design_root, path, include_hash=True) for path in ac.iter_files(design_root)]
     source_manifest: dict[str, Any] | None = None
+    materialization_source: dict[str, Any] | None = None
+    source_problem_start = len(problems)
     if args.source_manifest:
         source_manifest_path = Path(args.source_manifest).resolve()
         if not source_manifest_path.is_file():
@@ -635,6 +775,41 @@ def prepare(args: argparse.Namespace) -> int:
                 problems.append("design source manifest did not pass")
             if source_manifest.get("output_root") != str(design_root):
                 problems.append("design source manifest output_root does not match design_root")
+            materialization_source, source_snapshot_errors = materialization_source_snapshot(
+                source_manifest
+            )
+            problems.extend(source_snapshot_errors)
+    else:
+        implicit_manifest_path = log_root / "trace" / "design_source_materialization.json"
+        implicit_manifest: dict[str, Any] = {}
+        if implicit_manifest_path.is_file() and not implicit_manifest_path.is_symlink():
+            try:
+                loaded_implicit = ac.load_json(implicit_manifest_path)
+                implicit_manifest = loaded_implicit if isinstance(loaded_implicit, dict) else {}
+            except (OSError, json.JSONDecodeError):
+                implicit_manifest = {}
+        materialized_below_state = False
+        try:
+            design_root.relative_to(state_root)
+            materialized_below_state = design_root != state_root
+        except ValueError:
+            pass
+        if materialized_below_state or (
+            implicit_manifest.get("passed") is True
+            and implicit_manifest.get("output_root") == str(design_root)
+        ):
+            problems.append(
+                "materialized design root requires --source-manifest; refusing to omit original catalog/source provenance"
+            )
+    source_problems = problems[source_problem_start:]
+    if source_problems:
+        ac.save_json(
+            log_root / "trace" / "preflight.json",
+            {"ok": False, "problems": source_problems},
+        )
+        for problem in source_problems:
+            print(f"[prepare] {problem}", file=sys.stderr)
+        return 2
     problems.extend(entry_problems)
     if not design_docs:
         problems.append("no supported design documents found")
@@ -643,6 +818,26 @@ def prepare(args: argparse.Namespace) -> int:
         problems.append("target code repository contains no files")
 
     prepared_at = ac.now_iso()
+    run_clock_path = state_root / ARTIFACT_NAMES["run_clock"]
+    run_clock: dict[str, Any] = {}
+    if run_clock_path.is_symlink() or not run_clock_path.is_file():
+        problems.append("run_clock.json is missing or not a regular file")
+    else:
+        try:
+            loaded_clock = ac.load_json(run_clock_path)
+            run_clock = loaded_clock if isinstance(loaded_clock, dict) else {}
+            run_started_at = str(run_clock.get("started_at") or "")
+            run_deadline_at = str(run_clock.get("deadline_at") or "")
+            if (
+                not run_started_at or not run_deadline_at
+                or int((ac.parse_iso(run_deadline_at) - ac.parse_iso(run_started_at)).total_seconds())
+                != 21600
+            ):
+                problems.append("run_clock.json does not contain a valid six-hour interval")
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            problems.append(f"run_clock.json is invalid: {exc}")
+    run_started_at = str(run_clock.get("started_at") or prepared_at)
+    run_deadline_at = str(run_clock.get("deadline_at") or "")
     review_root = state_root / "review-inputs"
     review_code_root = review_root / "code"
     review_design_root = review_root / "design"
@@ -681,6 +876,11 @@ def prepare(args: argparse.Namespace) -> int:
             ac.save_json(log_root / "trace" / "preflight.json", {"ok": False, "problems": [problem]})
             print(f"[prepare] {problem}", file=sys.stderr)
             return 2
+        if (
+            existing_state.get("started_at") != run_started_at
+            or existing_state.get("deadline_at") != run_deadline_at
+        ):
+            problems.append("prepared session timing does not match immutable run_clock.json")
 
     review_code: dict[str, Any] = {"file_count": 0, "files": []}
     review_design_source_files: list[dict] = []
@@ -696,6 +896,56 @@ def prepare(args: argparse.Namespace) -> int:
             design_source_files,
             "original design root",
         ))
+        previous_materialization_source = existing_manifest.get("design", {}).get(
+            "materialization_source"
+        )
+        if isinstance(previous_materialization_source, dict):
+            previous_source_root_value = str(
+                previous_materialization_source.get("source_root") or ""
+            )
+            previous_source_root = (
+                Path(os.path.abspath(previous_source_root_value))
+                if previous_source_root_value else None
+            )
+            if previous_source_root is None or previous_source_root.is_symlink() \
+                    or not previous_source_root.is_dir():
+                problems.append("original design materialization source root is missing or a symlink")
+            else:
+                current_source_files = [
+                    file_record(previous_source_root, path, include_hash=True)
+                    for path in ac.iter_integrity_files(previous_source_root)
+                ]
+                problems.extend(record_integrity_errors(
+                    previous_materialization_source.get("files", []),
+                    current_source_files,
+                    "original design materialization source",
+                ))
+            previous_plan_value = str(
+                previous_materialization_source.get("plan_path") or ""
+            )
+            previous_plan = (
+                Path(os.path.abspath(previous_plan_value))
+                if previous_plan_value else None
+            )
+            if previous_plan is None or previous_plan.is_symlink() \
+                    or not previous_plan.is_file():
+                problems.append("design materialization plan is missing or a symlink")
+            elif previous_materialization_source.get("plan_sha256") \
+                    != ac.sha256_file(previous_plan):
+                problems.append("design materialization plan changed since session prepare")
+            if materialization_source is not None and (
+                materialization_source.get("source_root")
+                != previous_materialization_source.get("source_root")
+                or materialization_source.get("catalog_path")
+                != previous_materialization_source.get("catalog_path")
+                or materialization_source.get("plan_path")
+                != previous_materialization_source.get("plan_path")
+                or materialization_source.get("plan_sha256")
+                != previous_materialization_source.get("plan_sha256")
+            ):
+                problems.append("design materialization source changed since session prepare")
+        elif materialization_source is not None:
+            problems.append("design materialization source was not part of the prepared session")
         review_path_errors = [
             *_review_destination_errors(review_code_root, state_root),
             *_review_destination_errors(review_design_root, state_root),
@@ -764,6 +1014,7 @@ def prepare(args: argparse.Namespace) -> int:
             "document_groups": document_groups,
             "source_files": design_source_files,
             "source_manifest": source_manifest,
+            "materialization_source": materialization_source,
         },
         "code": code,
         "review_workspace": {
@@ -775,10 +1026,17 @@ def prepare(args: argparse.Namespace) -> int:
         "preflight_problems": problems,
         "semantic_analysis_performed": False,
     }
-    contract = loop_contract(paths, session_id)
+    effective_materialization_source = manifest.get("design", {}).get(
+        "materialization_source"
+    ) if isinstance(manifest, dict) else materialization_source
+    contract = loop_contract(
+        paths, session_id,
+        effective_materialization_source
+        if isinstance(effective_materialization_source, dict) else None,
+    )
     state = existing_state if resumed else {
         "session_id": session_id,
-        "started_at": prepared_at,
+        "started_at": run_started_at,
         "status": "ready",
         "current_phase": "architecture_mapping",
         "completed_phases": [],
@@ -786,14 +1044,13 @@ def prepare(args: argparse.Namespace) -> int:
         "next_actions": [
             "Read INSTRUCTION.md, the skill, workspace_manifest.json, and agent_loop_contract.json.",
             "Map repository architecture and integration boundaries.",
-            "After architecture-check, validate a focused multi-slice risk plan, run ordered batches of up to two code-only sweeps, and start design indexing only after the all-sweep atomic merge.",
+            "After architecture-check, validate a focused multi-slice risk plan and schedule one design-inventory task alongside disjoint code-risk sweeps under the global concurrency limit of two.",
         ],
         "stop_reason": "",
     }
-    started_at = str(state.get("started_at") or prepared_at)
+    started_at = str(state.get("started_at") or run_started_at)
     if not state.get("deadline_at"):
-        deadline = ac.parse_iso(started_at) + timedelta(seconds=21600)
-        state["deadline_at"] = deadline.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        state["deadline_at"] = run_deadline_at
     state["updated_at"] = prepared_at
     state["artifacts"] = contract["session"]["artifacts"]
     state.setdefault("metrics", {}).update({
@@ -820,8 +1077,27 @@ def prepare(args: argparse.Namespace) -> int:
     ac.save_json(state_root / ARTIFACT_NAMES["design_agent_manifest"], design_only_manifest)
     ac.save_json(state_root / "agent_loop_contract.json", contract)
     ac.save_json(state_root / ARTIFACT_NAMES["state"], state)
+    supplement_history_path = state_root / ARTIFACT_NAMES["coverage_supplement_history"]
+    if resumed and not supplement_history_path.is_file():
+        problems.append(
+            "resumed session is missing coverage_supplement_history.json; "
+            "refusing to reset the one-supplement ledger"
+        )
+    elif not resumed:
+        ac.save_json(supplement_history_path, {
+            "session_id": session_id,
+            "requests": [],
+        })
+    critic_history_path = state_root / ARTIFACT_NAMES["critic_review_history"]
+    if resumed and not critic_history_path.is_file():
+        problems.append(
+            "resumed session is missing critic_review_history.jsonl; "
+            "refusing to reset critic evidence history"
+        )
+    elif not resumed:
+        critic_history_path.touch()
     for key in (
-        "design_claims", "risk_observations", "rounds", "investigation_tasks", "investigation_findings", "dynamic_probes", "critic_reviews",
+        "design_lookup_requests", "design_claims", "risk_observations", "rounds", "investigation_tasks", "investigation_findings", "dynamic_probes", "critic_reviews",
         "verdicts", "approval_events",
     ):
         path = state_root / ARTIFACT_NAMES[key]
@@ -843,7 +1119,10 @@ def prepare(args: argparse.Namespace) -> int:
                 "The run may write machine artifacts only under its session result/log/state roots.",
             ),
             (
-                "target_source_write", f"{code_root} | {design_root}", "denied",
+                "target_source_write", " | ".join(filter(None, [
+                    str(code_root), str(design_root),
+                    str((materialization_source or {}).get("source_root") or ""),
+                ])), "denied",
                 "The supplied code and design roots are immutable review inputs.",
             ),
             (

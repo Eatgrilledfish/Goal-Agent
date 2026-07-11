@@ -13,33 +13,37 @@ import agent_common as ac
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 COMMANDS = {
-    "prepare": ["workspace_inventory.py"],
+    "start-clock": ["run_clock.py"],
+    "prepare": ["run_clock.py", "workspace_inventory.py"],
     "architecture-check": ["stage_artifact_validator.py"],
     "risk-plan-check": [
         "stage_artifact_validator.py:architecture", "risk_sweep_plan_validator.py",
     ],
-    "design-check": ["design_artifact_validator.py"],
+    "inventory-check": ["design_artifact_validator.py:inventory"],
+    "design-check": ["design_artifact_validator.py:all"],
     "claim-check": ["claim_review_validator.py"],
-    "task-check": ["stage_artifact_validator.py"],
+    "task-plan-check": ["stage_artifact_validator.py:task-plan"],
+    "task-lifecycle-check": ["stage_artifact_validator.py:task-lifecycle"],
+    "task-check": [
+        "stage_artifact_validator.py:task-plan",
+        "stage_artifact_validator.py:task-lifecycle",
+    ],
     "coverage-check": ["stage_artifact_validator.py"],
     "review": [
-        "design_artifact_validator.py", "claim_review_validator.py",
+        "design_artifact_validator.py:all", "claim_review_validator.py",
         "verdict_validator.py",
     ],
     "report": ["report_writer.py"],
     "gate": [
-        "design_artifact_validator.py", "claim_review_validator.py",
+        "design_artifact_validator.py:all", "claim_review_validator.py",
         "stage_artifact_validator.py:architecture", "risk_sweep_plan_validator.py",
-        "stage_artifact_validator.py:task",
+        "stage_artifact_validator.py:task-plan",
+        "stage_artifact_validator.py:task-lifecycle",
         "stage_artifact_validator.py:coverage", "verdict_validator.py", "final_gate.py",
     ],
-    "finalize": [
-        "design_artifact_validator.py", "claim_review_validator.py",
-        "stage_artifact_validator.py:architecture", "risk_sweep_plan_validator.py",
-        "stage_artifact_validator.py:task",
-        "stage_artifact_validator.py:coverage", "verdict_validator.py",
-        "report_writer.py", "final_gate.py",
-    ],
+    # The final judge already ran `review`; both helpers below reject stale
+    # digest-bound traces.  Avoid replaying every deterministic validator.
+    "finalize": ["report_writer.py", "final_gate.py"],
 }
 MAX_HELPER_SECONDS = 21600
 
@@ -77,6 +81,14 @@ def resolve_paths(args: argparse.Namespace) -> None:
 
 def script_command(script_spec: str, args: argparse.Namespace) -> list[str]:
     script, separator, explicit_stage = script_spec.partition(":")
+    if script == "run_clock.py":
+        command = [
+            sys.executable, str(SCRIPT_DIR / script),
+            "--log-root", args.log_root,
+        ]
+        if args.state_root:
+            command.extend(["--state-root", args.state_root])
+        return command
     command = [
         sys.executable, str(SCRIPT_DIR / script),
         "--code-root", args.code_root,
@@ -94,13 +106,21 @@ def script_command(script_spec: str, args: argparse.Namespace) -> list[str]:
         command.extend([
             "--stage", explicit_stage if separator else args.command.removesuffix("-check"),
         ])
+    elif script == "design_artifact_validator.py" and separator:
+        command.extend(["--mode", explicit_stage])
     return command
 
 
 def remaining_seconds(args: argparse.Namespace) -> int:
-    if args.command == "prepare":
+    if args.command == "start-clock":
         return MAX_HELPER_SECONDS
     root = ac.state_root(Path(args.log_root), args.state_root)
+    clock_path = root / "run_clock.json"
+    if clock_path.is_file():
+        clock = ac.load_json(clock_path)
+        deadline_at = str(clock.get("deadline_at") or "")
+        if deadline_at:
+            return int((ac.parse_iso(deadline_at) - ac.parse_iso(ac.now_iso())).total_seconds())
     state_path = root / "agent_loop_state.json"
     if not state_path.is_file():
         return MAX_HELPER_SECONDS
@@ -144,10 +164,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--log-root", default="/logs")
     parser.add_argument("--state-root", default=None)
     args = parser.parse_args(argv)
-    try:
-        resolve_paths(args)
-    except ValueError as exc:
-        parser.error(str(exc))
+    if args.command != "start-clock":
+        try:
+            resolve_paths(args)
+        except ValueError as exc:
+            parser.error(str(exc))
 
     exit_code = 0
     for script_spec in COMMANDS[args.command]:

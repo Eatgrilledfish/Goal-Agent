@@ -17,6 +17,8 @@ import design_source_materializer  # noqa: E402
 import handoff_merge  # noqa: E402
 import handoff_template  # noqa: E402
 import report_writer  # noqa: E402
+import session_event  # noqa: E402
+import stage_artifact_validator  # noqa: E402
 import stage_replay  # noqa: E402
 import verdict_validator  # noqa: E402
 
@@ -84,8 +86,178 @@ def workspace(tmp_path: Path) -> dict[str, Path | str]:
     }
 
 
+def prepare_materialized_workspace(
+    workspace: dict[str, Path | str], tmp_path: Path,
+) -> dict[str, Path | str]:
+    source = workspace["design"]
+    code = workspace["code"]
+    assert isinstance(source, Path)
+    assert isinstance(code, Path)
+    (source / "catalog.list").write_text(
+        "Use contract.md as the supplied service design.\n", encoding="utf-8"
+    )
+    result = tmp_path / "materialized-result"
+    logs = tmp_path / "materialized-logs"
+    state = logs / "state"
+    bundle = state / "design-sources"
+    plan = state / "design_source_plan.json"
+    source_manifest = logs / "trace" / "design_source_materialization.json"
+    clock = subprocess.run([
+        sys.executable, str(SCRIPTS / "goal_runner.py"), "start-clock",
+        "--log-root", str(logs), "--state-root", str(state),
+    ], text=True, capture_output=True)
+    assert clock.returncode == 0, clock.stdout + clock.stderr
+    ac.save_json(plan, {
+        "catalog_path": "catalog.list",
+        "sources": [{
+            "source_id": "service-contract",
+            "kind": "local",
+            "location": "contract.md",
+            "output_path": "contract.md",
+            "catalog_evidence": {
+                "path": "catalog.list", "line_start": 1, "line_end": 1,
+                "quote": "Use contract.md as the supplied service design.",
+            },
+        }],
+    })
+    materialize = subprocess.run([
+        sys.executable, str(SCRIPTS / "design_source_materializer.py"),
+        "--source-root", str(source), "--plan", str(plan),
+        "--output-root", str(bundle), "--manifest", str(source_manifest),
+    ], text=True, capture_output=True)
+    assert materialize.returncode == 0, materialize.stderr
+    prepared = subprocess.run([
+        sys.executable, str(SCRIPTS / "goal_runner.py"), "prepare",
+        "--code-root", str(code), "--design-root", str(bundle),
+        "--result-root", str(result), "--log-root", str(logs),
+        "--source-manifest", str(source_manifest),
+    ], text=True, capture_output=True)
+    assert prepared.returncode == 0, prepared.stderr
+    session = ac.load_json(state / "agent_loop_state.json")
+    return {
+        "code": code,
+        "design": bundle,
+        "source": source,
+        "result": result,
+        "logs": logs,
+        "state": state,
+        "session_id": session["session_id"],
+    }
+
+
+def test_prepare_rejects_materialized_bundle_without_source_manifest(workspace, tmp_path):
+    source = Path(workspace["design"])
+    code = Path(workspace["code"])
+    (source / "catalog.list").write_text(
+        "Use contract.md as the supplied service design.\n", encoding="utf-8",
+    )
+    result = tmp_path / "omitted-manifest-result"
+    logs = tmp_path / "omitted-manifest-logs"
+    state = logs / "state"
+    bundle = state / "design-sources"
+    plan = state / "design_source_plan.json"
+    manifest = logs / "trace" / "design_source_materialization.json"
+    clock = subprocess.run([
+        sys.executable, str(SCRIPTS / "goal_runner.py"), "start-clock",
+        "--log-root", str(logs), "--state-root", str(state),
+    ], text=True, capture_output=True)
+    assert clock.returncode == 0, clock.stdout + clock.stderr
+    ac.save_json(plan, {
+        "catalog_path": "catalog.list",
+        "sources": [{
+            "source_id": "service-contract", "kind": "local",
+            "location": "contract.md", "output_path": "contract.md",
+            "catalog_evidence": {
+                "path": "catalog.list", "line_start": 1, "line_end": 1,
+                "quote": "Use contract.md as the supplied service design.",
+            },
+        }],
+    })
+    materialize = subprocess.run([
+        sys.executable, str(SCRIPTS / "design_source_materializer.py"),
+        "--source-root", str(source), "--plan", str(plan),
+        "--output-root", str(bundle), "--manifest", str(manifest),
+    ], text=True, capture_output=True)
+    assert materialize.returncode == 0, materialize.stderr
+
+    prepared = run_runner(
+        "prepare", code, bundle, result, logs, check=False,
+    )
+
+    assert prepared.returncode != 0
+    preflight = ac.load_json(logs / "trace" / "preflight.json")
+    assert any(
+        "requires --source-manifest" in problem
+        for problem in preflight["problems"]
+    )
+    assert not (state / "agent_loop_state.json").exists()
+
+    corrected = subprocess.run([
+        sys.executable, str(SCRIPTS / "goal_runner.py"), "prepare",
+        "--code-root", str(code), "--design-root", str(bundle),
+        "--result-root", str(result), "--log-root", str(logs),
+        "--source-manifest", str(manifest),
+    ], text=True, capture_output=True)
+    assert corrected.returncode == 0, corrected.stdout + corrected.stderr
+
+
 def append(path: Path, value: dict) -> None:
     ac.append_jsonl(path, value)
+
+
+def record_critic_history(state: Path, critic: dict) -> None:
+    ac.append_jsonl(state / "critic_review_history.jsonl", {
+        "recorded_at": ac.now_iso(),
+        "session_id": critic["session_id"],
+        "finding_id": critic["finding_id"],
+        "review_key": handoff_merge._critic_history_key(critic),
+        "input_digests": critic["input_digests"],
+        "evidence_critic_prompt_version": critic["evidence_critic_prompt_version"],
+        "critic_sha256": handoff_merge.canonical_digest(critic),
+    })
+
+
+def record_trace_checkpoint(
+    state: Path, session_id: str, phase: str, role: str,
+    *, task_id: str | None = None, provider_session_id: str | None = None,
+) -> None:
+    input_path = state / "workspace_manifest.json"
+    records = [{
+        "path": str(input_path.resolve()),
+        "sha256": ac.sha256_file(input_path),
+        "size_bytes": input_path.stat().st_size,
+    }]
+    timestamp = ac.now_iso()
+    event = {
+        "recorded_at": timestamp,
+        "session_id": session_id,
+        "event": f"{phase}.checkpoint",
+        "actor": f"fixture-{role}",
+        "role": role,
+        "phase": phase,
+        "status": "complete",
+        "outcome": "fixture_complete",
+        "summary": "Fixture phase completed with deterministic artifacts.",
+        "metrics": {},
+        "artifacts": [],
+        "next_actions": [],
+        "scope": f"fixture:{phase}:{task_id or 'portfolio'}",
+        "input_artifacts": records,
+        "input_sha256": session_event.input_artifacts_sha256(records),
+        "started_at": timestamp,
+        "ended_at": timestamp,
+        "wall_time_seconds": 0.0,
+        "provider_attempt": 1,
+        "provider_session_id": provider_session_id or (
+            f"fixture-provider-{phase}-{task_id or 'portfolio'}"
+        ),
+        "output_count": 1,
+        "repair_count": 0,
+        "stop_reason": "phase_handoff",
+    }
+    if task_id is not None:
+        event["task_id"] = task_id
+    ac.append_jsonl(state / "agent_run_ledger.jsonl", event)
 
 
 def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quote: bool = False) -> None:
@@ -269,6 +441,28 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
             )
             risk_observations.append(item)
             append(state / "risk_observations.jsonl", item)
+    inventory = design_source_materializer.materialize_inventory({
+        "session_id": workspace["session_id"],
+        "document_groups": [{
+            "document_key": "contract",
+            "members": ["contract.md"],
+            "scope_relation": "required",
+            "scope_evidence": {
+                "source_ref": {
+                    "path": "contract.md", "line_start": 1, "line_end": 3,
+                },
+            },
+            "sections": [{
+                "section_id": "SECTION-CONTRACT",
+                "source_ref": {
+                    "path": "contract.md", "line_start": 1, "line_end": 6,
+                },
+                "behavior_families": ["externally visible service contract"],
+                "ambiguities": [],
+            }],
+        }],
+    }, Path(workspace["design"]))
+    ac.save_json(state / "design_inventory.json", inventory)
     specs = [
         (3, "The service must reject negative amounts.", 1, 2, "charge", 'def charge(amount):\n    return {"accepted": True}'),
         (4, "The service must expire sessions after 30 minutes.", 4, 5, "session_expired", "def session_expired(minutes):\n    return minutes > 60"),
@@ -280,16 +474,20 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
         task_id = f"TASK-{index:03d}"
         finding_id = f"FINDING-{task_id}"
         review_id = f"CRITIC-{index:03d}"
-        append(state / "design_claims.jsonl", {
+        claim = design_source_materializer.materialize_claims([{
             "claim_id": claim_id,
             "session_id": workspace["session_id"],
-            "document": "Service contract",
-            "path": "contract.md",
-            "section": "Service contract",
-            "line_start": design_line,
-            "line_end": design_line,
-            "quote": quote,
-            "behavior": quote,
+            "source_ref": {
+                "path": "contract.md",
+                "line_start": design_line,
+                "line_end": design_line,
+            },
+            "document_key": "contract",
+            "subject": "The public service implementation",
+            "trigger": f"A caller invokes {symbol} with an input covered by the contract.",
+            "obligation": quote,
+            "exceptions": [],
+            "observable_result": quote,
             "behavior_family": "externally visible service contract",
             "normative_strength": "mandatory",
             "applicability": "service implementation",
@@ -302,7 +500,8 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
                 "expected_observation": quote,
                 "non_testable_reason": "",
             },
-        })
+        }], Path(workspace["design"]))[0]
+        append(state / "design_claims.jsonl", claim)
         task_lenses = (
             lenses[index - 1::count]
             if count >= 3 else lenses[(index - 1) * 2:index * 2]
@@ -311,11 +510,15 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
         task_boundary = "BOUNDARY-AUDIT" if audit_scope else "BOUNDARY-API"
         task_plane = "PLANE-AUDIT" if audit_scope else "PLANE-SERVICE"
         task_risk = "RISK-AUDIT-001" if audit_scope else "RISK-API-001"
+        hypothesis = "Does the reachable implementation enforce this one design obligation?"
+        obligation_sha256 = stage_artifact_validator.claim_obligation_sha256(claim)
         append(state / "investigation_tasks.jsonl", {
             "task_id": task_id,
             "session_id": workspace["session_id"],
             "claim_id": claim_id,
-            "question": "Does the implementation enforce the stated behavior?",
+            "claim_branch": f"{claim_id}: documented observable branch",
+            "hypothesis": hypothesis,
+            "obligation_sha256": obligation_sha256,
             "starting_points": ["public service entry point"],
             "supporting_evidence_needed": ["reachable implementation"],
             "disconfirming_evidence_needed": ["alternate enforcement path"],
@@ -336,11 +539,13 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
             "session_id": workspace["session_id"],
             "task_id": task_id,
             "claim_id": claim_id,
-            "hypothesis": "Does the implementation enforce the stated behavior?",
-            "expected_behavior": quote,
+            "claim_branch": f"{claim_id}: documented observable branch",
+            "obligation_sha256": obligation_sha256,
+            "hypothesis": hypothesis,
+            "expected_behavior": f"{quote} Observable result: {quote}",
             "observed_behavior": "The cited implementation permits behavior the design forbids.",
             "design_evidence": [{
-                "document": "Service contract", "path": "contract.md", "section": "Service contract",
+                "document": claim["document"], "path": "contract.md", "section": claim["section"],
                 "line_start": design_line, "line_end": design_line, "quote": quote,
             }],
             "code_evidence": [{
@@ -391,7 +596,11 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
             "resolution": "No alternate enforcement path exists in the fixture.",
             "remaining_risks": [],
         }
+        critic = handoff_merge.materialize_critic_bindings(
+            critic, state, f"critic ({finding_id})",
+        )
         append(state / "critic_reviews.jsonl", critic)
+        record_critic_history(state, critic)
         design_quote = "invented quote" if bad_quote and index == 1 else quote
         append(state / "agent_review_verdicts.jsonl", {
             "finding_id": finding_id,
@@ -402,15 +611,14 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
             "confidence": 0.92,
             "severity": "high",
             "issue_type": "contradictory_behavior",
-            "design_evidence": [{
-                "document": "Service contract", "path": "contract.md", "section": "Service contract",
-                "line_start": design_line, "line_end": design_line, "quote": design_quote,
-            }],
+            "design_evidence": ([{
+                **finding["design_evidence"][0], "quote": design_quote,
+            }]),
             "code_evidence": [{
                 "file": "service.py", "line_start": code_start, "line_end": code_end,
                 "symbol": symbol, "snippet": snippet,
             }],
-            "expected_behavior": quote,
+            "expected_behavior": finding["expected_behavior"],
             "actual_behavior": finding["observed_behavior"],
             "inconsistency": "The implementation's reachable return value contradicts the stated requirement.",
             "impact": "A caller observes behavior forbidden by the design.",
@@ -451,7 +659,7 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
             "document_key": "contract",
             "members": ["contract.md"],
             "disposition": "applicable",
-            "evidence": "The document explicitly defines the service implementation contract.",
+            "evidence": "The supplied contract defines the service's observable behavior.",
             "claim_ids": [f"CLAIM-{index:03d}" for index in range(1, count + 1)],
             "behavior_families": ["externally visible service contract"],
         }],
@@ -459,7 +667,6 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
     ac.save_json(state / "claim_review_scope.json", {
         "session_id": workspace["session_id"],
         "round_id": "ROUND-001",
-        "design_claims_sha256": ac.sha256_file(state / "design_claims.jsonl"),
         "claim_ids": [f"CLAIM-{index:03d}" for index in range(1, count + 1)],
     })
     ac.save_json(state / "design_claim_review.json", {
@@ -467,12 +674,16 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
         "input_digests": {
             "design_claims.jsonl": ac.sha256_file(state / "design_claims.jsonl"),
             "design_coverage.json": ac.sha256_file(state / "design_coverage.json"),
+            "design_inventory.json": ac.sha256_file(state / "design_inventory.json"),
             "design_agent_manifest.json": ac.sha256_file(state / "design_agent_manifest.json"),
             "claim_review_scope.json": ac.sha256_file(state / "claim_review_scope.json"),
         },
         "claim_reviews": [{
             "session_id": workspace["session_id"],
             "claim_id": claim["claim_id"],
+            "claim_sha256": handoff_merge.canonical_digest(claim),
+            "source_sha256": claim["source_ref"]["source_sha256"],
+            "spec_critic_prompt_version": "spec-critic-v2",
             "quote_entailment": {
                 "assessment": "entailed", "rationale": "The quoted contract states this behavior directly.",
             },
@@ -482,7 +693,7 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
                 "rationale": "The fixture uses an explicit must requirement.",
             },
             "atomicity": {
-                "assessment": "atomic", "obligations": [claim["behavior"]],
+                "assessment": "atomic", "obligations": [claim["obligation"]],
                 "rationale": "The claim contains one independently observable obligation.",
             },
             "applicability": {
@@ -492,6 +703,7 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
         } for claim in claims_for_templates],
         "group_reviews": [{
             "session_id": workspace["session_id"], "document_key": "contract",
+            "group_sha256": inventory["document_groups"][0]["group_sha256"],
             "behavior_families": {
                 "assessment": "complete", "missing_items": [],
                 "rationale": "The fixture behavior family is represented.",
@@ -572,6 +784,8 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
         "deferred_claims": [],
         "false_positive_samples_rechecked": [f"FINDING-TASK-{index:03d}" for index in range(1, count + 1)],
         "next_round_tasks": [],
+        "supplement_rounds": 0,
+        "remaining_gaps": [],
         "stop_reason": "All high-priority fixture claims were investigated and independently reviewed.",
     })
     task_ids = [f"TASK-{index:03d}" for index in range(1, count + 1)]
@@ -584,6 +798,9 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
     ac.save_json(task_report, {
         "passed": True, "artifact_type": "task", "errors": [], "validated_ids": task_ids,
         "ledger_sha256": ac.sha256_file(state / "investigation_tasks.jsonl"),
+        "task_plan_ledger_sha256": handoff_merge.task_plan_ledger_sha256(
+            {task["task_id"]: task for task in tasks_for_templates}
+        ),
     })
     ac.save_json(finding_report, {
         "passed": True, "artifact_type": "finding", "errors": [], "validated_ids": finding_ids,
@@ -598,8 +815,12 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
         "passed": True, "artifact_type": "risk", "errors": [],
         "validated_ids": [item["observation_id"] for item in risk_observations],
         "expected_sweep_ids": ["RISK-SWEEP-API", "RISK-SWEEP-AUDIT"],
+        "submitted_sweep_ids": ["RISK-SWEEP-API", "RISK-SWEEP-AUDIT"],
         "validated_sweep_ids": ["RISK-SWEEP-API", "RISK-SWEEP-AUDIT"],
+        "completed_sweep_ids": ["RISK-SWEEP-API", "RISK-SWEEP-AUDIT"],
         "missing_sweep_ids": [],
+        "closed": True,
+        "global_coverage_validated": True,
         "risk_sweep_plan_sha256": risk_plan_digest,
         "architecture_map_sha256": architecture_digest,
         "ledger_sha256": ac.sha256_file(state / "risk_observations.jsonl"),
@@ -614,7 +835,7 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
         "critic": (finding_ids, state / "critic_reviews.jsonl", critic_report, "critic_review"),
     }
     for artifact_type, (validated_ids, ledger_path, report_path, phase) in provenance.items():
-        ac.append_jsonl(state / "agent_run_ledger.jsonl", {
+        event = {
             "recorded_at": ac.now_iso(), "session_id": workspace["session_id"],
             "event": "handoff_merge", "actor": "fixture_handoff_merge",
             "phase": phase,
@@ -622,7 +843,38 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
             "validated_ids": validated_ids, "report": str(report_path),
             "report_sha256": ac.sha256_file(report_path),
             "ledger_sha256": ac.sha256_file(ledger_path),
-        })
+        }
+        if artifact_type == "task":
+            event["task_plan_ledger_sha256"] = handoff_merge.task_plan_ledger_sha256(
+                {task["task_id"]: task for task in tasks_for_templates}
+            )
+        ac.append_jsonl(state / "agent_run_ledger.jsonl", event)
+    for phase, role in (
+        ("architecture_mapping", "orchestrator"),
+        ("design_inventory", "spec-analyst"),
+        ("design_claim_resolution", "spec-analyst"),
+        ("design_claim_review", "spec-critic"),
+        ("investigation_planning", "orchestrator"),
+        ("coverage_audit", "coverage-critic"),
+        ("final_judgement", "final-judge"),
+    ):
+        record_trace_checkpoint(state, str(workspace["session_id"]), phase, role)
+    for slice_item in ac.load_json(state / "risk_sweep_plan.json")["slices"]:
+        record_trace_checkpoint(
+            state, str(workspace["session_id"]),
+            "code_risk_backtracking", "risk-explorer",
+            task_id=slice_item["sweep_id"],
+        )
+    for task in tasks_for_templates:
+        record_trace_checkpoint(
+            state, str(workspace["session_id"]),
+            "investigation", "code-investigator", task_id=task["task_id"],
+        )
+    for finding_id in finding_ids:
+        record_trace_checkpoint(
+            state, str(workspace["session_id"]),
+            "critic_review", "evidence-critic", task_id=finding_id,
+        )
     validation_commands = [
         "architecture-check", "risk-plan-check", "design-check", "claim-check", "task-check",
     ]
@@ -642,6 +894,7 @@ def attach_dynamic_probe(
     baseline_status: str = "passed",
     execution_status: str = "completed",
     target_reached: bool = True,
+    validate_coverage: bool = True,
 ) -> dict:
     state = workspace["state"]
     assert isinstance(state, Path)
@@ -651,6 +904,15 @@ def attach_dynamic_probe(
     probe_id = "PROBE-001"
     probe_workspace = state / "probes" / probe_id / "workspace"
     probe_workspace.mkdir(parents=True)
+    findings, _ = ac.load_jsonl(state / "investigation_findings.jsonl")
+    review_code_root = Path(
+        ac.load_json(state / "workspace_manifest.json")["paths"]["review_code_root"]
+    )
+    for evidence in findings[0]["code_evidence"]:
+        relative = Path(evidence["file"])
+        target = probe_workspace / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes((review_code_root / relative).read_bytes())
     probe = {
         "probe_id": probe_id,
         "session_id": workspace["session_id"],
@@ -658,14 +920,32 @@ def attach_dynamic_probe(
         "claim_id": claim["claim_id"],
         "oracle": {
             "source": "design_claim",
+            "claim_id": claim["claim_id"],
+            "claim_sha256": handoff_merge.canonical_digest(claim),
+            "source_sha256": claim["source_ref"]["source_sha256"],
             "preconditions": claim["probe_oracle"]["preconditions"],
             "stimulus": claim["probe_oracle"]["stimulus"],
             "expected_observation": claim["probe_oracle"]["expected_observation"],
+        },
+        "oracle_validation": {
+            "non_triviality": {
+                "status": "passed",
+                "method": "Run a deliberately satisfying and deliberately failing control input.",
+                "result": "The focused oracle distinguishes the two controls.",
+            },
+            "secondary_oracle": {
+                "kind": "negative_control",
+                "status": "passed",
+                "command": "python focused_probe.py --negative-control",
+                "result": "The negative control rejected the deliberately invalid observation.",
+            },
+            "evidence_role": "corroborating",
         },
         "selection_reason": "The public function is observable and the existing Python runtime is available.",
         "isolation": {
             "kind": "session_copy",
             "workspace": str(probe_workspace),
+            "command_cwd": str(probe_workspace),
             "original_target_unchanged": True,
         },
         "baseline": {
@@ -695,7 +975,6 @@ def attach_dynamic_probe(
     }
     append(state / "dynamic_probes.jsonl", probe)
 
-    findings, _ = ac.load_jsonl(state / "investigation_findings.jsonl")
     findings[0]["dynamic_probe_selection"] = {
         "disposition": "selected",
         "reason": "The candidate is high-value, observable, low-cost, and runnable with existing dependencies.",
@@ -713,9 +992,15 @@ def attach_dynamic_probe(
         "reachability": "The probe records whether the mapped target path was reached.",
         "effect_on_decision": "The scoped result supplements but does not replace static evidence.",
     }
+    critiques[0].pop("input_digests", None)
+    critiques[0].pop("evidence_critic_prompt_version", None)
+    critiques[0] = handoff_merge.materialize_critic_bindings(
+        critiques[0], state, f"critic ({finding_id})",
+    )
     (state / "critic_reviews.jsonl").write_text(
         "\n".join(json.dumps(item) for item in critiques) + "\n", encoding="utf-8"
     )
+    record_critic_history(state, critiques[0])
 
     verdicts, _ = ac.load_jsonl(state / "agent_review_verdicts.jsonl")
     verdicts[0]["dynamic_validation"] = {
@@ -764,16 +1049,33 @@ def attach_dynamic_probe(
         "report_sha256": ac.sha256_file(probe_report),
         "ledger_sha256": ac.sha256_file(state / "dynamic_probes.jsonl"),
     })
+    current_critic_report = trace / "critic-handoff-merge.json"
+    ac.append_jsonl(state / "agent_run_ledger.jsonl", {
+        "recorded_at": ac.now_iso(), "session_id": workspace["session_id"],
+        "event": "handoff_merge", "actor": "fixture_handoff_merge",
+        "phase": "critic_review", "status": "complete", "artifact_type": "critic",
+        "validated_ids": [
+            f"FINDING-TASK-{index:03d}" for index in range(1, len(critiques) + 1)
+        ],
+        "report": str(current_critic_report),
+        "report_sha256": ac.sha256_file(current_critic_report),
+        "ledger_sha256": ac.sha256_file(state / "critic_reviews.jsonl"),
+    })
     ac.append_jsonl(state / "approval_events.jsonl", {
         "recorded_at": ac.now_iso(), "session_id": workspace["session_id"],
         "actor": "fixture_handoff_merge", "action": "focused_dynamic_probe",
         "scope": str(state / "probes"), "decision": "auto_approved",
         "rationale": "The fixture probe is confined to a session-owned copy.",
     })
-    run_runner(
-        "coverage-check", Path(workspace["code"]), Path(workspace["design"]),
-        Path(workspace["result"]), Path(workspace["logs"]),
+    record_trace_checkpoint(
+        state, str(workspace["session_id"]), "dynamic_probe", "code-investigator",
+        task_id=finding_id,
     )
+    if validate_coverage:
+        run_runner(
+            "coverage-check", Path(workspace["code"]), Path(workspace["design"]),
+            Path(workspace["result"]), Path(workspace["logs"]),
+        )
     return probe
 
 
@@ -792,19 +1094,28 @@ def test_prepare_is_semantic_neutral_and_writes_agent_contract(workspace):
     assert "paths" not in design_manifest
     assert "code_root" not in json.dumps(design_manifest)
     assert contract["execution_model"] == "opencode-owned-model-driven-loop"
-    assert contract["contract_version"] == 12
+    assert contract["contract_version"] == 13
     assert contract["handoff_integrity"]["max_concurrent_subagent_tasks"] == 2
+    assert contract["tool_protocol"]["agent_event_contract"]["required_fields"] == [
+        "event", "role", "phase", "scope", "input_artifacts", "input_sha256",
+        "started_at", "ended_at", "wall_time_seconds",
+        "provider_attempt", "provider_session_id", "output_count",
+        "repair_count", "outcome", "stop_reason",
+    ]
     assert len(contract["coverage_contract"]["exploration_modes"]) == 3
     assert "dynamic_probe" in contract["coverage_contract"]
-    assert [phase["owner"] for phase in contract["phases"]][:9] == [
-        "orchestrator", "orchestrator_then_two_risk_explorers", "spec_analyst",
-        "orchestrator_then_spec_critic",
-        "orchestrator", "code_investigator", "coverage_critic_then_orchestrator",
-        "orchestrator_then_code_investigator", "evidence_critic",
+    assert [phase["owner"] for phase in contract["phases"]][:10] == [
+        "orchestrator", "spec-analyst", "risk-explorer",
+        "spec-analyst", "spec-critic", "orchestrator",
+        "code-investigator", "code-investigator", "evidence-critic",
+        "coverage-critic",
     ]
     assert (state / "risk_observations.jsonl").is_file()
     assert (state / "dynamic_probes.jsonl").is_file()
     loop_state = ac.load_json(state / "agent_loop_state.json")
+    run_clock = ac.load_json(state / "run_clock.json")
+    assert loop_state["started_at"] == run_clock["started_at"]
+    assert loop_state["deadline_at"] == run_clock["deadline_at"]
     assert int((
         ac.parse_iso(loop_state["deadline_at"]) - ac.parse_iso(loop_state["started_at"])
     ).total_seconds()) == 21600
@@ -846,6 +1157,11 @@ def test_goal_runner_stops_helpers_after_persisted_session_deadline(workspace):
     state = workspace["state"]
     assert isinstance(state, Path)
     loop_state = ac.load_json(state / "agent_loop_state.json")
+    run_clock = ac.load_json(state / "run_clock.json")
+    run_clock["started_at"] = "1999-12-31T18:00:00Z"
+    run_clock["deadline_at"] = "2000-01-01T00:00:00Z"
+    ac.save_json(state / "run_clock.json", run_clock)
+    loop_state["started_at"] = run_clock["started_at"]
     loop_state["deadline_at"] = "2000-01-01T00:00:00Z"
     ac.save_json(state / "agent_loop_state.json", loop_state)
 
@@ -1151,6 +1467,48 @@ def test_design_source_materializer_normalizes_html_to_visible_text():
     assert "ignore" not in text
 
 
+def test_prepare_freezes_materialization_source_and_gate_accepts_unchanged_catalog(
+    workspace, tmp_path,
+):
+    materialized = prepare_materialized_workspace(workspace, tmp_path)
+    state = materialized["state"]
+    source = materialized["source"]
+    assert isinstance(state, Path)
+    assert isinstance(source, Path)
+    manifest = ac.load_json(state / "workspace_manifest.json")
+    snapshot = manifest["design"]["materialization_source"]
+    assert snapshot["source_root"] == str(source.resolve())
+    assert snapshot["catalog_path"] == "catalog.list"
+    assert snapshot["plan_path"] == str((state / "design_source_plan.json").resolve())
+    assert snapshot["plan_sha256"] == ac.sha256_file(state / "design_source_plan.json")
+    assert snapshot["file_count"] == len(snapshot["files"])
+    assert {record["path"] for record in snapshot["files"]} == {
+        "catalog.list", "contract.md",
+    }
+    assert all(
+        record.get("sha256") for record in snapshot["files"]
+        if record["kind"] == "file"
+    )
+
+    populate_handoffs(materialized)
+    run_runner(
+        "review", materialized["code"], materialized["design"],
+        materialized["result"], materialized["logs"],
+    )
+    run_runner(
+        "report", materialized["code"], materialized["design"],
+        materialized["result"], materialized["logs"],
+    )
+    gate = run_runner(
+        "gate", materialized["code"], materialized["design"],
+        materialized["result"], materialized["logs"],
+    )
+    assert gate.returncode == 0
+    verdict = ac.load_json(materialized["logs"] / "trace" / "final_gate.json")
+    assert verdict["checks"]["supplied_design_source_unchanged"] is True
+    assert verdict["checks"]["target_roots_unchanged"] is True
+
+
 def test_design_source_materializer_rejects_unverifiable_catalog_evidence(tmp_path):
     source = tmp_path / "input-design"
     bundle = tmp_path / "bundle"
@@ -1337,7 +1695,11 @@ def test_finding_template_copies_only_task_and_claim_contract_fields(workspace, 
     claims, _ = ac.load_jsonl(state / "design_claims.jsonl")
     template = handoff_template.finding_template(tasks[0], claims[0])
     assert template["finding_id"] == "FINDING-TASK-001"
-    assert template["expected_behavior"] == claims[0]["behavior"]
+    assert template["expected_behavior"] == (
+        f"{claims[0]['obligation']} Observable result: {claims[0]['observable_result']}"
+    )
+    assert template["claim_branch"] == tasks[0]["claim_branch"]
+    assert template["obligation_sha256"] == tasks[0]["obligation_sha256"]
     assert template["design_evidence"] == [{
         "document": claims[0]["document"], "path": claims[0]["path"],
         "section": claims[0]["section"], "line_start": claims[0]["line_start"],
@@ -1395,7 +1757,7 @@ def test_handoff_check_file_accepts_valid_finding_without_writing_ledger(workspa
     assert list(tmp_path.glob("*.jsonl")) == []
 
 
-def test_finding_template_enforces_two_unmerged_items_and_failed_batch_lock(workspace):
+def test_finding_template_keeps_two_task_frontier_without_failed_peer_lock(workspace):
     populate_handoffs(workspace, count=4)
     state = workspace["state"]
     assert isinstance(state, Path)
@@ -1437,26 +1799,20 @@ def test_finding_template_enforces_two_unmerged_items_and_failed_batch_lock(work
     assert generate("TASK-001", force=True).returncode == 0
     assert generate("TASK-002").returncode == 0
     blocked = generate("TASK-003")
-    assert blocked.returncode == 3
-    assert "two investigator templates are already unresolved" in blocked.stdout
+    assert blocked.returncode == 1
+    assert "outside the ordered two-task frontier" in blocked.stdout
 
-    ac.save_json(state / "investigator_batch_gate.json", {
-        "passed": True,
-        "validated_ids": ["FINDING-TASK-001", "FINDING-TASK-002"],
-        "errors": [],
-    })
-    for task in tasks[:2]:
-        task["status"] = "complete"
+    # Candidate 1 closes while candidate 2 remains pending.  A failed report
+    # for candidate 2 is audit evidence for that candidate, not a global lock.
+    tasks[0]["status"] = "complete"
     (state / "investigation_tasks.jsonl").write_text(
         "".join(json.dumps(task) + "\n" for task in tasks), encoding="utf-8",
     )
     (state / "investigation_findings.jsonl").write_text(
-        "".join(json.dumps(item) + "\n" for item in original_findings[:2]),
+        json.dumps(original_findings[0]) + "\n",
         encoding="utf-8",
     )
-    rounds[0]["finding_ids"] = [
-        "FINDING-TASK-001", "FINDING-TASK-002",
-    ]
+    rounds[0]["finding_ids"] = ["FINDING-TASK-001"]
     (state / "investigation_rounds.jsonl").write_text(
         "".join(json.dumps(item) + "\n" for item in rounds), encoding="utf-8",
     )
@@ -1464,16 +1820,13 @@ def test_finding_template_enforces_two_unmerged_items_and_failed_batch_lock(work
         "task-check", Path(workspace["code"]), Path(workspace["design"]),
         Path(workspace["result"]), Path(workspace["logs"]),
     )
-    assert generate("TASK-003").returncode == 0
-
     ac.save_json(state / "investigator_batch_gate.json", {
         "passed": False,
-        "invalid_ids": ["FINDING-TASK-003"],
+        "invalid_ids": ["FINDING-TASK-002"],
         "errors": ["invalid handoff"],
     })
-    locked = generate("TASK-004")
-    assert locked.returncode == 3
-    assert "previous investigator batch has not passed merge" in locked.stdout
+    third = generate("TASK-003")
+    assert third.returncode == 0, third.stdout + third.stderr
 
 
 def test_failed_finding_merge_writes_batch_gate_and_detailed_stdout(workspace, tmp_path):
@@ -1501,7 +1854,7 @@ def test_failed_finding_merge_writes_batch_gate_and_detailed_stdout(workspace, t
     assert gate["invalid_ids"] == ["FINDING-BAD"]
 
 
-def test_finding_merge_rejects_missing_expected_batch_handoff_before_unlock(workspace, tmp_path):
+def test_finding_merge_isolates_valid_candidate_from_invalid_peer(workspace, tmp_path):
     populate_handoffs(workspace, count=3)
     source_state = workspace["state"]
     assert isinstance(source_state, Path)
@@ -1510,76 +1863,204 @@ def test_finding_merge_rejects_missing_expected_batch_handoff_before_unlock(work
     findings, _ = ac.load_jsonl(source_state / "investigation_findings.jsonl")
     claims_by_id = {item["claim_id"]: item for item in claims}
 
-    state = tmp_path / "state"
+    state = source_state
     handoffs = state / "handoffs" / "investigators"
     templates = state / "handoff-templates" / "investigators"
-    handoffs.mkdir(parents=True)
+    for path in handoffs.rglob("*.json"):
+        path.unlink()
+    for path in templates.glob("*.json"):
+        path.unlink()
+    (state / "investigation_findings.jsonl").write_text("", encoding="utf-8")
+    for task in tasks:
+        task["status"] = "pending"
     ac.save_json(templates / "TASK-001.json", handoff_template.finding_template(tasks[0], claims_by_id[tasks[0]["claim_id"]]))
     ac.save_json(templates / "TASK-002.json", handoff_template.finding_template(tasks[1], claims_by_id[tasks[1]["claim_id"]]))
-    ac.save_json(handoffs / "TASK-001.json", findings[0])
+    valid_dir = handoffs / "TASK-001"
+    invalid_dir = handoffs / "TASK-002"
+    valid_dir.mkdir(parents=True)
+    invalid_dir.mkdir(parents=True)
+    ac.save_json(valid_dir / "finding.json", findings[0])
+    invalid_peer = dict(findings[1])
+    invalid_peer["observed_behavior"] = ""
+    ac.save_json(invalid_dir / "finding.json", invalid_peer)
     (state / "investigation_tasks.jsonl").write_text(
         "\n".join(json.dumps(item) for item in tasks) + "\n", encoding="utf-8"
     )
     (state / "design_claims.jsonl").write_text(
         "\n".join(json.dumps(item) for item in claims) + "\n", encoding="utf-8"
     )
-    report = tmp_path / "batch-report.json"
-    proc = subprocess.run([
+    rounds, _ = ac.load_jsonl(source_state / "investigation_rounds.jsonl")
+    rounds[0]["finding_ids"] = []
+    (state / "investigation_rounds.jsonl").write_text(
+        "\n".join(json.dumps(item) for item in rounds) + "\n", encoding="utf-8"
+    )
+    invalid_report = tmp_path / "invalid-candidate-report.json"
+    invalid = subprocess.run([
         sys.executable, str(SCRIPTS / "handoff_merge.py"),
-        "--input-dir", str(handoffs), "--output", str(state / "investigation_findings.jsonl"),
+        "--input-dir", str(invalid_dir), "--output", str(state / "investigation_findings.jsonl"),
+        "--artifact-type", "finding", "--session-id", str(workspace["session_id"]),
+        "--code-root", str(workspace["code"]), "--design-root", str(workspace["design"]),
+        "--report", str(invalid_report),
+    ], text=True, capture_output=True)
+    assert invalid.returncode == 1
+    assert (state / "investigation_findings.jsonl").read_bytes() == b""
+    failed = ac.load_json(invalid_report)
+    assert failed["expected_ids"] == ["FINDING-TASK-002"]
+    assert failed["invalid_ids"] == ["FINDING-TASK-002"]
+    assert ac.load_json(state / "investigator_batch_gate.json")["passed"] is False
+
+    # The peer is independently invalid in both its stable plan and lifecycle.
+    # Those candidate-local errors must remain visible without rolling back the
+    # valid candidate's finding/lifecycle transition.
+    tasks[1]["obligation_sha256"] = "0" * 64
+    tasks[1]["status"] = "invalid-peer-status"
+    (state / "investigation_tasks.jsonl").write_text(
+        "\n".join(json.dumps(item) for item in tasks) + "\n", encoding="utf-8"
+    )
+    plan = run_runner(
+        "task-plan-check", Path(workspace["code"]), Path(workspace["design"]),
+        Path(workspace["result"]), Path(workspace["logs"]), check=False,
+    )
+    lifecycle = run_runner(
+        "task-lifecycle-check", Path(workspace["code"]), Path(workspace["design"]),
+        Path(workspace["result"]), Path(workspace["logs"]), check=False,
+    )
+    assert plan.returncode == 1
+    assert lifecycle.returncode == 1
+    plan_digest_before = stage_artifact_validator.task_plan_digest(
+        tasks[0], claims_by_id[tasks[0]["claim_id"]], rounds,
+    )
+    lifecycle_digest_before = stage_artifact_validator.task_lifecycle_digest(tasks[0], [])
+    trace_root = Path(workspace["logs"]) / "trace"
+    plan_trace_before = (trace_root / "task_plan_validation.json").read_bytes()
+    lifecycle_trace_before = (trace_root / "task_lifecycle_validation.json").read_bytes()
+    plan_trace = ac.load_json(trace_root / "task_plan_validation.json")
+    lifecycle_trace = ac.load_json(trace_root / "task_lifecycle_validation.json")
+    assert plan_trace["global_passed"] is True
+    assert lifecycle_trace["global_passed"] is True
+    assert "TASK-001" in plan_trace["valid_task_ids"]
+    assert "TASK-001" in lifecycle_trace["valid_task_ids"]
+    assert "TASK-002" in plan_trace["invalid_task_ids"]
+    assert "TASK-002" in lifecycle_trace["invalid_task_ids"]
+
+    report = tmp_path / "valid-candidate-report.json"
+    valid = subprocess.run([
+        sys.executable, str(SCRIPTS / "handoff_merge.py"),
+        "--input-dir", str(valid_dir), "--output", str(state / "investigation_findings.jsonl"),
         "--artifact-type", "finding", "--session-id", str(workspace["session_id"]),
         "--code-root", str(workspace["code"]), "--design-root", str(workspace["design"]),
         "--report", str(report),
     ], text=True, capture_output=True)
-    assert proc.returncode == 1
-    assert not (state / "investigation_findings.jsonl").exists()
+    assert valid.returncode == 0, valid.stdout + valid.stderr
     result = ac.load_json(report)
-    assert result["expected_ids"] == ["FINDING-TASK-001", "FINDING-TASK-002"]
-    assert result["missing_ids"] == ["FINDING-TASK-002"]
-    assert ac.load_json(state / "investigator_batch_gate.json")["passed"] is False
+    assert result["expected_ids"] == ["FINDING-TASK-001"]
+    assert result["missing_ids"] == []
+    assert result["validated_ids"] == ["FINDING-TASK-001"]
+    merged_tasks, _ = ac.load_jsonl(state / "investigation_tasks.jsonl")
+    merged_rounds, _ = ac.load_jsonl(state / "investigation_rounds.jsonl")
+    merged_findings, _ = ac.load_jsonl(state / "investigation_findings.jsonl")
+    assert stage_artifact_validator.task_plan_digest(
+        merged_tasks[0], claims_by_id[merged_tasks[0]["claim_id"]], merged_rounds,
+    ) == plan_digest_before
+    assert stage_artifact_validator.task_lifecycle_digest(
+        merged_tasks[0], [merged_findings[0]],
+    ) != lifecycle_digest_before
+    assert merged_tasks[0]["status"] == "complete"
+    assert merged_tasks[1]["status"] == "invalid-peer-status"
+    assert merged_rounds[0]["finding_ids"] == ["FINDING-TASK-001"]
+    assert (trace_root / "task_plan_validation.json").read_bytes() == plan_trace_before
+    assert (trace_root / "task_lifecycle_validation.json").read_bytes() != lifecycle_trace_before
+    refreshed_lifecycle = ac.load_json(trace_root / "task_lifecycle_validation.json")
+    assert refreshed_lifecycle["global_passed"] is True
+    assert refreshed_lifecycle["passed"] is False
+    assert "TASK-001" in refreshed_lifecycle["valid_task_ids"]
+    assert "TASK-002" in refreshed_lifecycle["invalid_task_ids"]
 
-    blocked = subprocess.run([
+    # The next frontier candidate can start even though candidate 2's isolated
+    # validation failed and its template remains unresolved.
+    allowed = subprocess.run([
         sys.executable, str(SCRIPTS / "handoff_template.py"),
         "--tasks", str(state / "investigation_tasks.jsonl"),
         "--claims", str(state / "design_claims.jsonl"), "--task-id", "TASK-003",
         "--output", str(templates / "TASK-003.json"),
     ], text=True, capture_output=True)
-    assert blocked.returncode == 3
-    assert "previous investigator batch has not passed" in blocked.stdout
+    assert allowed.returncode == 0, allowed.stdout + allowed.stderr
 
-    tasks[1].update({
-        "status": "deferred",
-        "defer_reason": "The provider failed twice before producing a handoff.",
-        "defer_evidence": {
-            "kind": "provider_failure",
-            "attempts": [
-                {"attempt_id": "attempt-1", "outcome": "failed", "evidence": "provider stream closed"},
-                {"attempt_id": "attempt-2", "outcome": "failed", "evidence": "provider stream closed again"},
-            ],
-        },
-    })
-    (state / "investigation_tasks.jsonl").write_text(
-        "\n".join(json.dumps(item) for item in tasks) + "\n", encoding="utf-8"
+
+def test_finding_merge_does_not_block_on_a_stale_retained_candidate(workspace):
+    populate_handoffs(workspace, count=2)
+    state = workspace["state"]
+    assert isinstance(state, Path)
+    findings, errors = ac.load_jsonl(state / "investigation_findings.jsonl")
+    assert errors == []
+    findings[0]["code_evidence"][0]["snippet"] = "not the cited source"
+    (state / "investigation_findings.jsonl").write_text(
+        "".join(json.dumps(finding) + "\n" for finding in findings),
+        encoding="utf-8",
     )
-    recovered = subprocess.run(proc.args, text=True, capture_output=True)
-    assert recovered.returncode == 0, recovered.stdout + recovered.stderr
-    recovered_report = ac.load_json(report)
-    assert recovered_report["deferred_ids"] == ["FINDING-TASK-002"]
-    assert recovered_report["validated_ids"] == ["FINDING-TASK-001"]
-    allowed = subprocess.run(blocked.args, text=True, capture_output=True)
-    assert allowed.returncode == 3
-    assert "current passed task validation is required" in allowed.stdout
-    (templates / "TASK-003.json").unlink(missing_ok=True)
+    candidate_dir = state / "handoffs" / "investigators" / "TASK-002"
+    candidate_dir.mkdir(parents=True, exist_ok=True)
+    ac.save_json(candidate_dir / "TASK-002.json", findings[1])
+    report_path = workspace["logs"] / "trace" / "finding-merge-TASK-002.json"
 
-    finding_before = (state / "investigation_findings.jsonl").read_bytes()
-    task_before = (state / "investigation_tasks.jsonl").read_bytes()
-    ac.save_json(handoffs / "TASK-002.json", findings[1])
-    late = subprocess.run(proc.args, text=True, capture_output=True)
-    assert late.returncode == 1
-    assert (state / "investigation_findings.jsonl").read_bytes() == finding_before
-    assert (state / "investigation_tasks.jsonl").read_bytes() == task_before
-    late_report = ac.load_json(report)
-    assert any("targets deferred task TASK-002" in error for error in late_report["errors"])
+    proc = subprocess.run([
+        sys.executable, str(SCRIPTS / "handoff_merge.py"),
+        "--input-dir", str(candidate_dir),
+        "--output", str(state / "investigation_findings.jsonl"),
+        "--artifact-type", "finding", "--session-id", str(workspace["session_id"]),
+        "--code-root", str(workspace["code"]), "--design-root", str(workspace["design"]),
+        "--report", str(report_path),
+    ], text=True, capture_output=True)
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    report = ac.load_json(report_path)
+    assert report["validated_ids"] == ["FINDING-TASK-002"]
+    assert report["retained_invalid_ids"] == ["FINDING-TASK-001"]
+    merged, errors = ac.load_jsonl(state / "investigation_findings.jsonl")
+    assert errors == []
+    assert {finding["finding_id"] for finding in merged} == {
+        "FINDING-TASK-001", "FINDING-TASK-002",
+    }
+
+
+def test_finding_merge_does_not_block_on_retained_stale_template_binding(workspace):
+    populate_handoffs(workspace, count=2)
+    state = workspace["state"]
+    assert isinstance(state, Path)
+    tasks, task_errors = ac.load_jsonl(state / "investigation_tasks.jsonl")
+    findings, finding_errors = ac.load_jsonl(state / "investigation_findings.jsonl")
+    assert task_errors == []
+    assert finding_errors == []
+
+    # Make only the retained peer's upstream task/template contract stale.  The
+    # currently submitted candidate remains unchanged and must still merge.
+    tasks[0]["claim_id"] = tasks[1]["claim_id"]
+    (state / "investigation_tasks.jsonl").write_text(
+        "".join(json.dumps(task) + "\n" for task in tasks), encoding="utf-8",
+    )
+    candidate_dir = state / "handoffs" / "investigators" / "TASK-002"
+    candidate_dir.mkdir(parents=True, exist_ok=True)
+    ac.save_json(candidate_dir / "TASK-002.json", findings[1])
+    report_path = workspace["logs"] / "trace" / "finding-merge-stale-template.json"
+
+    proc = subprocess.run([
+        sys.executable, str(SCRIPTS / "handoff_merge.py"),
+        "--input-dir", str(candidate_dir),
+        "--output", str(state / "investigation_findings.jsonl"),
+        "--artifact-type", "finding", "--session-id", str(workspace["session_id"]),
+        "--code-root", str(workspace["code"]), "--design-root", str(workspace["design"]),
+        "--report", str(report_path),
+    ], text=True, capture_output=True)
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    report = ac.load_json(report_path)
+    assert report["validated_ids"] == ["FINDING-TASK-002"]
+    assert report["retained_invalid_ids"] == ["FINDING-TASK-001"]
+    merged, merge_errors = ac.load_jsonl(state / "investigation_findings.jsonl")
+    assert merge_errors == []
+    assert {finding["finding_id"] for finding in merged} == {
+        "FINDING-TASK-001", "FINDING-TASK-002",
+    }
 
 
 def test_finding_self_check_rejects_changes_to_pristine_template_fields(workspace):
@@ -1631,23 +2112,28 @@ def test_finding_self_check_reconstructs_template_instead_of_trusting_the_file(w
     )
 
 
-def test_instruction_makes_successful_batch_report_a_hard_progression_gate():
+def test_instruction_allows_valid_candidate_to_merge_without_waiting_for_its_peer():
     instruction = (ROOT / "INSTRUCTION.md").read_text(encoding="utf-8")
     assert "--check-file" in instruction
     assert "--report" in instruction
-    assert "merge 返回非 0 时，**禁止启动下一批**" in instruction
-    assert "validated_ids" in instruction
+    assert "handoffs/investigators/${TASK_ID}/${TASK_ID}.json" in instruction
+    assert "--input-dir ${STATE_ROOT}/handoffs/investigators/${TASK_ID}" in instruction
+    assert "不阻塞已验证 candidate" in instruction
+    assert "valid_task_ids" in instruction
+    assert "全部 handoff self-check 通过后原子 merge" not in instruction
+    assert "部分批次不得继续" not in instruction
     assert "${REVIEW_CODE_ROOT}" in instruction
-    assert "investigator_batch_gate.json" in instruction
+    assert "goal_runner.py task-lifecycle-check" in instruction
 
 
 def test_instruction_requires_risk_plan_gate_before_parallel_risk_tasks():
     instruction = (ROOT / "INSTRUCTION.md").read_text(encoding="utf-8")
     gate_position = instruction.index("goal_runner.py risk-plan-check")
-    launch_position = instruction.index("按 plan 顺序反复取最前两个 pending slices")
+    launch_position = instruction.index("按 plan 启动 fresh `risk-explorer`")
     assert gate_position < launch_position
-    assert "risk_sweep_plan_validation.json" in instruction
-    assert "passed=true" in instruction[gate_position:launch_position]
+    assert "通过后" in instruction[gate_position:launch_position]
+    assert "切片按真实耦合 component" in instruction[:launch_position]
+    assert "不得重叠" in instruction[:launch_position]
 
 
 def test_prepare_resumes_same_session_without_erasing_handoffs(workspace):
@@ -1674,6 +2160,26 @@ def test_prepare_resume_rejects_original_mutation_without_rebaselining(workspace
     assert proc.returncode == 2
     assert manifest_path.read_bytes() == manifest_before
     assert (review_code / "service.py").read_bytes() == review_before
+
+
+def test_prepare_resume_refuses_to_recreate_deleted_supplement_history(workspace):
+    state = workspace["state"]
+    assert isinstance(state, Path)
+    history = state / "coverage_supplement_history.json"
+    history.unlink()
+
+    proc = run_runner(
+        "prepare", workspace["code"], workspace["design"],
+        workspace["result"], workspace["logs"], check=False,
+    )
+
+    assert proc.returncode == 1
+    assert not history.exists()
+    prepared = ac.load_json(workspace["logs"] / "trace" / "session_prepared.json")
+    assert any(
+        "refusing to reset the one-supplement ledger" in problem
+        for problem in prepared["problems"]
+    )
 
 
 def test_prepare_resume_rejects_snapshot_mutation_without_repairing_it(workspace):
@@ -1726,7 +2232,7 @@ def test_validator_re_reads_cited_source_and_rejects_fabricated_quote(workspace)
 @pytest.mark.parametrize(
     ("ledger_name", "expected_error"),
     (
-        ("critic_reviews.jsonl", "reviewable findings lack critic handoffs"),
+        ("critic_reviews.jsonl", "findings lack critic handoffs"),
         ("agent_review_verdicts.jsonl", "findings lack final-judge verdicts"),
     ),
 )
@@ -1805,6 +2311,32 @@ def test_validator_requires_judge_to_copy_investigator_evidence_exactly(workspac
     assert any("code_evidence must exactly match" in error for error in trace["errors"])
 
 
+def test_validator_rejects_critic_bound_to_an_older_finding_snapshot(workspace):
+    populate_handoffs(workspace, count=1)
+    state = workspace["state"]
+    assert isinstance(state, Path)
+    findings, errors = ac.load_jsonl(state / "investigation_findings.jsonl")
+    assert errors == []
+    findings[0]["supporting_evidence"].append(
+        "A newly discovered caller changes the evidence snapshot."
+    )
+    (state / "investigation_findings.jsonl").write_text(
+        json.dumps(findings[0]) + "\n", encoding="utf-8",
+    )
+
+    proc = run_runner(
+        "review", workspace["code"], workspace["design"],
+        workspace["result"], workspace["logs"], check=False,
+    )
+
+    assert proc.returncode == 1
+    trace = ac.load_json(workspace["logs"] / "trace" / "evidence_validation.json")
+    assert any(
+        "critic (FINDING-TASK-001): input_digests do not match current"
+        in error for error in trace["errors"]
+    )
+
+
 def test_full_handoff_review_report_and_gate(workspace):
     populate_handoffs(workspace)
     run_runner("review", workspace["code"], workspace["design"], workspace["result"], workspace["logs"])
@@ -1819,6 +2351,27 @@ def test_full_handoff_review_report_and_gate(workspace):
     assert all(issue["agent_review"]["critic_review"]["decision"] == "confirm_contradiction" for issue in result["issues"])
     assert gate["passed"] is True
     assert gate["checks"]["handoff_chain_complete"] is True
+
+
+def test_competition_review_then_finalize_path_uses_current_traces(workspace):
+    populate_handoffs(workspace)
+    run_runner(
+        "review", workspace["code"], workspace["design"],
+        workspace["result"], workspace["logs"],
+    )
+
+    proc = run_runner(
+        "finalize", workspace["code"], workspace["design"],
+        workspace["result"], workspace["logs"],
+    )
+
+    assert proc.returncode == 0
+    assert "design_artifact_validator.py" not in proc.stdout
+    assert "stage_artifact_validator.py" not in proc.stdout
+    assert "verdict_validator.py" not in proc.stdout
+    assert ac.load_json(Path(workspace["logs"]) / "trace" / "final_gate.json")[
+        "passed"
+    ] is True
 
 
 def test_gate_rejects_risk_merge_report_bound_to_stale_plan(workspace):
@@ -1861,16 +2414,27 @@ def test_coverage_passed_is_not_closed_while_next_round_tasks_exist(workspace):
     state = workspace["state"]
     assert isinstance(state, Path)
     contract = ac.load_json(state / "agent_loop_contract.json")
+    claims, _ = ac.load_jsonl(state / "design_claims.jsonl")
     coverage = ac.load_json(state / "coverage_audit.json")
+    coverage["remaining_gaps"] = [{
+        "gap_id": "GAP-SUPPLEMENT-001",
+        "kind": "frontier_claim",
+        "ref_id": "CLAIM-001",
+        "reason": "An alternate reachable path has not been tested.",
+        "evidence": "The current finding covers only the primary entry path.",
+    }]
     coverage["next_round_tasks"] = [{
         "claim_id": "CLAIM-001",
-        "question": "Recheck the claim through a different evidence path.",
+        "claim_branch": "CLAIM-001: alternate reachable evidence path",
+        "hypothesis": "Does an independent entry path enforce the same obligation?",
+        "obligation_sha256": stage_artifact_validator.claim_obligation_sha256(claims[0]),
         "exploration_mode": "design-to-code obligation tracing",
         "review_lenses": [contract["coverage_contract"]["portfolio_lenses"][0]],
         "architecture_boundaries": ["BOUNDARY-API"],
         "implementation_planes": ["PLANE-SERVICE"],
         "parallel_path_ids": [],
         "risk_observation_ids": [],
+        "source_gap_ids": ["GAP-SUPPLEMENT-001"],
         "priority_reason": "The coverage critic identified a concrete alternate-path gap.",
     }]
     ac.save_json(state / "coverage_audit.json", coverage)
@@ -1881,6 +2445,7 @@ def test_coverage_passed_is_not_closed_while_next_round_tasks_exist(workspace):
     trace = ac.load_json(Path(workspace["logs"]) / "trace" / "coverage_validation.json")
     assert trace["passed"] is True
     assert trace["closed"] is False
+    assert trace["metrics"]["supplement_rounds"] == 0
     report = run_runner(
         "report", Path(workspace["code"]), Path(workspace["design"]),
         Path(workspace["result"]), Path(workspace["logs"]), check=False,
@@ -1888,20 +2453,24 @@ def test_coverage_passed_is_not_closed_while_next_round_tasks_exist(workspace):
     assert report.returncode != 0
 
 
-def test_unselected_high_claim_remains_design_index_not_mandatory_frontier(workspace):
+def test_unselected_on_demand_claim_does_not_invalidate_scoped_reviews(workspace):
     populate_handoffs(workspace)
     state = workspace["state"]
     assert isinstance(state, Path)
-    append(state / "design_claims.jsonl", {
+    review_path = state / "design_claim_review.json"
+    review_before = review_path.read_bytes()
+    on_demand_claim = design_source_materializer.materialize_claims([{
         "claim_id": "CLAIM-INDEX-ONLY",
         "session_id": workspace["session_id"],
-        "document": "Service contract",
-        "path": "contract.md",
-        "section": "Service contract",
-        "line_start": 3,
-        "line_end": 3,
-        "quote": "The service must reject negative amounts.",
-        "behavior": "Negative amounts are rejected.",
+        "source_ref": {
+            "path": "contract.md", "line_start": 3, "line_end": 3,
+        },
+        "document_key": "contract",
+        "subject": "A secondary service entry point",
+        "trigger": "A caller supplies an amount covered by the service contract.",
+        "obligation": "The service must reject negative amounts.",
+        "exceptions": [],
+        "observable_result": "The negative request is rejected.",
         "behavior_family": "externally visible service contract",
         "normative_strength": "mandatory",
         "applicability": "service implementation",
@@ -1914,33 +2483,51 @@ def test_unselected_high_claim_remains_design_index_not_mandatory_frontier(works
             "expected_observation": "The request is rejected.",
             "non_testable_reason": "",
         },
-    })
+    }], Path(workspace["design"]))[0]
+    append(state / "design_claims.jsonl", on_demand_claim)
     design_coverage = ac.load_json(state / "design_coverage.json")
     design_coverage["document_groups"][0]["claim_ids"].append("CLAIM-INDEX-ONLY")
     ac.save_json(state / "design_coverage.json", design_coverage)
-    scope = ac.load_json(state / "claim_review_scope.json")
-    scope["design_claims_sha256"] = ac.sha256_file(state / "design_claims.jsonl")
-    ac.save_json(state / "claim_review_scope.json", scope)
-    review = ac.load_json(state / "design_claim_review.json")
-    review["input_digests"] = {
-        "design_claims.jsonl": ac.sha256_file(state / "design_claims.jsonl"),
-        "design_coverage.json": ac.sha256_file(state / "design_coverage.json"),
-        "design_agent_manifest.json": ac.sha256_file(state / "design_agent_manifest.json"),
-        "claim_review_scope.json": ac.sha256_file(state / "claim_review_scope.json"),
-    }
-    ac.save_json(state / "design_claim_review.json", review)
     coverage = ac.load_json(state / "coverage_audit.json")
     coverage["claims_total"] = 5
     ac.save_json(state / "coverage_audit.json", coverage)
-    for command in ("design-check", "claim-check", "task-check", "coverage-check"):
+    for command in ("design-check", "claim-check", "task-check"):
         run_runner(
             command, Path(workspace["code"]), Path(workspace["design"]),
             Path(workspace["result"]), Path(workspace["logs"]),
         )
+    missing_gap = run_runner(
+        "coverage-check", Path(workspace["code"]), Path(workspace["design"]),
+        Path(workspace["result"]), Path(workspace["logs"]), check=False,
+    )
+    assert missing_gap.returncode == 1
+    missing_trace = ac.load_json(Path(workspace["logs"]) / "trace" / "coverage_validation.json")
+    assert any(
+        "materialized claims outside the current accepted scope" in error
+        for error in missing_trace["errors"]
+    )
+    coverage["remaining_gaps"] = [{
+        "gap_id": "GAP-UNSELECTED-CLAIM",
+        "kind": "frontier_claim",
+        "ref_id": "CLAIM-INDEX-ONLY",
+        "reason": "The materialized obligation was not selected into the bounded frontier.",
+        "evidence": "No accepted review/task currently binds this claim.",
+    }]
+    ac.save_json(state / "coverage_audit.json", coverage)
+    run_runner(
+        "coverage-check", Path(workspace["code"]), Path(workspace["design"]),
+        Path(workspace["result"]), Path(workspace["logs"]),
+    )
     trace = ac.load_json(Path(workspace["logs"]) / "trace" / "coverage_validation.json")
     assert trace["passed"] is True
     assert trace["closed"] is True
     assert trace["metrics"]["scoped_claims"] == 4
+    assert trace["metrics"]["claims"] == 5
+    claim_trace = ac.load_json(Path(workspace["logs"]) / "trace" / "claim_review_validation.json")
+    assert claim_trace["accepted_claim_ids"] == [
+        "CLAIM-001", "CLAIM-002", "CLAIM-003", "CLAIM-004",
+    ]
+    assert review_path.read_bytes() == review_before
 
 
 def test_complete_session_gate_can_be_replayed_in_isolation(workspace, tmp_path):
@@ -1961,6 +2548,64 @@ def test_complete_session_gate_can_be_replayed_in_isolation(workspace, tmp_path)
     ] == 0
 
 
+def test_materialized_catalog_gate_replay_copies_and_protects_source(workspace, tmp_path):
+    materialized = prepare_materialized_workspace(workspace, tmp_path)
+    populate_handoffs(materialized)
+    run_runner(
+        "review", materialized["code"], materialized["design"],
+        materialized["result"], materialized["logs"],
+    )
+    run_runner(
+        "report", materialized["code"], materialized["design"],
+        materialized["result"], materialized["logs"],
+    )
+    run_runner(
+        "gate", materialized["code"], materialized["design"],
+        materialized["result"], materialized["logs"],
+    )
+    replay = tmp_path / "materialized-gate-replay"
+    stage_replay.prepare_replay(
+        source_state=Path(materialized["state"]), replay_root=replay,
+        stage="gate", run_local=True,
+    )
+    replay_manifest = ac.load_json(replay / "state" / "workspace_manifest.json")
+    replay_source = Path(
+        replay_manifest["design"]["materialization_source"]["source_root"]
+    )
+    replay_plan = Path(
+        replay_manifest["design"]["materialization_source"]["plan_path"]
+    )
+    assert replay_source.is_relative_to(replay / "state" / "materialization-inputs")
+    assert replay_plan == replay / "state" / "design_source_plan.json"
+    assert (replay_source / "catalog.list").is_file()
+
+    original_source = Path(materialized["source"])
+    (original_source / "catalog.list").write_text(
+        "Original source changed after replay preparation.\n", encoding="utf-8",
+    )
+    assert stage_replay.run_local(replay) == 0
+    assert ac.load_json(replay / "logs" / "trace" / "final_gate.json")[
+        "passed"
+    ] is True
+
+
+def test_gate_replay_force_cannot_delete_materialization_source(workspace, tmp_path):
+    materialized = prepare_materialized_workspace(workspace, tmp_path)
+    source = Path(materialized["source"])
+    replay = source / "unsafe-replay-root"
+    replay.mkdir()
+    marker = replay / "keep.txt"
+    marker.write_text("must survive\n", encoding="utf-8")
+
+    with pytest.raises(stage_replay.ReplayError, match="protected source/session root"):
+        stage_replay.prepare_replay(
+            source_state=Path(materialized["state"]), replay_root=replay,
+            stage="gate", force=True,
+        )
+
+    assert marker.read_text(encoding="utf-8") == "must survive\n"
+
+
 def test_complete_coverage_stage_can_be_replayed_in_isolation(workspace, tmp_path):
     populate_handoffs(workspace)
     replay = tmp_path / "coverage-replay"
@@ -1974,6 +2619,46 @@ def test_complete_coverage_stage_can_be_replayed_in_isolation(workspace, tmp_pat
         "passed"
     ] is True
     assert ac.load_json(replay / "logs" / "trace" / "coverage_validation.json")[
+        "passed"
+    ] is True
+
+
+def test_dynamic_probe_session_can_replay_coverage_and_gate(workspace, tmp_path):
+    populate_handoffs(workspace)
+    attach_dynamic_probe(workspace)
+    run_runner(
+        "review", workspace["code"], workspace["design"],
+        workspace["result"], workspace["logs"],
+    )
+    run_runner(
+        "report", workspace["code"], workspace["design"],
+        workspace["result"], workspace["logs"],
+    )
+    run_runner(
+        "gate", workspace["code"], workspace["design"],
+        workspace["result"], workspace["logs"],
+    )
+
+    coverage_replay = tmp_path / "dynamic-coverage-replay"
+    stage_replay.prepare_replay(
+        source_state=Path(workspace["state"]), replay_root=coverage_replay,
+        stage="coverage", run_local=True,
+    )
+    replay_probe = ac.load_jsonl(
+        coverage_replay / "state" / "dynamic_probes.jsonl"
+    )[0][0]
+    probe_workspace = Path(replay_probe["isolation"]["workspace"])
+    assert probe_workspace.is_relative_to(coverage_replay / "state" / "probes")
+    assert (probe_workspace / "service.py").is_file()
+    assert stage_replay.run_local(coverage_replay) == 0
+
+    gate_replay = tmp_path / "dynamic-gate-replay"
+    stage_replay.prepare_replay(
+        source_state=Path(workspace["state"]), replay_root=gate_replay,
+        stage="gate", run_local=True,
+    )
+    assert stage_replay.run_local(gate_replay) == 0
+    assert ac.load_json(gate_replay / "logs" / "trace" / "final_gate.json")[
         "passed"
     ] is True
 
@@ -2109,6 +2794,10 @@ def test_parallel_path_can_be_covered_by_linked_split_plane_tasks(workspace):
     report_path = Path(workspace["logs"]) / "trace" / "task-handoff-merge.json"
     report = ac.load_json(report_path)
     report["ledger_sha256"] = ac.sha256_file(state / "investigation_tasks.jsonl")
+    current_task_plan_sha256 = handoff_merge.task_plan_ledger_sha256(
+        {task["task_id"]: task for task in tasks}
+    )
+    report["task_plan_ledger_sha256"] = current_task_plan_sha256
     ac.save_json(report_path, report)
     ac.append_jsonl(state / "agent_run_ledger.jsonl", {
         "recorded_at": ac.now_iso(), "session_id": workspace["session_id"],
@@ -2117,6 +2806,7 @@ def test_parallel_path_can_be_covered_by_linked_split_plane_tasks(workspace):
         "validated_ids": [task["task_id"] for task in tasks], "report": str(report_path),
         "report_sha256": ac.sha256_file(report_path),
         "ledger_sha256": ac.sha256_file(state / "investigation_tasks.jsonl"),
+        "task_plan_ledger_sha256": current_task_plan_sha256,
     })
     risk_report_path = Path(workspace["logs"]) / "trace" / "risk-handoff-merge.json"
     risk_report = ac.load_json(risk_report_path)
@@ -2169,11 +2859,27 @@ def test_gate_counts_only_unique_findings_and_binds_published_results(workspace)
     gate = ac.load_json(Path(workspace["logs"]) / "trace" / "final_gate.json")
     assert gate["metrics"]["confirmed"] == 3
     assert any("duplicate finding_id" in error for error in gate["errors"])
-    assert any("only 3 unique validated confirmed" in error for error in gate["errors"])
+
+
+def test_gate_accepts_fewer_than_four_validated_issues_for_a_generic_project(workspace):
+    populate_handoffs(workspace, count=3)
+    run_runner("review", workspace["code"], workspace["design"], workspace["result"], workspace["logs"])
+    run_runner("report", workspace["code"], workspace["design"], workspace["result"], workspace["logs"])
+
+    proc = run_runner(
+        "gate", workspace["code"], workspace["design"], workspace["result"], workspace["logs"], check=False
+    )
+
+    assert proc.returncode == 0
+    gate = ac.load_json(Path(workspace["logs"]) / "trace" / "final_gate.json")
+    assert gate["passed"] is True
+    assert gate["metrics"]["confirmed"] == 3
 
 
 def test_gate_requires_recorded_handoff_merge_lifecycle(workspace):
     populate_handoffs(workspace)
+    run_runner("review", workspace["code"], workspace["design"], workspace["result"], workspace["logs"])
+    run_runner("report", workspace["code"], workspace["design"], workspace["result"], workspace["logs"])
     state = workspace["state"]
     assert isinstance(state, Path)
     ledger, _ = ac.load_jsonl(state / "agent_run_ledger.jsonl")
@@ -2181,8 +2887,6 @@ def test_gate_requires_recorded_handoff_merge_lifecycle(workspace):
     (state / "agent_run_ledger.jsonl").write_text(
         "\n".join(json.dumps(item) for item in ledger) + "\n", encoding="utf-8"
     )
-    run_runner("review", workspace["code"], workspace["design"], workspace["result"], workspace["logs"])
-    run_runner("report", workspace["code"], workspace["design"], workspace["result"], workspace["logs"])
     proc = run_runner(
         "gate", workspace["code"], workspace["design"], workspace["result"], workspace["logs"], check=False
     )
@@ -2190,6 +2894,149 @@ def test_gate_requires_recorded_handoff_merge_lifecycle(workspace):
     gate = ac.load_json(Path(workspace["logs"]) / "trace" / "final_gate.json")
     assert any("digest-bound finding handoff merge event" in error for error in gate["errors"])
     assert any("digest-bound critic handoff merge event" in error for error in gate["errors"])
+    assert any("digest-bound task handoff merge event" in error for error in gate["errors"])
+
+
+def test_gate_requires_rich_checkpoint_for_each_semantic_phase(workspace):
+    populate_handoffs(workspace)
+    state = workspace["state"]
+    assert isinstance(state, Path)
+    ledger, errors = ac.load_jsonl(state / "agent_run_ledger.jsonl")
+    assert errors == []
+    ledger = [
+        event for event in ledger
+        if not (
+            event.get("phase") == "final_judgement"
+            and event.get("role") == "final-judge"
+        )
+    ]
+    (state / "agent_run_ledger.jsonl").write_text(
+        "".join(json.dumps(event) + "\n" for event in ledger), encoding="utf-8",
+    )
+    run_runner("review", workspace["code"], workspace["design"], workspace["result"], workspace["logs"])
+    run_runner("report", workspace["code"], workspace["design"], workspace["result"], workspace["logs"])
+
+    proc = run_runner(
+        "gate", workspace["code"], workspace["design"],
+        workspace["result"], workspace["logs"], check=False,
+    )
+
+    assert proc.returncode == 1
+    gate = ac.load_json(workspace["logs"] / "trace" / "final_gate.json")
+    assert gate["checks"]["rich_trace_complete"] is False
+    assert any(
+        "final_judgement/final-judge" in error for error in gate["errors"]
+    )
+
+
+def test_gate_rejects_reused_provider_session_across_fresh_semantic_phases(workspace):
+    populate_handoffs(workspace)
+    state = Path(workspace["state"])
+    ledger, errors = ac.load_jsonl(state / "agent_run_ledger.jsonl")
+    assert errors == []
+    inventory_session = next(
+        event["provider_session_id"] for event in ledger
+        if event.get("phase") == "design_inventory"
+    )
+    for event in ledger:
+        if event.get("phase") == "design_claim_resolution":
+            event["provider_session_id"] = inventory_session
+    (state / "agent_run_ledger.jsonl").write_text(
+        "".join(json.dumps(event) + "\n" for event in ledger), encoding="utf-8",
+    )
+    run_runner("review", workspace["code"], workspace["design"], workspace["result"], workspace["logs"])
+    run_runner("report", workspace["code"], workspace["design"], workspace["result"], workspace["logs"])
+
+    proc = run_runner(
+        "gate", workspace["code"], workspace["design"],
+        workspace["result"], workspace["logs"], check=False,
+    )
+
+    assert proc.returncode == 1
+    gate = ac.load_json(Path(workspace["logs"]) / "trace" / "final_gate.json")
+    assert any("fresh semantic tasks reuse provider session" in error for error in gate["errors"])
+
+
+def test_gate_rejects_third_identical_no_progress_checkpoint(workspace):
+    populate_handoffs(workspace)
+    state = Path(workspace["state"])
+    ledger, errors = ac.load_jsonl(state / "agent_run_ledger.jsonl")
+    assert errors == []
+    checkpoint = next(
+        event for event in ledger if event.get("phase") == "design_inventory"
+    )
+    second = dict(checkpoint, outcome="same_inputs_different_wording")
+    third = dict(checkpoint, outcome="another_outcome_wording_only")
+    ac.append_jsonl(state / "agent_run_ledger.jsonl", second)
+    ac.append_jsonl(state / "agent_run_ledger.jsonl", third)
+    run_runner("review", workspace["code"], workspace["design"], workspace["result"], workspace["logs"])
+    run_runner("report", workspace["code"], workspace["design"], workspace["result"], workspace["logs"])
+
+    proc = run_runner(
+        "gate", workspace["code"], workspace["design"],
+        workspace["result"], workspace["logs"], check=False,
+    )
+
+    assert proc.returncode == 1
+    gate = ac.load_json(Path(workspace["logs"]) / "trace" / "final_gate.json")
+    assert any("repeated a third time without progress" in error for error in gate["errors"])
+
+
+def test_gate_rejects_provider_session_reuse_between_candidates(workspace):
+    populate_handoffs(workspace)
+    state = Path(workspace["state"])
+    ledger, errors = ac.load_jsonl(state / "agent_run_ledger.jsonl")
+    assert errors == []
+    first_provider = next(
+        event["provider_session_id"] for event in ledger
+        if event.get("phase") == "investigation" and event.get("task_id") == "TASK-001"
+    )
+    for event in ledger:
+        if event.get("phase") == "investigation" and event.get("task_id") == "TASK-002":
+            event["provider_session_id"] = first_provider
+    (state / "agent_run_ledger.jsonl").write_text(
+        "".join(json.dumps(event) + "\n" for event in ledger), encoding="utf-8",
+    )
+    run_runner("review", workspace["code"], workspace["design"], workspace["result"], workspace["logs"])
+    run_runner("report", workspace["code"], workspace["design"], workspace["result"], workspace["logs"])
+
+    proc = run_runner(
+        "gate", workspace["code"], workspace["design"],
+        workspace["result"], workspace["logs"], check=False,
+    )
+
+    assert proc.returncode == 1
+    gate = ac.load_json(Path(workspace["logs"]) / "trace" / "final_gate.json")
+    assert any("fresh semantic tasks reuse provider session" in error for error in gate["errors"])
+
+
+def test_gate_rejects_task_plan_edited_after_handoff_merge(workspace):
+    populate_handoffs(workspace)
+    state = workspace["state"]
+    assert isinstance(state, Path)
+    tasks, errors = ac.load_jsonl(state / "investigation_tasks.jsonl")
+    assert errors == []
+    tasks[0]["starting_points"].append("A directly edited unmerged plan entry.")
+    (state / "investigation_tasks.jsonl").write_text(
+        "".join(json.dumps(task) + "\n" for task in tasks), encoding="utf-8",
+    )
+    for command in ("task-check", "coverage-check", "review", "report"):
+        run_runner(
+            command, workspace["code"], workspace["design"],
+            workspace["result"], workspace["logs"],
+        )
+
+    proc = run_runner(
+        "gate", workspace["code"], workspace["design"],
+        workspace["result"], workspace["logs"], check=False,
+    )
+
+    assert proc.returncode == 1
+    gate = ac.load_json(workspace["logs"] / "trace" / "final_gate.json")
+    assert any(
+        "task handoff merge trace does not validate the current ledger" in error
+        for error in gate["errors"]
+    )
 
 
 def test_design_grounded_dynamic_probe_survives_review_report_and_gate(workspace):
@@ -2228,6 +3075,7 @@ def test_validator_forces_environment_failure_to_inconclusive(workspace):
         baseline_status="failed",
         execution_status="environment_failed",
         target_reached=False,
+        validate_coverage=False,
     )
     proc = run_runner(
         "review", workspace["code"], workspace["design"], workspace["result"], workspace["logs"], check=False
@@ -2237,63 +3085,116 @@ def test_validator_forces_environment_failure_to_inconclusive(workspace):
     assert any("environment/baseline/reachability limitations must be inconclusive" in error for error in trace["errors"])
 
 
-def test_gate_rejects_unaccounted_design_groups(workspace):
+def test_inventory_obligation_can_remain_unmaterialized_when_gap_recorded(workspace):
     populate_handoffs(workspace)
     state = workspace["state"]
     assert isinstance(state, Path)
-    ac.save_json(state / "design_coverage.json", {
-        "session_id": workspace["session_id"], "document_groups": [],
+    inventory = design_source_materializer.materialize_inventory({
+        "session_id": workspace["session_id"],
+        "document_groups": [{
+            "document_key": "contract",
+            "members": ["contract.md"],
+            "scope_relation": "required",
+            "scope_evidence": {
+                "source_ref": {"path": "contract.md", "line_start": 1, "line_end": 3},
+            },
+            "sections": [
+                {
+                    "section_id": "SECTION-CONTRACT",
+                    "source_ref": {"path": "contract.md", "line_start": 1, "line_end": 6},
+                    "behavior_families": ["externally visible service contract"],
+                    "ambiguities": [],
+                },
+                {
+                    "section_id": "SECTION-NOT-MATERIALIZED",
+                    "source_ref": {"path": "contract.md", "line_start": 2, "line_end": 2},
+                    "behavior_families": ["session lifecycle"],
+                    "ambiguities": ["This obligation was not selected for the current frontier."],
+                },
+            ],
+        }],
+    }, Path(workspace["design"]))
+    ac.save_json(state / "design_inventory.json", inventory)
+    review = ac.load_json(state / "design_claim_review.json")
+    review["group_reviews"][0]["group_sha256"] = inventory["document_groups"][0]["group_sha256"]
+    ac.save_json(state / "design_claim_review.json", review)
+    for command in ("design-check", "claim-check", "task-check"):
+        run_runner(
+            command, Path(workspace["code"]), Path(workspace["design"]),
+            Path(workspace["result"]), Path(workspace["logs"]),
+        )
+    missing_gap = run_runner(
+        "coverage-check", Path(workspace["code"]), Path(workspace["design"]),
+        Path(workspace["result"]), Path(workspace["logs"]), check=False,
+    )
+    assert missing_gap.returncode == 1
+    missing_trace = ac.load_json(
+        Path(workspace["logs"]) / "trace" / "coverage_validation.json"
+    )
+    assert any(
+        "SECTION-NOT-MATERIALIZED" in error
+        and "neither a materialized claim nor an inventory gap" in error
+        for error in missing_trace["errors"]
+    )
+    coverage = ac.load_json(state / "coverage_audit.json")
+    coverage["remaining_gaps"] = [{
+        "gap_id": "GAP-INVENTORY-001",
+        "kind": "inventory",
+        "ref_id": "SECTION-NOT-MATERIALIZED",
+        "reason": "The bounded evidence-pair frontier did not materialize this section.",
+        "evidence": "design_inventory.json retains the section and its exact source reference.",
+    }]
+    ac.save_json(state / "coverage_audit.json", coverage)
+
+    run_runner(
+        "coverage-check", Path(workspace["code"]), Path(workspace["design"]),
+        Path(workspace["result"]), Path(workspace["logs"]),
+    )
+    trace = ac.load_json(Path(workspace["logs"]) / "trace" / "coverage_validation.json")
+    assert trace["passed"] is True
+    assert trace["closed"] is True
+    assert trace["metrics"]["claims"] == 4
+    assert trace["metrics"]["remaining_gaps"] == 1
+
+
+def test_gap_recorded_lens_requires_matching_gap_evidence(workspace):
+    populate_handoffs(workspace)
+    state = workspace["state"]
+    assert isinstance(state, Path)
+    semantic = ac.load_json(state / "semantic_coverage.json")
+    lens = semantic["lenses"][0]
+    lens.update({
+        "disposition": "gap_recorded",
+        "evidence": "The coverage critic identified this unexamined semantic dimension.",
+        "task_ids": [],
+        "finding_ids": [],
+        "counterfactual": "If this lens applied, a focused task would be required.",
     })
-    proc = run_runner("review", workspace["code"], workspace["design"], workspace["result"], workspace["logs"], check=False)
-    assert proc.returncode == 1
-    trace = ac.load_json(workspace["logs"] / "trace" / "design_validation.json")
-    assert trace["passed"] is False
-    assert any("design coverage missing document groups" in error for error in trace["errors"])
-
-
-def test_gate_rejects_behavior_family_without_a_claim(workspace):
-    populate_handoffs(workspace)
-    state = workspace["state"]
-    assert isinstance(state, Path)
-    coverage = ac.load_json(state / "design_coverage.json")
-    coverage["document_groups"][0]["behavior_families"].append("unrepresented behavior family")
-    ac.save_json(state / "design_coverage.json", coverage)
+    ac.save_json(state / "semantic_coverage.json", semantic)
     proc = run_runner(
-        "review", workspace["code"], workspace["design"],
+        "coverage-check", workspace["code"], workspace["design"],
         workspace["result"], workspace["logs"], check=False,
     )
     assert proc.returncode == 1
-    validation = ac.load_json(workspace["logs"] / "trace" / "design_validation.json")
+    validation = ac.load_json(workspace["logs"] / "trace" / "coverage_validation.json")
     assert validation["passed"] is False
-    assert any("behavior families lack" in error for error in validation["errors"])
+    assert any("gap_recorded lacks remaining_gaps entry" in error for error in validation["errors"])
 
 
-def test_gate_rejects_one_finding_claiming_every_review_lens(workspace):
+def test_coverage_rejects_second_supplement_round(workspace):
     populate_handoffs(workspace)
     state = workspace["state"]
     assert isinstance(state, Path)
-    contract = ac.load_json(state / "agent_loop_contract.json")
-    lenses = contract["coverage_contract"]["portfolio_lenses"]
-    tasks, _ = ac.load_jsonl(state / "investigation_tasks.jsonl")
-    findings, _ = ac.load_jsonl(state / "investigation_findings.jsonl")
-    tasks[0]["review_lenses"] = lenses
-    findings[0]["review_lenses"] = lenses
-    (state / "investigation_tasks.jsonl").write_text(
-        "\n".join(json.dumps(item) for item in tasks) + "\n", encoding="utf-8"
+    coverage = ac.load_json(state / "coverage_audit.json")
+    coverage["supplement_rounds"] = 2
+    ac.save_json(state / "coverage_audit.json", coverage)
+    proc = run_runner(
+        "coverage-check", workspace["code"], workspace["design"],
+        workspace["result"], workspace["logs"], check=False,
     )
-    (state / "investigation_findings.jsonl").write_text(
-        "\n".join(json.dumps(item) for item in findings) + "\n", encoding="utf-8"
-    )
-    run_runner("review", workspace["code"], workspace["design"], workspace["result"], workspace["logs"])
-    report = run_runner(
-        "report", workspace["code"], workspace["design"], workspace["result"],
-        workspace["logs"], check=False,
-    )
-    assert report.returncode != 0
-    proc = run_runner("gate", workspace["code"], workspace["design"], workspace["result"], workspace["logs"], check=False)
     assert proc.returncode == 1
-    gate = ac.load_json(workspace["logs"] / "trace" / "final_gate.json")
-    assert any("focused to at most three" in error for error in gate["errors"])
+    trace = ac.load_json(workspace["logs"] / "trace" / "coverage_validation.json")
+    assert any("supplement_rounds must be 0 or 1" in error for error in trace["errors"])
 
 
 def test_gate_rejects_semantic_lens_refs_unrelated_to_task_and_finding(workspace):
@@ -2353,16 +3254,18 @@ def test_gate_rejects_actionable_uninvestigated_scoped_claim(workspace):
     populate_handoffs(workspace)
     state = workspace["state"]
     assert isinstance(state, Path)
-    append(state / "design_claims.jsonl", {
+    claim = design_source_materializer.materialize_claims([{
         "claim_id": "CLAIM-UNINVESTIGATED",
         "session_id": workspace["session_id"],
-        "document": "Service contract",
-        "path": "contract.md",
-        "section": "Service contract",
-        "line_start": 3,
-        "line_end": 3,
-        "quote": "The service must reject negative amounts.",
-        "behavior": "Negative amounts are rejected.",
+        "source_ref": {
+            "path": "contract.md", "line_start": 3, "line_end": 3,
+        },
+        "document_key": "contract",
+        "subject": "The public service implementation",
+        "trigger": "A caller supplies a negative amount.",
+        "obligation": "The service must reject negative amounts.",
+        "exceptions": [],
+        "observable_result": "The negative request is rejected.",
         "behavior_family": "externally visible service contract",
         "normative_strength": "mandatory",
         "applicability": "service implementation",
@@ -2375,18 +3278,21 @@ def test_gate_rejects_actionable_uninvestigated_scoped_claim(workspace):
             "expected_observation": "The request is rejected.",
             "non_testable_reason": "",
         },
-    })
+    }], Path(workspace["design"]))[0]
+    append(state / "design_claims.jsonl", claim)
     design_coverage = ac.load_json(state / "design_coverage.json")
     design_coverage["document_groups"][0]["claim_ids"].append("CLAIM-UNINVESTIGATED")
     ac.save_json(state / "design_coverage.json", design_coverage)
     scope = ac.load_json(state / "claim_review_scope.json")
     scope["claim_ids"].append("CLAIM-UNINVESTIGATED")
-    scope["design_claims_sha256"] = ac.sha256_file(state / "design_claims.jsonl")
     ac.save_json(state / "claim_review_scope.json", scope)
     claim_review = ac.load_json(state / "design_claim_review.json")
     claim_review["claim_reviews"].append({
         "session_id": workspace["session_id"],
         "claim_id": "CLAIM-UNINVESTIGATED",
+        "claim_sha256": handoff_merge.canonical_digest(claim),
+        "source_sha256": claim["source_ref"]["source_sha256"],
+        "spec_critic_prompt_version": "spec-critic-v2",
         "quote_entailment": {
             "assessment": "entailed", "rationale": "The quoted contract states rejection directly.",
         },
@@ -2395,7 +3301,7 @@ def test_gate_rejects_actionable_uninvestigated_scoped_claim(workspace):
             "recommended_strength": "mandatory", "rationale": "The source uses must.",
         },
         "atomicity": {
-            "assessment": "atomic", "obligations": ["Negative amounts are rejected."],
+            "assessment": "atomic", "obligations": [claim["obligation"]],
             "rationale": "This is one independently observable behavior.",
         },
         "applicability": {
@@ -2406,6 +3312,7 @@ def test_gate_rejects_actionable_uninvestigated_scoped_claim(workspace):
     claim_review["input_digests"] = {
         "design_claims.jsonl": ac.sha256_file(state / "design_claims.jsonl"),
         "design_coverage.json": ac.sha256_file(state / "design_coverage.json"),
+        "design_inventory.json": ac.sha256_file(state / "design_inventory.json"),
         "design_agent_manifest.json": ac.sha256_file(state / "design_agent_manifest.json"),
         "claim_review_scope.json": ac.sha256_file(state / "claim_review_scope.json"),
     }
@@ -2416,16 +3323,26 @@ def test_gate_rejects_actionable_uninvestigated_scoped_claim(workspace):
         "claim_id": "CLAIM-UNINVESTIGATED",
         "reason": "Outside the completed risk-diverse portfolio for this bounded review.",
     }]
+    coverage["remaining_gaps"] = [{
+        "gap_id": "GAP-SUPPLEMENT-UNINVESTIGATED",
+        "kind": "frontier_claim",
+        "ref_id": "CLAIM-UNINVESTIGATED",
+        "reason": "The accepted claim has no completed investigation.",
+        "evidence": "The task/finding ledgers contain no entry for this claim.",
+    }]
     contract = ac.load_json(state / "agent_loop_contract.json")
     coverage["next_round_tasks"] = [{
         "claim_id": "CLAIM-UNINVESTIGATED",
-        "question": "Does the implementation reject negative amounts on its public path?",
+        "claim_branch": "CLAIM-UNINVESTIGATED: public negative-amount branch",
+        "hypothesis": "Does the public path enforce the negative-amount obligation?",
+        "obligation_sha256": stage_artifact_validator.claim_obligation_sha256(claim),
         "exploration_mode": "design-to-code obligation tracing",
         "review_lenses": [contract["coverage_contract"]["portfolio_lenses"][0]],
         "architecture_boundaries": ["BOUNDARY-API"],
         "implementation_planes": ["PLANE-SERVICE"],
         "parallel_path_ids": [],
         "risk_observation_ids": [],
+        "source_gap_ids": ["GAP-SUPPLEMENT-UNINVESTIGATED"],
         "priority_reason": "This high-priority claim has no completed investigation.",
     }]
     ac.save_json(state / "coverage_audit.json", coverage)
@@ -2480,6 +3397,101 @@ def test_gate_rejects_target_code_mutation_after_prepare(workspace):
     gate = ac.load_json(workspace["logs"] / "trace" / "final_gate.json")
     assert gate["checks"]["target_roots_unchanged"] is False
     assert any("target file changed after prepare" in error for error in gate["errors"])
+
+
+def test_gate_rejects_original_catalog_mutation_after_materialization(workspace, tmp_path):
+    materialized = prepare_materialized_workspace(workspace, tmp_path)
+    populate_handoffs(materialized)
+    run_runner(
+        "review", materialized["code"], materialized["design"],
+        materialized["result"], materialized["logs"],
+    )
+    run_runner(
+        "report", materialized["code"], materialized["design"],
+        materialized["result"], materialized["logs"],
+    )
+    source = materialized["source"]
+    assert isinstance(source, Path)
+    (source / "catalog.list").write_text(
+        "The supplied catalog was changed after prepare.\n", encoding="utf-8"
+    )
+    proc = run_runner(
+        "gate", materialized["code"], materialized["design"],
+        materialized["result"], materialized["logs"], check=False,
+    )
+    assert proc.returncode == 1
+    gate = ac.load_json(materialized["logs"] / "trace" / "final_gate.json")
+    assert gate["checks"]["supplied_design_source_unchanged"] is False
+    assert gate["checks"]["target_roots_unchanged"] is False
+    assert any(
+        "supplied design source file changed after prepare: catalog.list" in error
+        for error in gate["errors"]
+    )
+
+
+def test_catalog_source_integrity_includes_normally_ignored_directories(workspace, tmp_path):
+    source = Path(workspace["design"])
+    hidden = source / ".cache-supplied-design" / "nested.txt"
+    hidden.parent.mkdir()
+    hidden.write_text("Frozen supplied context.\n", encoding="utf-8")
+    materialized = prepare_materialized_workspace(workspace, tmp_path)
+    snapshot = ac.load_json(
+        Path(materialized["state"]) / "workspace_manifest.json"
+    )["design"]["materialization_source"]
+    assert ".cache-supplied-design/nested.txt" in {
+        record["path"] for record in snapshot["files"]
+    }
+    populate_handoffs(materialized)
+    run_runner(
+        "review", materialized["code"], materialized["design"],
+        materialized["result"], materialized["logs"],
+    )
+    run_runner(
+        "report", materialized["code"], materialized["design"],
+        materialized["result"], materialized["logs"],
+    )
+    hidden.write_text("Changed after prepare.\n", encoding="utf-8")
+
+    proc = run_runner(
+        "gate", materialized["code"], materialized["design"],
+        materialized["result"], materialized["logs"], check=False,
+    )
+
+    assert proc.returncode == 1
+    gate = ac.load_json(Path(materialized["logs"]) / "trace" / "final_gate.json")
+    assert any(
+        "supplied design source file changed after prepare: "
+        ".cache-supplied-design/nested.txt" in error
+        for error in gate["errors"]
+    )
+
+
+def test_gate_rejects_materialization_plan_mutation_after_prepare(workspace, tmp_path):
+    materialized = prepare_materialized_workspace(workspace, tmp_path)
+    populate_handoffs(materialized)
+    run_runner(
+        "review", materialized["code"], materialized["design"],
+        materialized["result"], materialized["logs"],
+    )
+    run_runner(
+        "report", materialized["code"], materialized["design"],
+        materialized["result"], materialized["logs"],
+    )
+    plan = materialized["state"] / "design_source_plan.json"
+    plan.write_text('{"catalog_path":"changed-after-prepare"}\n', encoding="utf-8")
+
+    proc = run_runner(
+        "gate", materialized["code"], materialized["design"],
+        materialized["result"], materialized["logs"], check=False,
+    )
+
+    assert proc.returncode == 1
+    gate = ac.load_json(materialized["logs"] / "trace" / "final_gate.json")
+    assert gate["checks"]["supplied_design_source_unchanged"] is False
+    assert any(
+        "design materialization plan changed after prepare" in error
+        for error in gate["errors"]
+    )
 
 
 def test_gate_rejects_review_snapshot_mutation(workspace):
@@ -2603,5 +3615,6 @@ def test_core_pipeline_has_no_project_specific_detection_path():
 def test_submission_does_not_bundle_opencode_runtime_configuration():
     assert not (ROOT / "opencode.json").exists()
     instruction = (ROOT / "INSTRUCTION.md").read_text(encoding="utf-8")
-    assert "不要询问用户" in instruction
-    assert "不要修改目标代码或设计文档" in instruction
+    assert "不得询问用户" in instruction
+    assert "等待人工审批" in instruction
+    assert "修改目标代码与设计资料" in instruction

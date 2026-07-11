@@ -214,7 +214,11 @@ def test_risk_check_accepts_multi_observation_slice_and_checks_each_context(
     result = ac.load_json(report)
     assert result["passed"] is True
     assert result["validated_ids"] == ["RISK-1", "RISK-2"]
+    assert result["submitted_sweep_ids"] == ["SWEEP-CONTROL"]
     assert result["validated_sweep_ids"] == ["SWEEP-CONTROL"]
+    assert result["completed_sweep_ids"] == []
+    assert result["missing_sweep_ids"] == sorted(SWEEP_IDS)
+    assert result["closed"] is False
     assert calls == ["RISK-1", "RISK-2"]
 
 
@@ -272,12 +276,42 @@ def test_risk_merge_requires_and_records_both_planned_sweeps(
     assert return_code == 0
     result = ac.load_json(report)
     assert result["passed"] is True
+    assert result["submitted_sweep_ids"] == sorted(SWEEP_IDS)
     assert result["validated_sweep_ids"] == sorted(SWEEP_IDS)
+    assert result["completed_sweep_ids"] == sorted(SWEEP_IDS)
+    assert result["missing_sweep_ids"] == []
+    assert result["closed"] is True
+    assert result["global_coverage_validated"] is True
     merged, errors = ac.load_jsonl(output)
     assert errors == []
     assert {item["observation_id"] for item in merged} == {
         "RISK-C1", "RISK-C2", "RISK-P1",
     }
+
+
+def test_risk_merge_accepts_one_true_coupled_sweep(
+    risk_state: dict[str, object], monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        hm, "_expected_risk_sweep_ids", lambda root: {"SWEEP-CONTROL"},
+    )
+    handoffs = Path(risk_state["handoffs"])
+    ac.save_json(handoffs / "SWEEP-CONTROL.json", [
+        _risk("RISK-ONLY", str(risk_state["session_id"]), "SWEEP-CONTROL"),
+    ])
+
+    report = tmp_path / "single-sweep-merge.json"
+    return_code, output = _run_merge(risk_state, report)
+
+    assert return_code == 0
+    result = ac.load_json(report)
+    assert result["submitted_sweep_ids"] == ["SWEEP-CONTROL"]
+    assert result["completed_sweep_ids"] == ["SWEEP-CONTROL"]
+    assert result["missing_sweep_ids"] == []
+    assert result["closed"] is True
+    merged, errors = ac.load_jsonl(output)
+    assert errors == []
+    assert [item["observation_id"] for item in merged] == ["RISK-ONLY"]
 
 
 def test_risk_merge_accepts_all_planned_focused_sweeps(
@@ -298,10 +332,134 @@ def test_risk_merge_accepts_all_planned_focused_sweeps(
     return_code, output = _run_merge(risk_state, report)
 
     assert return_code == 0
-    assert ac.load_json(report)["validated_sweep_ids"] == sweep_ids
+    result = ac.load_json(report)
+    assert result["submitted_sweep_ids"] == sweep_ids
+    assert result["completed_sweep_ids"] == sweep_ids
+    assert result["missing_sweep_ids"] == []
+    assert result["closed"] is True
     merged, errors = ac.load_jsonl(output)
     assert errors == []
     assert len(merged) == 4
+
+
+def test_risk_merge_incrementally_completes_and_replaces_only_submitted_sweep(
+    risk_state: dict[str, object], monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    handoffs = Path(risk_state["handoffs"])
+    coverage_calls: list[set[str]] = []
+
+    def validate_global_coverage(risks: dict[str, dict], root: Path) -> tuple[list[str], dict]:
+        assert root == risk_state["state"]
+        coverage_calls.append({str(item["sweep_id"]) for item in risks.values()})
+        return [], {}
+
+    monkeypatch.setattr(rpv, "validate_risk_coverage", validate_global_coverage)
+
+    ac.save_json(handoffs / "SWEEP-CONTROL.json", [
+        _risk("RISK-C-OLD", str(risk_state["session_id"]), "SWEEP-CONTROL"),
+    ])
+    first_report = tmp_path / "risk-first.json"
+    first_code, output = _run_merge(risk_state, first_report)
+
+    assert first_code == 0
+    first = ac.load_json(first_report)
+    assert first["submitted_sweep_ids"] == ["SWEEP-CONTROL"]
+    assert first["completed_sweep_ids"] == ["SWEEP-CONTROL"]
+    assert first["missing_sweep_ids"] == ["SWEEP-PARALLEL"]
+    assert first["closed"] is False
+    assert first["global_coverage_validated"] is False
+    assert coverage_calls == []
+
+    (handoffs / "SWEEP-CONTROL.json").unlink()
+    ac.save_json(handoffs / "SWEEP-PARALLEL.json", [
+        _risk("RISK-P", str(risk_state["session_id"]), "SWEEP-PARALLEL"),
+    ])
+    second_report = tmp_path / "risk-second.json"
+    second_code, _output = _run_merge(risk_state, second_report)
+
+    assert second_code == 0
+    second = ac.load_json(second_report)
+    assert second["submitted_sweep_ids"] == ["SWEEP-PARALLEL"]
+    assert second["completed_sweep_ids"] == sorted(SWEEP_IDS)
+    assert second["missing_sweep_ids"] == []
+    assert second["closed"] is True
+    assert second["global_coverage_validated"] is True
+    assert coverage_calls == [SWEEP_IDS]
+
+    (handoffs / "SWEEP-PARALLEL.json").unlink()
+    ac.save_json(handoffs / "SWEEP-CONTROL.json", [
+        _risk("RISK-C-NEW", str(risk_state["session_id"]), "SWEEP-CONTROL"),
+    ])
+    third_report = tmp_path / "risk-third.json"
+    third_code, _output = _run_merge(risk_state, third_report)
+
+    assert third_code == 0
+    third = ac.load_json(third_report)
+    assert third["submitted_sweep_ids"] == ["SWEEP-CONTROL"]
+    assert third["completed_sweep_ids"] == sorted(SWEEP_IDS)
+    assert third["missing_sweep_ids"] == []
+    assert third["closed"] is True
+    merged, errors = ac.load_jsonl(output)
+    assert errors == []
+    assert {item["observation_id"] for item in merged} == {
+        "RISK-C-NEW", "RISK-P",
+    }
+    assert coverage_calls == [SWEEP_IDS, SWEEP_IDS]
+
+
+def test_candidate_owned_risk_directory_ignores_invalid_peer_directory(
+    risk_state: dict[str, object], tmp_path: Path,
+) -> None:
+    handoffs = Path(risk_state["handoffs"])
+    valid_dir = handoffs / "SWEEP-CONTROL"
+    invalid_dir = handoffs / "SWEEP-PARALLEL"
+    valid_dir.mkdir()
+    invalid_dir.mkdir()
+    ac.save_json(valid_dir / "SWEEP-CONTROL.json", [
+        _risk("RISK-C", str(risk_state["session_id"]), "SWEEP-CONTROL"),
+    ])
+    ac.save_json(invalid_dir / "SWEEP-PARALLEL.json", {"invalid": True})
+    state = Path(risk_state["state"])
+    output = state / "risk_observations.jsonl"
+    report = tmp_path / "candidate-risk-merge.json"
+
+    result = hm.main([
+        "--input-dir", str(valid_dir), "--output", str(output),
+        "--artifact-type", "risk", "--session-id", str(risk_state["session_id"]),
+        "--report", str(report),
+    ])
+
+    assert result == 0
+    merged, errors = ac.load_jsonl(output)
+    assert errors == []
+    assert [item["observation_id"] for item in merged] == ["RISK-C"]
+    trace = ac.load_json(report)
+    assert trace["submitted_sweep_ids"] == ["SWEEP-CONTROL"]
+    assert trace["missing_sweep_ids"] == ["SWEEP-PARALLEL"]
+
+
+def test_partial_risk_merge_rejects_incomplete_submitted_sweep_before_write(
+    risk_state: dict[str, object], monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    handoffs = Path(risk_state["handoffs"])
+    ac.save_json(handoffs / "SWEEP-CONTROL.json", [
+        _risk("RISK-C", str(risk_state["session_id"]), "SWEEP-CONTROL"),
+    ])
+    monkeypatch.setattr(
+        rpv,
+        "validate_sweep_coverage",
+        lambda items, root, sweep: [f"risk sweep {sweep}: incomplete slice"],
+    )
+
+    report = tmp_path / "incomplete-slice.json"
+    return_code, output = _run_merge(risk_state, report)
+
+    assert return_code == 1
+    assert not output.exists()
+    result = ac.load_json(report)
+    assert result["completed_sweep_ids"] == []
+    assert result["closed"] is False
+    assert any("incomplete slice" in error for error in result["errors"])
 
 
 def test_risk_merge_authoritatively_replaces_stale_ledger(
@@ -332,26 +490,39 @@ def test_risk_merge_authoritatively_replaces_stale_ledger(
     }
 
 
-@pytest.mark.parametrize("extra", [False, True])
-def test_risk_merge_rejects_missing_or_extra_sweep_files_without_writing_ledger(
-    risk_state: dict[str, object], tmp_path: Path, extra: bool,
+def test_risk_merge_rejects_extra_sweep_file_without_writing_ledger(
+    risk_state: dict[str, object], tmp_path: Path,
 ) -> None:
     handoffs = Path(risk_state["handoffs"])
     ac.save_json(handoffs / "SWEEP-CONTROL.json", [
         _risk("RISK-C1", str(risk_state["session_id"]), "SWEEP-CONTROL"),
     ])
-    if extra:
-        ac.save_json(handoffs / "EXTRA.json", [
-            _risk("RISK-X1", str(risk_state["session_id"]), "EXTRA"),
-        ])
-    report = tmp_path / "incomplete-risk-merge.json"
+    ac.save_json(handoffs / "EXTRA.json", [
+        _risk("RISK-X1", str(risk_state["session_id"]), "EXTRA"),
+    ])
+    report = tmp_path / "extra-risk-merge.json"
     return_code, output = _run_merge(risk_state, report)
     assert return_code == 1
     assert not output.exists()
     result = ac.load_json(report)
     assert result["expected_sweep_ids"] == sorted(SWEEP_IDS)
     assert result["validated_sweep_ids"] == []
-    assert any("exactly all planned sweep JSON files" in error for error in result["errors"])
+    assert result["completed_sweep_ids"] == []
+    assert any("unplanned sweep files" in error for error in result["errors"])
+
+
+def test_risk_merge_rejects_empty_batch_without_writing_ledger(
+    risk_state: dict[str, object], tmp_path: Path,
+) -> None:
+    report = tmp_path / "empty-risk-merge.json"
+    return_code, output = _run_merge(risk_state, report)
+
+    assert return_code == 1
+    assert not output.exists()
+    result = ac.load_json(report)
+    assert result["submitted_sweep_ids"] == []
+    assert result["completed_sweep_ids"] == []
+    assert any("at least one planned sweep" in error for error in result["errors"])
 
 
 def test_risk_merge_rejects_a_file_containing_another_sweep(

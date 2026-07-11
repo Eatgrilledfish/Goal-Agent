@@ -187,15 +187,12 @@ def validate_plan(
         required_boundaries, required_planes, required_paths,
         boundaries, planes, parallel_paths,
     )
-    if len(components) < 2:
-        errors.append(
-            f"{PLAN_NAME}: architecture has fewer than two independent required risk components; "
-            "multiple non-overlapping risk scopes would be inaccurate"
-        )
+    if not components:
+        errors.append(f"{PLAN_NAME}: architecture has no required risk component")
 
     raw_slices = plan.get("slices")
-    if not isinstance(raw_slices, list) or len(raw_slices) < 2:
-        errors.append(f"{PLAN_NAME}: slices must contain at least two objects")
+    if not isinstance(raw_slices, list) or not raw_slices:
+        errors.append(f"{PLAN_NAME}: slices must contain at least one object")
         raw_slices = []
     known_lenses = set(contract.get("coverage_contract", {}).get("portfolio_lenses", []))
     slices: dict[str, dict[str, Any]] = {}
@@ -299,12 +296,6 @@ def validate_plan(
         unknown_lenses = set(lenses) - known_lenses
         if unknown_lenses:
             errors.append(f"{label}.review_lenses: unknown values {sorted(unknown_lenses)}")
-        if set(lenses) != known_lenses:
-            errors.append(
-                f"{label}.review_lenses must contain the complete contract portfolio; "
-                f"missing={sorted(known_lenses - set(lenses))}, "
-                f"extra={sorted(set(lenses) - known_lenses)}"
-            )
         if not isinstance(item.get("scope_rationale"), str) or not item.get(
             "scope_rationale", "",
         ).strip():

@@ -35,7 +35,6 @@ def _prepare_claim_scope(workspace) -> None:
     ac.save_json(scope_path, {
         "session_id": workspace["session_id"],
         "round_id": "ROUND-001",
-        "design_claims_sha256": ac.sha256_file(state / "design_claims.jsonl"),
         "claim_ids": [claim["claim_id"] for claim in claims],
     })
     review_path = state / "design_claim_review.json"
@@ -43,7 +42,8 @@ def _prepare_claim_scope(workspace) -> None:
     review["input_digests"] = {
         name: ac.sha256_file(state / name)
         for name in (
-            "design_claims.jsonl", "design_coverage.json", "design_agent_manifest.json",
+            "design_claims.jsonl", "design_coverage.json", "design_inventory.json",
+            "design_agent_manifest.json",
             "claim_review_scope.json",
         )
     }
@@ -84,7 +84,7 @@ def test_architecture_check_rejects_duplicate_id_and_unknown_reference(workspace
 def test_task_check_rejects_code_to_design_task_without_risk_refs(workspace):
     populate_handoffs(workspace)
     _prepare_claim_scope(workspace)
-    _run_stage(workspace, "task-check")
+    _run_stage(workspace, "task-plan-check")
 
     state = workspace["state"]
     assert isinstance(state, Path)
@@ -98,9 +98,9 @@ def test_task_check_rejects_code_to_design_task_without_risk_refs(workspace):
     code_to_design["risk_observation_ids"] = []
     _rewrite_jsonl(task_path, tasks)
 
-    proc = _run_stage(workspace, "task-check", check=False)
+    proc = _run_stage(workspace, "task-plan-check", check=False)
     assert proc.returncode == 1
-    trace = ac.load_json(workspace["logs"] / "trace" / "task_validation.json")
+    trace = ac.load_json(workspace["logs"] / "trace" / "task_plan_validation.json")
     assert trace["passed"] is False
     assert any(
         "code-to-design task requires risk_observation_ids" in error
@@ -124,9 +124,9 @@ def test_task_check_requires_each_task_in_exactly_one_round(workspace):
     })
     _rewrite_jsonl(state / "investigation_rounds.jsonl", [rounds[0], duplicate])
 
-    proc = _run_stage(workspace, "task-check", check=False)
+    proc = _run_stage(workspace, "task-plan-check", check=False)
     assert proc.returncode == 1
-    trace = ac.load_json(workspace["logs"] / "trace" / "task_validation.json")
+    trace = ac.load_json(workspace["logs"] / "trace" / "task_plan_validation.json")
     assert any(
         "task TASK-001: must belong to exactly one investigation round; found 2" in error
         for error in trace["errors"]
@@ -170,16 +170,16 @@ def test_task_check_freezes_later_round_until_earlier_round_drains(workspace):
     })
     _rewrite_jsonl(state / "investigation_rounds.jsonl", [first, second])
 
-    proc = _run_stage(workspace, "task-check", check=False)
+    proc = _run_stage(workspace, "task-lifecycle-check", check=False)
     assert proc.returncode == 1
-    trace = ac.load_json(workspace["logs"] / "trace" / "task_validation.json")
+    trace = ac.load_json(workspace["logs"] / "trace" / "task_lifecycle_validation.json")
     assert any(
         "ROUND-002: cannot exist while earlier round ROUND-001" in error
         for error in trace["errors"]
     )
 
 
-def test_task_check_binds_tasks_bidirectionally_to_accepted_claim_review_scope(workspace):
+def test_task_plan_isolates_task_outside_accepted_claim_review_scope(workspace):
     populate_handoffs(workspace)
     _prepare_claim_scope(workspace)
     state = workspace["state"]
@@ -207,44 +207,21 @@ def test_task_check_binds_tasks_bidirectionally_to_accepted_claim_review_scope(w
         workspace["result"], workspace["logs"],
     )
 
-    proc = _run_stage(workspace, "task-check", check=False)
+    proc = _run_stage(workspace, "task-plan-check", check=False)
     assert proc.returncode == 1
-    trace = ac.load_json(workspace["logs"] / "trace" / "task_validation.json")
+    trace = ac.load_json(workspace["logs"] / "trace" / "task_plan_validation.json")
     assert any(
         "task TASK-004: claim_id 'CLAIM-004' is outside accepted claim review scope" in error
         for error in trace["errors"]
     )
 
+    assert trace["global_passed"] is True
+    assert "TASK-004" in trace["invalid_task_ids"]
+    assert set(trace["valid_task_ids"]) == {"TASK-001", "TASK-002", "TASK-003"}
     ac.save_json(review_path, original_review)
-    _prepare_claim_scope(workspace)
-    tasks, errors = ac.load_jsonl(state / "investigation_tasks.jsonl")
-    assert errors == []
-    _rewrite_jsonl(
-        state / "investigation_tasks.jsonl",
-        [task for task in tasks if task["task_id"] != "TASK-004"],
-    )
-    findings, errors = ac.load_jsonl(state / "investigation_findings.jsonl")
-    assert errors == []
-    _rewrite_jsonl(
-        state / "investigation_findings.jsonl",
-        [finding for finding in findings if finding["task_id"] != "TASK-004"],
-    )
-    rounds, errors = ac.load_jsonl(state / "investigation_rounds.jsonl")
-    assert errors == []
-    rounds[0]["task_ids"].remove("TASK-004")
-    rounds[0]["finding_ids"].remove("FINDING-TASK-004")
-    _rewrite_jsonl(state / "investigation_rounds.jsonl", rounds)
-
-    proc = _run_stage(workspace, "task-check", check=False)
-    assert proc.returncode == 1
-    trace = ac.load_json(workspace["logs"] / "trace" / "task_validation.json")
-    assert any(
-        "accepted claim review scope claim CLAIM-004: missing investigation task" in error
-        for error in trace["errors"]
-    )
 
 
-def test_first_round_boundary_requires_matching_code_to_design_risk_task(workspace):
+def test_task_plan_does_not_hard_code_first_round_semantic_portfolio(workspace):
     populate_handoffs(workspace)
     _prepare_claim_scope(workspace)
     state = workspace["state"]
@@ -256,13 +233,8 @@ def test_first_round_boundary_requires_matching_code_to_design_risk_task(workspa
         task["risk_observation_ids"] = []
     _rewrite_jsonl(state / "investigation_tasks.jsonl", tasks)
 
-    proc = _run_stage(workspace, "task-check", check=False)
-    assert proc.returncode == 1
-    trace = ac.load_json(workspace["logs"] / "trace" / "task_validation.json")
-    assert any(
-        "first-round portfolio needs at least one risk-backed code-to-design task" in error
-        for error in trace["errors"]
-    )
+    proc = _run_stage(workspace, "task-plan-check", check=False)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
 
 
 def test_first_round_can_defer_other_parallel_planes_to_coverage(workspace):
@@ -308,7 +280,7 @@ def test_first_round_can_defer_other_parallel_planes_to_coverage(workspace):
     tasks[1]["parallel_path_ids"] = ["PATH-SERVICE"]
     _rewrite_jsonl(state / "investigation_tasks.jsonl", tasks)
 
-    proc = _run_stage(workspace, "task-check", check=False)
+    proc = _run_stage(workspace, "task-plan-check", check=False)
     assert proc.returncode == 0
 
 
@@ -329,13 +301,79 @@ def test_round_frontier_rejects_more_than_contract_limit(workspace):
     rounds[0]["task_ids"].append("TASK-005")
     _rewrite_jsonl(state / "investigation_rounds.jsonl", rounds)
 
-    proc = _run_stage(workspace, "task-check", check=False)
+    proc = _run_stage(workspace, "task-plan-check", check=False)
     assert proc.returncode == 1
-    trace = ac.load_json(workspace["logs"] / "trace" / "task_validation.json")
+    trace = ac.load_json(workspace["logs"] / "trace" / "task_plan_validation.json")
     assert any(
         "task_ids exceeds max_tasks_per_round=4" in error
         for error in trace["errors"]
     )
+
+
+def test_atomic_task_identity_errors_are_candidate_local(workspace):
+    populate_handoffs(workspace)
+    _prepare_claim_scope(workspace)
+    state = workspace["state"]
+    assert isinstance(state, Path)
+    task_path = state / "investigation_tasks.jsonl"
+    tasks, errors = ac.load_jsonl(task_path)
+    assert errors == []
+    tasks[0]["claim_branch"] = ["branch-a", "branch-b"]
+    tasks[1]["obligation_sha256"] = "0" * 64
+    tasks[2]["hypothesis"] = ["first", "second"]
+    _rewrite_jsonl(task_path, tasks)
+
+    proc = _run_stage(workspace, "task-plan-check", check=False)
+    assert proc.returncode == 1
+    trace = ac.load_json(workspace["logs"] / "trace" / "task_plan_validation.json")
+    assert trace["global_passed"] is True
+    assert trace["valid_task_ids"] == ["TASK-004"]
+    assert trace["invalid_task_ids"] == ["TASK-001", "TASK-002", "TASK-003"]
+    assert any("claim_branch must be a string" in error for error in trace["errors_by_task"]["TASK-001"])
+    assert any("does not match the linked claim obligation" in error for error in trace["errors_by_task"]["TASK-002"])
+    assert any("hypothesis must be a string" in error for error in trace["errors_by_task"]["TASK-003"])
+
+
+def test_finding_merge_only_requires_lifecycle_refresh(workspace):
+    populate_handoffs(workspace)
+    _prepare_claim_scope(workspace)
+    state = workspace["state"]
+    assert isinstance(state, Path)
+    task_path = state / "investigation_tasks.jsonl"
+    finding_path = state / "investigation_findings.jsonl"
+    round_path = state / "investigation_rounds.jsonl"
+    tasks, errors = ac.load_jsonl(task_path)
+    assert errors == []
+    findings, errors = ac.load_jsonl(finding_path)
+    assert errors == []
+    rounds, errors = ac.load_jsonl(round_path)
+    assert errors == []
+    original_finding = next(item for item in findings if item["task_id"] == "TASK-001")
+    tasks[0]["status"] = "pending"
+    _rewrite_jsonl(task_path, tasks)
+    _rewrite_jsonl(
+        finding_path, [item for item in findings if item["task_id"] != "TASK-001"],
+    )
+    rounds[0]["finding_ids"].remove(original_finding["finding_id"])
+    _rewrite_jsonl(round_path, rounds)
+    _run_stage(workspace, "task-plan-check")
+    _run_stage(workspace, "task-lifecycle-check")
+    plan_path = workspace["logs"] / "trace" / "task_plan_validation.json"
+    lifecycle_path = workspace["logs"] / "trace" / "task_lifecycle_validation.json"
+    plan_before = plan_path.read_bytes()
+    lifecycle_before = ac.load_json(lifecycle_path)["task_lifecycle_sha256"]
+
+    tasks[0]["status"] = "complete"
+    _rewrite_jsonl(task_path, tasks)
+    _rewrite_jsonl(finding_path, findings)
+    rounds[0]["finding_ids"].append(original_finding["finding_id"])
+    _rewrite_jsonl(round_path, rounds)
+    _run_stage(workspace, "task-lifecycle-check")
+
+    assert plan_path.read_bytes() == plan_before
+    lifecycle_after = ac.load_json(lifecycle_path)
+    assert lifecycle_after["passed"] is True
+    assert lifecycle_after["task_lifecycle_sha256"] != lifecycle_before
 
 
 def test_coverage_check_rejects_legacy_semantic_coverage_fields_early(workspace):

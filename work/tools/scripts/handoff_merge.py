@@ -8,7 +8,11 @@ ranking, filtering, or design/code judgement.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -30,18 +34,39 @@ TRACE_KINDS = {
 }
 DEFER_FAILURE_KINDS = {"provider_failure", "tool_failure"}
 FINDING_TEMPLATE_FIELDS = (
-    "finding_id", "session_id", "task_id", "claim_id", "hypothesis", "expected_behavior",
-    "design_evidence", "review_lenses",
+    "finding_id", "session_id", "task_id", "claim_id", "claim_branch",
+    "obligation_sha256", "hypothesis", "expected_behavior", "design_evidence",
+    "review_lenses",
 )
 CRITIC_ALLOWED_KEYS = {
     "review_id", "session_id", "finding_id", "claim_id", "decision", "challenges",
     "checks_performed", "dynamic_probe_review", "review_context", "resolution",
-    "remaining_risks",
+    "remaining_risks", "input_digests", "evidence_critic_prompt_version",
 }
+CRITIC_INPUT_DIGEST_KEYS = {
+    "claim_sha256", "finding_sha256", "probe_sha256",
+}
+EVIDENCE_CRITIC_PROMPT_VERSION = "evidence-critic-v2"
 DYNAMIC_PROBE_REVIEW_ALLOWED_KEYS = {
     "status", "probe_id", "oracle_validity", "environment_validity", "reachability",
     "effect_on_decision",
 }
+PROBE_INTERPRETATIONS = {
+    "supports_contradiction", "disconfirms_contradiction", "inconclusive",
+}
+PROBE_SECONDARY_ORACLE_KINDS = {
+    "reference_model", "minimal_reference", "known_good_path", "negative_control",
+    "not_available",
+}
+COVERAGE_TASK_SCALAR_FIELDS = (
+    "claim_id", "claim_branch", "hypothesis", "obligation_sha256",
+    "exploration_mode",
+)
+COVERAGE_TASK_LIST_FIELDS = (
+    "review_lenses", "architecture_boundaries", "implementation_planes",
+    "parallel_path_ids", "risk_observation_ids", "source_gap_ids",
+)
+TASK_LIFECYCLE_FIELDS = {"status", "defer_reason", "defer_evidence"}
 
 
 class HandoffValidationError(ValueError):
@@ -54,6 +79,130 @@ class HandoffValidationError(ValueError):
 
 def _present(value: Any) -> bool:
     return value not in (None, "", [], {})
+
+
+def canonical_digest(value: Any) -> str:
+    encoded = json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def coverage_task_projection(item: dict[str, Any]) -> dict[str, Any]:
+    """Return the immutable frontier fields shared by a coverage request/task."""
+    projected = {field: item.get(field) for field in COVERAGE_TASK_SCALAR_FIELDS}
+    for field in COVERAGE_TASK_LIST_FIELDS:
+        value = item.get(field)
+        projected[field] = sorted({
+            entry for entry in value
+            if isinstance(entry, str) and entry
+        }) if isinstance(value, list) else []
+    return projected
+
+
+def task_plan_ledger_sha256(values: dict[str, dict[str, Any]]) -> str:
+    """Digest task handoff plan fields while ignoring lifecycle transitions."""
+    return canonical_digest({
+        task_id: {
+            key: value for key, value in task.items()
+            if key not in TASK_LIFECYCLE_FIELDS
+        }
+        for task_id, task in sorted(values.items())
+    })
+
+
+def validate_task_coverage_binding(
+    item: dict[str, Any], state_root: Path, label: str,
+) -> list[str]:
+    """Bind tasks created after coverage to the one recorded supplement request."""
+    history_path = state_root / "coverage_supplement_history.json"
+    if not history_path.is_file():
+        return [f"{label}: coverage_supplement_history.json is missing"]
+    try:
+        history = ac.load_json(history_path)
+    except (OSError, json.JSONDecodeError) as exc:
+        return [f"{label}: coverage supplement history is invalid: {exc}"]
+    requests = history.get("requests") if isinstance(history, dict) else None
+    if not isinstance(requests, list) or len(requests) > 1:
+        return [f"{label}: coverage supplement history has an invalid request ledger"]
+    marker = item.get("coverage_request_sha256")
+    source_gap_ids = item.get("source_gap_ids")
+    if not requests:
+        if marker not in (None, "") or source_gap_ids not in (None, []):
+            return [f"{label}: supplement binding exists without a recorded coverage request"]
+        return []
+    request = requests[0]
+    if not isinstance(request, dict):
+        return [f"{label}: recorded coverage supplement request is invalid"]
+    prior_task_ids = request.get("prior_task_ids")
+    task_specs = request.get("task_specs")
+    if not isinstance(prior_task_ids, list) or not isinstance(task_specs, list):
+        return [f"{label}: recorded coverage supplement request lacks task bindings"]
+    task_id = str(item.get("task_id") or "")
+    if task_id in {value for value in prior_task_ids if isinstance(value, str)}:
+        if marker not in (None, "") or source_gap_ids not in (None, []):
+            return [f"{label}: pre-coverage task cannot claim a supplement binding"]
+        return []
+    errors: list[str] = []
+    request_sha256 = request.get("request_sha256")
+    if marker != request_sha256:
+        errors.append(
+            f"{label}: post-coverage task must bind coverage_request_sha256 to the recorded request"
+        )
+    projection = coverage_task_projection(item)
+    if projection not in task_specs:
+        errors.append(f"{label}: post-coverage task does not match a requested supplement task")
+    return errors
+
+
+def validate_probe_chain(
+    findings: dict[str, dict[str, Any]],
+    probes: dict[str, dict[str, Any]],
+    critiques: dict[str, dict[str, Any]],
+) -> list[str]:
+    """Require the investigator selection, probe, and critic to form one chain."""
+    errors: list[str] = []
+    probes_by_finding: dict[str, list[dict[str, Any]]] = {}
+    for probe_id, probe in probes.items():
+        finding_id = str(probe.get("finding_id") or "")
+        if finding_id not in findings:
+            errors.append(f"dynamic probe {probe_id}: unknown finding_id {finding_id!r}")
+        probes_by_finding.setdefault(finding_id, []).append(probe)
+    for finding_id, finding in findings.items():
+        selection = finding.get("dynamic_probe_selection")
+        disposition = selection.get("disposition") if isinstance(selection, dict) else ""
+        linked = probes_by_finding.get(finding_id, [])
+        critique = critiques.get(finding_id, {})
+        review = critique.get("dynamic_probe_review") if isinstance(critique, dict) else {}
+        review = review if isinstance(review, dict) else {}
+        if disposition == "selected":
+            if len(linked) != 1:
+                errors.append(
+                    f"finding {finding_id}: selected probe requires exactly one artifact; found {len(linked)}"
+                )
+                continue
+            probe = linked[0]
+            if str(review.get("probe_id") or "") != str(probe.get("probe_id") or ""):
+                errors.append(
+                    f"finding {finding_id}: critic must review the selected probe artifact"
+                )
+            if review.get("status") != probe.get("interpretation"):
+                errors.append(
+                    f"finding {finding_id}: critic probe status does not match the selected probe"
+                )
+        else:
+            if linked:
+                errors.append(
+                    f"finding {finding_id}: {disposition or 'invalid'} probe selection cannot have probe artifacts"
+                )
+            if critique and (
+                review.get("status") != "not_run"
+                or str(review.get("probe_id") or "")
+            ):
+                errors.append(
+                    f"finding {finding_id}: critic must record not_run with no probe for an unselected probe"
+                )
+    return errors
 
 
 def _require(item: dict[str, Any], fields: tuple[str, ...], label: str) -> list[str]:
@@ -142,6 +291,266 @@ def _validate_risk_trace(item: dict[str, Any], label: str) -> list[str]:
     return errors
 
 
+def _validate_probe_trace(item: dict[str, Any], label: str) -> list[str]:
+    trace = item.get("tool_trace")
+    if not isinstance(trace, list) or len(trace) < 2:
+        return [f"{label}: tool_trace must contain at least two real probe steps"]
+    errors: list[str] = []
+    kinds: set[str] = set()
+    for index, step in enumerate(trace, start=1):
+        step_label = f"{label}: tool_trace[{index}]"
+        if not isinstance(step, dict):
+            errors.append(f"{step_label} must be an object")
+            continue
+        errors.extend(_require(
+            step, ("kind", "tool", "target", "purpose", "result"), step_label,
+        ))
+        if step.get("seq") != index:
+            errors.append(f"{step_label}: seq must equal {index}")
+        kind = str(step.get("kind") or "")
+        if kind not in TRACE_KINDS:
+            errors.append(f"{step_label}: unsupported kind {kind!r}")
+        kinds.add(kind)
+    if "test" not in kinds:
+        errors.append(f"{label}: tool_trace lacks a test step")
+    return errors
+
+
+def validate_probe_contract(item: dict[str, Any], label: str) -> list[str]:
+    """Validate an isolated focused probe without interpreting its semantics."""
+    errors = _require(item, (
+        "probe_id", "session_id", "finding_id", "claim_id", "oracle",
+        "oracle_validation", "selection_reason", "isolation", "baseline",
+        "execution", "interpretation", "tool_trace",
+    ), label)
+
+    oracle = item.get("oracle")
+    if not isinstance(oracle, dict):
+        errors.append(f"{label}: oracle must be an object")
+    else:
+        errors.extend(_require(oracle, (
+            "source", "claim_id", "claim_sha256", "source_sha256",
+            "preconditions", "stimulus", "expected_observation",
+        ), f"{label}: oracle"))
+        if oracle.get("source") != "design_claim":
+            errors.append(f"{label}: oracle.source must be design_claim")
+        if not isinstance(oracle.get("preconditions"), list):
+            errors.append(f"{label}: oracle.preconditions must be an array")
+
+    validation = item.get("oracle_validation")
+    if not isinstance(validation, dict):
+        errors.append(f"{label}: oracle_validation must be an object")
+    else:
+        errors.extend(_require(validation, (
+            "non_triviality", "secondary_oracle", "evidence_role",
+        ), f"{label}: oracle_validation"))
+        role = validation.get("evidence_role")
+        if role not in {"corroborating", "auxiliary"}:
+            errors.append(f"{label}: oracle_validation.evidence_role is invalid")
+
+        non_triviality = validation.get("non_triviality")
+        non_triviality_status = ""
+        if not isinstance(non_triviality, dict):
+            errors.append(f"{label}: oracle_validation.non_triviality must be an object")
+        else:
+            errors.extend(_require(
+                non_triviality, ("status", "result"),
+                f"{label}: oracle_validation.non_triviality",
+            ))
+            non_triviality_status = str(non_triviality.get("status") or "")
+            if non_triviality_status not in {"passed", "failed", "not_run"}:
+                errors.append(
+                    f"{label}: oracle_validation.non_triviality.status is invalid"
+                )
+            if non_triviality_status != "not_run" and not _present(
+                non_triviality.get("method")
+            ):
+                errors.append(
+                    f"{label}: executed non-triviality validation needs a method"
+                )
+
+        secondary = validation.get("secondary_oracle")
+        secondary_status = ""
+        if not isinstance(secondary, dict):
+            errors.append(f"{label}: oracle_validation.secondary_oracle must be an object")
+        else:
+            errors.extend(_require(
+                secondary, ("kind", "status", "result"),
+                f"{label}: oracle_validation.secondary_oracle",
+            ))
+            kind = secondary.get("kind")
+            secondary_status = str(secondary.get("status") or "")
+            if kind not in PROBE_SECONDARY_ORACLE_KINDS:
+                errors.append(
+                    f"{label}: oracle_validation.secondary_oracle.kind is invalid"
+                )
+            if kind == "not_available":
+                if secondary_status != "not_run":
+                    errors.append(
+                        f"{label}: unavailable secondary oracle must have status not_run"
+                    )
+            else:
+                if secondary_status not in {"passed", "failed"}:
+                    errors.append(
+                        f"{label}: executable secondary oracle must pass or fail"
+                    )
+                if not _present(secondary.get("command")):
+                    errors.append(
+                        f"{label}: executable secondary oracle needs a command"
+                    )
+
+        interpretation = item.get("interpretation")
+        if non_triviality_status != "passed" and interpretation != "inconclusive":
+            errors.append(
+                f"{label}: an unvalidated/non-triviality-failing oracle must be inconclusive"
+            )
+        if secondary_status == "failed" and interpretation != "inconclusive":
+            errors.append(
+                f"{label}: a failed secondary oracle must make the probe inconclusive"
+            )
+        if (
+            non_triviality_status != "passed" or secondary_status != "passed"
+        ) and role != "auxiliary":
+            errors.append(
+                f"{label}: a probe without both oracle checks passed must be auxiliary"
+            )
+
+    isolation = item.get("isolation")
+    if not isinstance(isolation, dict):
+        errors.append(f"{label}: isolation must be an object")
+    else:
+        errors.extend(_require(
+            isolation, (
+                "kind", "workspace", "command_cwd", "original_target_unchanged",
+            ),
+            f"{label}: isolation",
+        ))
+        if isolation.get("kind") != "session_copy":
+            errors.append(f"{label}: isolation.kind must be session_copy")
+        if isolation.get("original_target_unchanged") is not True:
+            errors.append(f"{label}: original_target_unchanged must be true")
+
+    baseline = item.get("baseline")
+    baseline_status = ""
+    if not isinstance(baseline, dict):
+        errors.append(f"{label}: baseline must be an object")
+    else:
+        errors.extend(_require(baseline, ("status", "result"), f"{label}: baseline"))
+        baseline_status = str(baseline.get("status") or "")
+        if baseline_status not in {"passed", "failed", "not_available"}:
+            errors.append(f"{label}: baseline.status is invalid")
+        if baseline_status != "not_available" and not _present(baseline.get("command")):
+            errors.append(f"{label}: executed baseline needs a command")
+
+    execution = item.get("execution")
+    execution_status = ""
+    target_reached = False
+    if not isinstance(execution, dict):
+        errors.append(f"{label}: execution must be an object")
+    else:
+        errors.extend(_require(execution, ("status", "observed"), f"{label}: execution"))
+        execution_status = str(execution.get("status") or "")
+        target_reached = execution.get("target_reached") is True
+        if execution_status not in {"completed", "environment_failed", "not_executed"}:
+            errors.append(f"{label}: execution.status is invalid")
+        if execution_status == "completed":
+            if not _present(execution.get("command")):
+                errors.append(f"{label}: completed execution needs a command")
+            if not isinstance(execution.get("exit_code"), int):
+                errors.append(f"{label}: completed execution needs an integer exit_code")
+
+    interpretation = item.get("interpretation")
+    if interpretation not in PROBE_INTERPRETATIONS:
+        errors.append(f"{label}: invalid interpretation")
+    if (
+        baseline_status != "passed" or execution_status != "completed" or not target_reached
+    ) and interpretation != "inconclusive":
+        errors.append(
+            f"{label}: environment/baseline/reachability limitations must be inconclusive"
+        )
+    if "limitations" not in item or not isinstance(item.get("limitations"), list):
+        errors.append(f"{label}: limitations must be an array")
+    errors.extend(_validate_probe_trace(item, label))
+    return errors
+
+
+def validate_probe_workspace(
+    item: dict[str, Any], state_root: Path, label: str,
+) -> list[str]:
+    """Require a real, non-symlinked session-owned probe workspace."""
+    isolation = item.get("isolation")
+    workspace = str(isolation.get("workspace") or "") if isinstance(
+        isolation, dict
+    ) else ""
+    if not workspace:
+        return [f"{label}: isolation.workspace must be a non-empty absolute path"]
+    candidate = Path(workspace)
+    if not candidate.is_absolute():
+        return [f"{label}: isolation.workspace must be an absolute path"]
+    probes_root = state_root / "probes"
+    try:
+        candidate.relative_to(probes_root)
+    except ValueError:
+        return [f"{label}: isolation.workspace must be below state/probes"]
+    errors = ac.lexical_path_errors(
+        state_root, candidate, f"{label}: isolation.workspace",
+    )
+    if errors:
+        return errors
+    if candidate.is_symlink() or not candidate.is_dir():
+        errors.append(
+            f"{label}: isolation.workspace must exist as a non-symlink directory"
+        )
+        return errors
+    command_cwd_value = isolation.get("command_cwd")
+    command_cwd = (
+        Path(os.path.abspath(str(command_cwd_value)))
+        if isinstance(command_cwd_value, str) and command_cwd_value else None
+    )
+    if command_cwd != candidate:
+        errors.append(f"{label}: isolation.command_cwd must equal isolation.workspace")
+
+    manifest_path = state_root / "workspace_manifest.json"
+    finding_path = state_root / "investigation_findings.jsonl"
+    if manifest_path.is_file() and finding_path.is_file():
+        manifest = ac.load_json(manifest_path)
+        review_root_value = manifest.get("paths", {}).get("review_code_root") \
+            if isinstance(manifest, dict) else None
+        review_root = (
+            Path(os.path.abspath(str(review_root_value)))
+            if isinstance(review_root_value, str) and review_root_value else None
+        )
+        findings, finding_errors = _load_index(finding_path, "finding_id")
+        if finding_errors:
+            errors.append(f"{label}: cannot bind workspace to invalid finding ledger")
+        finding = findings.get(str(item.get("finding_id") or ""))
+        evidence_paths = sorted({
+            str(evidence.get("file") or evidence.get("path") or "")
+            for evidence in finding.get("code_evidence", [])
+            if isinstance(evidence, dict)
+            and (evidence.get("file") or evidence.get("path"))
+        }) if isinstance(finding, dict) else []
+        if review_root is None or not review_root.is_dir():
+            errors.append(f"{label}: prepared review code root is unavailable")
+        elif not evidence_paths:
+            errors.append(f"{label}: linked finding has no code evidence to bind the target copy")
+        else:
+            for relative in evidence_paths:
+                source = ac.contained_path(review_root, relative)
+                target = candidate / relative
+                target_errors = ac.lexical_path_errors(
+                    candidate, target, f"{label}: copied target {relative}",
+                )
+                errors.extend(target_errors)
+                if source is None or source.is_symlink() or not source.is_file():
+                    errors.append(f"{label}: review target file is unavailable: {relative}")
+                elif target_errors or target.is_symlink() or not target.is_file():
+                    errors.append(f"{label}: workspace lacks a regular copied target: {relative}")
+                elif ac.sha256_file(target) != ac.sha256_file(source):
+                    errors.append(f"{label}: copied target differs from review snapshot: {relative}")
+    return errors
+
+
 def validate_task_defer_evidence(item: dict[str, Any], label: str) -> list[str]:
     if item.get("status") != "deferred":
         return []
@@ -179,12 +588,39 @@ def validate_artifact(item: dict[str, Any], artifact_type: str, label: str) -> l
     errors: list[str] = []
     if artifact_type == "task":
         errors.extend(_require(item, (
-            "task_id", "session_id", "claim_id", "question", "starting_points",
+            "task_id", "session_id", "claim_id", "claim_branch", "hypothesis",
+            "obligation_sha256", "starting_points",
             "supporting_evidence_needed", "disconfirming_evidence_needed", "review_lenses",
             "exploration_mode", "architecture_boundaries", "implementation_planes", "status",
         ), label))
+        if "question" in item:
+            errors.append(f"{label}: legacy question is unsupported; use hypothesis")
+        obligation_digest = item.get("obligation_sha256")
+        if _present(obligation_digest) and (
+            not isinstance(obligation_digest, str)
+            or len(obligation_digest) != 64
+            or any(character not in "0123456789abcdef" for character in obligation_digest)
+        ):
+            errors.append(f"{label}: obligation_sha256 must be a lowercase SHA-256 digest")
         if item.get("status") not in {"pending", "in_progress", "complete", "deferred"}:
             errors.append(f"{label}: invalid status")
+        coverage_request = item.get("coverage_request_sha256")
+        if coverage_request not in (None, "") and (
+            not isinstance(coverage_request, str)
+            or len(coverage_request) != 64
+            or any(character not in "0123456789abcdef" for character in coverage_request)
+        ):
+            errors.append(
+                f"{label}: coverage_request_sha256 must be a lowercase SHA-256 digest"
+            )
+        if "source_gap_ids" in item:
+            source_gap_ids = item.get("source_gap_ids")
+            if (
+                not isinstance(source_gap_ids, list)
+                or not source_gap_ids
+                or any(not isinstance(value, str) or not value for value in source_gap_ids)
+            ):
+                errors.append(f"{label}: source_gap_ids must contain non-empty gap IDs")
         errors.extend(validate_task_defer_evidence(item, label))
         lenses = item.get("review_lenses")
         if not isinstance(lenses, list) or not 1 <= len(lenses) <= 3:
@@ -259,13 +695,21 @@ def validate_artifact(item: dict[str, Any], artifact_type: str, label: str) -> l
 
     if artifact_type == "finding":
         errors.extend(_require(item, (
-            "finding_id", "session_id", "task_id", "claim_id", "hypothesis",
+            "finding_id", "session_id", "task_id", "claim_id", "claim_branch",
+            "obligation_sha256", "hypothesis",
             "expected_behavior", "observed_behavior", "design_evidence", "code_evidence",
             "supporting_evidence", "false_positive_checks", "tool_trace",
             "dynamic_probe_selection", "assessment", "review_lenses", "recommendation",
         ), label))
         if item.get("assessment") not in {"contradiction_supported", "uncertain", "design_satisfied"}:
             errors.append(f"{label}: invalid assessment")
+        obligation_digest = item.get("obligation_sha256")
+        if _present(obligation_digest) and (
+            not isinstance(obligation_digest, str)
+            or len(obligation_digest) != 64
+            or any(character not in "0123456789abcdef" for character in obligation_digest)
+        ):
+            errors.append(f"{label}: obligation_sha256 must be a lowercase SHA-256 digest")
         if item.get("recommendation") not in {"critic_review", "probable", "reject"}:
             errors.append(f"{label}: invalid recommendation")
         checks = item.get("false_positive_checks")
@@ -297,9 +741,44 @@ def validate_artifact(item: dict[str, Any], artifact_type: str, label: str) -> l
         errors.extend(_require(item, (
             "review_id", "session_id", "finding_id", "claim_id", "decision", "challenges",
             "checks_performed", "dynamic_probe_review", "review_context", "resolution",
+            "input_digests", "evidence_critic_prompt_version",
         ), label))
+        input_digests = item.get("input_digests")
+        if not isinstance(input_digests, dict):
+            errors.append(f"{label}: input_digests must be an object")
+        else:
+            digest_keys = set(input_digests)
+            if digest_keys != CRITIC_INPUT_DIGEST_KEYS:
+                errors.append(
+                    f"{label}: input_digests keys must be exactly "
+                    f"{sorted(CRITIC_INPUT_DIGEST_KEYS)}"
+                )
+            for field in ("claim_sha256", "finding_sha256"):
+                value = input_digests.get(field)
+                if (
+                    not isinstance(value, str)
+                    or len(value) != 64
+                    or any(character not in "0123456789abcdef" for character in value)
+                ):
+                    errors.append(
+                        f"{label}: input_digests.{field} must be a lowercase SHA-256 digest"
+                    )
+            probe_digest = input_digests.get("probe_sha256")
+            if probe_digest != "" and (
+                not isinstance(probe_digest, str)
+                or len(probe_digest) != 64
+                or any(character not in "0123456789abcdef" for character in probe_digest)
+            ):
+                errors.append(
+                    f"{label}: input_digests.probe_sha256 must be empty or a lowercase SHA-256 digest"
+                )
+        if item.get("evidence_critic_prompt_version") != EVIDENCE_CRITIC_PROMPT_VERSION:
+            errors.append(
+                f"{label}: evidence_critic_prompt_version must be "
+                f"{EVIDENCE_CRITIC_PROMPT_VERSION!r}"
+            )
         if item.get("decision") not in {
-            "confirm_contradiction", "probable_contradiction", "reject_issue", "needs_more_evidence",
+            "confirm_contradiction", "reject_issue", "needs_more_evidence",
         }:
             errors.append(f"{label}: invalid decision")
         # This is a policy declaration in the handoff, not proof of Task identity.
@@ -343,15 +822,7 @@ def validate_artifact(item: dict[str, Any], artifact_type: str, label: str) -> l
         return errors
 
     if artifact_type == "probe":
-        errors.extend(_require(item, (
-            "probe_id", "session_id", "finding_id", "claim_id", "oracle", "selection_reason",
-            "isolation", "baseline", "execution", "interpretation", "tool_trace",
-        ), label))
-        if item.get("interpretation") not in {
-            "supports_contradiction", "disconfirms_contradiction", "inconclusive",
-        }:
-            errors.append(f"{label}: invalid interpretation")
-        return errors
+        return validate_probe_contract(item, label)
     return [f"{label}: unknown artifact type {artifact_type!r}"]
 
 
@@ -383,10 +854,13 @@ def _template_errors(
 
 
 def _template_root_for_handoff(path: Path) -> Path | None:
-    parent = path.resolve().parent
-    if parent.name != "investigators" or parent.parent.name != "handoffs":
-        return None
-    return parent.parent.parent / "handoff-templates" / "investigators"
+    # A candidate may use its own directory below handoffs/investigators so a
+    # failed peer never has to share the same merge input.  Walk only the
+    # resolved ancestor chain and keep the canonical state-owned template root.
+    for parent in path.resolve().parents:
+        if parent.name == "investigators" and parent.parent.name == "handoffs":
+            return parent.parent.parent / "handoff-templates" / "investigators"
+    return None
 
 
 def _load_template(
@@ -448,6 +922,132 @@ def _load_index(path: Path, key: str) -> tuple[dict[str, dict[str, Any]], list[s
     return indexed, errors
 
 
+def expected_critic_input_digests(
+    item: dict[str, Any], state_root: Path, label: str,
+) -> tuple[dict[str, str], list[str]]:
+    """Derive the exact evidence snapshot a critic is allowed to judge."""
+    findings, finding_errors = _load_index(
+        state_root / "investigation_findings.jsonl", "finding_id",
+    )
+    claims, claim_errors = _load_index(
+        state_root / "design_claims.jsonl", "claim_id",
+    )
+    errors = [
+        *(f"{label}: finding ledger is invalid: {error}" for error in finding_errors),
+        *(f"{label}: design claim ledger is invalid: {error}" for error in claim_errors),
+    ]
+    finding_id = str(item.get("finding_id") or "")
+    claim_id = str(item.get("claim_id") or "")
+    finding = findings.get(finding_id)
+    claim = claims.get(claim_id)
+    if finding is None:
+        errors.append(f"{label}: unknown finding_id {finding_id!r}")
+    if claim is None:
+        errors.append(f"{label}: unknown claim_id {claim_id!r}")
+
+    probe_review = item.get("dynamic_probe_review")
+    probe_id = str(probe_review.get("probe_id") or "") if isinstance(
+        probe_review, dict
+    ) else ""
+    probe: dict[str, Any] | None = None
+    if probe_id:
+        probes, probe_errors = _load_index(
+            state_root / "dynamic_probes.jsonl", "probe_id",
+        )
+        errors.extend(
+            f"{label}: dynamic probe ledger is invalid: {error}"
+            for error in probe_errors
+        )
+        probe = probes.get(probe_id)
+        if probe is None:
+            errors.append(f"{label}: unknown probe_id {probe_id!r}")
+
+    return {
+        "claim_sha256": canonical_digest(claim) if claim is not None else "",
+        "finding_sha256": canonical_digest(finding) if finding is not None else "",
+        "probe_sha256": canonical_digest(probe) if probe is not None else "",
+    }, errors
+
+
+def materialize_critic_bindings(
+    item: dict[str, Any], state_root: Path, label: str,
+) -> dict[str, Any]:
+    """Add tool-owned critic bindings without synthesizing semantic content."""
+    expected, errors = expected_critic_input_digests(item, state_root, label)
+    supplied = item.get("input_digests")
+    if supplied is not None and supplied != expected:
+        errors.append(f"{label}: supplied input_digests do not match current evidence")
+    supplied_version = item.get("evidence_critic_prompt_version")
+    if supplied_version is not None and supplied_version != EVIDENCE_CRITIC_PROMPT_VERSION:
+        errors.append(
+            f"{label}: supplied evidence_critic_prompt_version is stale or unsupported"
+        )
+    if errors:
+        identifier = str(item.get("finding_id") or item.get("review_id") or "?")
+        raise HandoffValidationError({identifier: errors})
+    return {
+        **item,
+        "input_digests": expected,
+        "evidence_critic_prompt_version": EVIDENCE_CRITIC_PROMPT_VERSION,
+    }
+
+
+def validate_critic_bindings(
+    item: dict[str, Any], state_root: Path, label: str,
+) -> list[str]:
+    """Reject a retained critic after any judged evidence snapshot changes."""
+    expected, errors = expected_critic_input_digests(item, state_root, label)
+    if item.get("input_digests") != expected:
+        errors.append(f"{label}: input_digests do not match current claim/finding/probe evidence")
+    if item.get("evidence_critic_prompt_version") != EVIDENCE_CRITIC_PROMPT_VERSION:
+        errors.append(
+            f"{label}: evidence_critic_prompt_version does not match current critic contract"
+        )
+    return errors
+
+
+def _critic_history_key(item: dict[str, Any]) -> str:
+    return canonical_digest({
+        "finding_id": item.get("finding_id"),
+        "input_digests": item.get("input_digests"),
+        "evidence_critic_prompt_version": item.get("evidence_critic_prompt_version"),
+    })
+
+
+def validate_critic_review_history(
+    state_root: Path, critiques: dict[str, dict[str, Any]],
+) -> list[str]:
+    path = state_root / "critic_review_history.jsonl"
+    if not path.is_file() or path.is_symlink():
+        return ["critic_review_history.jsonl is missing or not a regular file"]
+    values, parse_errors = ac.load_jsonl(path)
+    errors = [f"critic review history is invalid: {error}" for error in parse_errors]
+    by_key: dict[str, dict[str, Any]] = {}
+    for index, entry in enumerate(values, start=1):
+        label = f"critic_review_history.jsonl:{index}"
+        if not isinstance(entry, dict):
+            errors.append(f"{label}: entry must be an object")
+            continue
+        key = str(entry.get("review_key") or "")
+        critic_sha256 = str(entry.get("critic_sha256") or "")
+        if not key or len(key) != 64:
+            errors.append(f"{label}: review_key must be a SHA-256 digest")
+        if not critic_sha256 or len(critic_sha256) != 64:
+            errors.append(f"{label}: critic_sha256 must be a SHA-256 digest")
+        if key in by_key:
+            errors.append(f"{label}: duplicate evidence review_key {key}")
+        elif key:
+            by_key[key] = entry
+    for finding_id, critique in critiques.items():
+        key = _critic_history_key(critique)
+        entry = by_key.get(key)
+        if entry is None:
+            errors.append(f"critic {finding_id}: current evidence review is absent from history")
+        elif entry.get("critic_sha256") != canonical_digest(critique):
+            errors.append(f"critic {finding_id}: history critic digest does not match current review")
+    return errors
+
+
 def _risk_plan_validation_errors(
     item: dict[str, Any], state_root: Path, label: str,
 ) -> list[str]:
@@ -488,8 +1088,59 @@ def _context_errors(
     item: dict[str, Any], artifact_type: str, state_root: Path, label: str,
 ) -> list[str]:
     """Validate typed references against current session artifacts."""
-    if artifact_type not in {"task", "risk", "critic"}:
+    if artifact_type not in {"task", "risk", "critic", "probe"}:
         return []
+    if artifact_type == "probe":
+        findings, finding_errors = _load_index(
+            state_root / "investigation_findings.jsonl", "finding_id",
+        )
+        claims, claim_errors = _load_index(
+            state_root / "design_claims.jsonl", "claim_id",
+        )
+        errors: list[str] = []
+        if finding_errors:
+            errors.append(
+                f"{label}: finding ledger is invalid: {'; '.join(finding_errors)}"
+            )
+        if claim_errors:
+            errors.append(
+                f"{label}: design claim ledger is invalid: {'; '.join(claim_errors)}"
+            )
+        finding_id = str(item.get("finding_id") or "")
+        claim_id = str(item.get("claim_id") or "")
+        finding = findings.get(finding_id)
+        claim = claims.get(claim_id)
+        if finding is None:
+            errors.append(f"{label}: unknown finding_id {finding_id!r}")
+        elif str(finding.get("claim_id") or "") != claim_id:
+            errors.append(f"{label}: finding/probe claim mismatch for {finding_id}")
+        elif finding.get("session_id") != item.get("session_id"):
+            errors.append(f"{label}: finding belongs to a different session")
+        if claim is None:
+            errors.append(f"{label}: unknown claim_id {claim_id!r}")
+        elif claim.get("session_id") != item.get("session_id"):
+            errors.append(f"{label}: claim belongs to a different session")
+        else:
+            oracle = item.get("oracle") if isinstance(item.get("oracle"), dict) else {}
+            source_ref = claim.get("source_ref") if isinstance(
+                claim.get("source_ref"), dict
+            ) else {}
+            claim_oracle = claim.get("probe_oracle") if isinstance(
+                claim.get("probe_oracle"), dict
+            ) else {}
+            if oracle.get("claim_id") != claim_id:
+                errors.append(f"{label}: oracle.claim_id does not match the probe claim")
+            if oracle.get("claim_sha256") != canonical_digest(claim):
+                errors.append(f"{label}: oracle.claim_sha256 does not match the current claim")
+            if oracle.get("source_sha256") != source_ref.get("source_sha256"):
+                errors.append(f"{label}: oracle.source_sha256 does not match the claim source")
+            for field in ("preconditions", "stimulus", "expected_observation"):
+                if oracle.get(field) != claim_oracle.get(field):
+                    errors.append(
+                        f"{label}: oracle.{field} does not match the design claim"
+                    )
+        errors.extend(validate_probe_workspace(item, state_root, label))
+        return errors
     if artifact_type == "critic":
         findings, finding_errors = _load_index(
             state_root / "investigation_findings.jsonl", "finding_id",
@@ -545,6 +1196,7 @@ def _context_errors(
                     errors.append(f"{label}: probe/claim mismatch for {probe_id}")
                 if probe.get("session_id") != item.get("session_id"):
                     errors.append(f"{label}: probe belongs to a different session")
+        errors.extend(validate_critic_bindings(item, state_root, label))
         return errors
 
     contract_path = state_root / "agent_loop_contract.json"
@@ -608,6 +1260,19 @@ def _context_errors(
     claim_id = str(item.get("claim_id") or "")
     if claim_id not in claims:
         errors.append(f"{label}: unknown claim_id {claim_id!r}")
+    else:
+        claim = claims[claim_id]
+        obligation = claim.get("obligation")
+        expected_obligation_digest = canonical_digest({
+            "claim_id": claim_id,
+            "obligation": obligation,
+        }) if isinstance(obligation, str) and obligation.strip() else ""
+        if not expected_obligation_digest:
+            errors.append(f"{label}: linked claim lacks one non-empty obligation")
+        elif item.get("obligation_sha256") != expected_obligation_digest:
+            errors.append(
+                f"{label}: obligation_sha256 does not match the linked claim obligation"
+            )
     mode = str(item.get("exploration_mode") or "")
     if mode not in modes:
         errors.append(f"{label}: unknown exploration_mode {mode!r}")
@@ -633,11 +1298,18 @@ def _context_errors(
                 risk.get("implementation_planes", [])
             ):
                 errors.append(f"{label}: risk observation {risk_id} shares no implementation plane")
+    errors.extend(validate_task_coverage_binding(item, state_root, label))
     return errors
 
 
 def _finding_batch_expectation(output: Path, input_dir: Path) -> tuple[list[str], list[str], list[str]]:
-    """Use already-created pristine templates as the immutable batch membership."""
+    """Describe only the candidate handoffs submitted by this merge call.
+
+    Pristine templates remain the immutable per-candidate contract, but sibling
+    templates are deliberately not merge prerequisites.  The caller can point
+    ``input_dir`` at one candidate-owned directory (the normal path) or at an
+    explicitly selected subset of at most two candidates.
+    """
     state_root = output.resolve().parent
     template_root = state_root / "handoff-templates" / "investigators"
     if not template_root.is_dir():
@@ -650,30 +1322,17 @@ def _finding_batch_expectation(output: Path, input_dir: Path) -> tuple[list[str]
         if item.get("task_id") and item.get("status") == "deferred"
         and not validate_task_defer_evidence(item, f"task ({item.get('task_id')})")
     }
-    prior, prior_errors = ac.load_jsonl(output)
-    if prior_errors and output.exists():
-        raise ValueError(f"existing ledger is invalid: {'; '.join(prior_errors)}")
-    prior_ids = sorted(
-        str(item.get("finding_id")) for item in prior if item.get("finding_id")
-    )
-    template_ids: set[str] = set()
-    for path in sorted(template_root.glob("*.json")):
-        value = ac.load_json(path)
-        if not isinstance(value, dict) or not value.get("finding_id"):
-            raise ValueError(f"invalid pristine template: {path}")
-        template_ids.add(str(value["finding_id"]))
     deferred_ids = sorted(
-        finding_id for finding_id in template_ids
-        if finding_id.removeprefix("FINDING-") in deferred_task_ids
+        f"FINDING-{task_id}" for task_id in deferred_task_ids
     )
-    expected = sorted(template_ids - set(prior_ids) - set(deferred_ids))
-    if len(expected) > 2:
+    submitted = sorted(_handoff_identifiers(input_dir, "finding_id"))
+    if len(submitted) > 2:
         raise ValueError(
-            f"investigator batch has more than two unresolved template IDs: {expected}"
+            f"finding merge submits more than two candidate IDs: {submitted}"
         )
-    present = _handoff_identifiers(input_dir, "finding_id")
-    missing = sorted(set(expected) - present)
-    return expected, missing, deferred_ids
+    # Unknown IDs and stale template contents are rejected later by
+    # _load_template/_template_errors with candidate-local diagnostics.
+    return submitted, [], deferred_ids
 
 
 def _deferred_finding_input_errors(
@@ -751,13 +1410,27 @@ def validate_item(
     return errors
 
 
+def _typed_state_root_for_handoff(path: Path, directory: str, label: str) -> Path:
+    """Locate state root for direct or candidate-owned typed handoff paths."""
+    for parent in path.resolve().parents:
+        if parent.name == directory and parent.parent.name == "handoffs":
+            return parent.parent.parent
+    raise ValueError(
+        f"{label} --check-file must be located under "
+        f"<state-root>/handoffs/{directory}"
+    )
+
+
 def _risk_state_root_for_handoff(path: Path) -> Path:
-    parent = path.resolve().parent
-    if parent.name != "risks" or parent.parent.name != "handoffs":
-        raise ValueError(
-            "risk --check-file must be located under <state-root>/handoffs/risks"
-        )
-    return parent.parent.parent
+    return _typed_state_root_for_handoff(path, "risks", "risk")
+
+
+def _critic_state_root_for_handoff(path: Path) -> Path:
+    return _typed_state_root_for_handoff(path, "critics", "critic")
+
+
+def _probe_state_root_for_handoff(path: Path) -> Path:
+    return _typed_state_root_for_handoff(path, "probes", "probe")
 
 
 def _validate_risk_handoff_file(
@@ -852,41 +1525,37 @@ def _validate_risk_batch(
     state_root: Path,
     expected_sweep_ids: list[str] | None = None,
 ) -> list[str]:
-    """Require every plan-owned sweep file before mutating the shared ledger."""
+    """Validate one or more plan-owned sweep files before mutating the ledger."""
     if not input_dir.is_dir():
         raise ValueError(f"handoff directory is missing: {input_dir}")
     if expected_sweep_ids is None:
         expected_sweep_ids = sorted(_expected_risk_sweep_ids(state_root))
-    if len(expected_sweep_ids) < 2:
+    if not expected_sweep_ids:
         raise ValueError(
-            "risk sweep plan must declare at least two sweep IDs; "
+            "risk sweep plan must declare at least one sweep ID; "
             f"found {expected_sweep_ids}"
         )
 
     expected_paths = {
-        input_dir / f"{sweep_id}.json" for sweep_id in expected_sweep_ids
+        input_dir / f"{sweep_id}.json": sweep_id for sweep_id in expected_sweep_ids
     }
     actual_paths = {
         path for path in input_dir.rglob("*")
         if path.is_file() and path.suffix.lower() in {".json", ".jsonl"}
     }
-    missing = sorted(path.name for path in expected_paths - actual_paths)
     unexpected = sorted(
-        str(path.relative_to(input_dir)) for path in actual_paths - expected_paths
+        str(path.relative_to(input_dir)) for path in actual_paths - set(expected_paths)
     )
-    if missing or unexpected or len(actual_paths) != len(expected_paths):
-        details: list[str] = []
-        if missing:
-            details.append(f"missing {missing}")
-        if unexpected:
-            details.append(f"unexpected {unexpected}")
+    if not actual_paths:
+        raise ValueError("risk merge requires at least one planned sweep JSON file")
+    if unexpected:
         raise ValueError(
-            "risk merge requires exactly all planned sweep JSON files"
-            + (f": {'; '.join(details)}" if details else "")
+            "risk merge contains unplanned sweep files: " + str(unexpected)
         )
 
-    for sweep_id in expected_sweep_ids:
-        path = input_dir / f"{sweep_id}.json"
+    submitted_sweep_ids: list[str] = []
+    for path in sorted(actual_paths):
+        sweep_id = expected_paths[path]
         file_sweep_id, _ = _validate_risk_handoff_file(
             path,
             _read_values(path),
@@ -899,7 +1568,28 @@ def _validate_risk_batch(
             raise ValueError(
                 f"risk sweep file {path.name} contains sweep {file_sweep_id!r}"
             )
-    return expected_sweep_ids
+        submitted_sweep_ids.append(sweep_id)
+    return submitted_sweep_ids
+
+
+def _risk_ledger_sweep_ids(output: Path, state_root: Path) -> list[str]:
+    """Read cumulative sweep completion from the current-plan risk ledger."""
+    if not output.is_file():
+        return []
+    values, errors = ac.load_jsonl(output)
+    if errors:
+        raise ValueError(f"existing ledger is invalid: {'; '.join(errors)}")
+    plan_path = state_root / "risk_sweep_plan.json"
+    plan_digest = ac.sha256_file(plan_path) if plan_path.is_file() else ""
+    return sorted({
+        str(item.get("sweep_id") or "") for item in values
+        if isinstance(item.get("sweep_id"), str)
+        and item.get("sweep_id")
+        and (
+            not plan_digest
+            or item.get("risk_sweep_plan_sha256") == plan_digest
+        )
+    })
 
 
 def merge(
@@ -916,13 +1606,20 @@ def merge(
     if not input_dir.is_dir():
         raise ValueError(f"handoff directory is missing: {input_dir}")
     existing: list[dict[str, Any]] = []
-    # A repaired architecture/plan invalidates every prior risk observation.  The
-    # The current sweep files are therefore the authoritative batch, not an
-    # incremental overlay on a stale ledger.
-    if output.exists() and artifact_type != "risk":
+    if output.exists():
         existing, errors = ac.load_jsonl(output)
         if errors:
             raise ValueError(f"existing ledger is invalid: {'; '.join(errors)}")
+    if artifact_type == "risk" and context_root is not None:
+        plan_path = context_root / "risk_sweep_plan.json"
+        if plan_path.is_file():
+            current_plan_digest = ac.sha256_file(plan_path)
+            # A changed plan invalidates all previous sweep ownership.  Current-plan
+            # observations remain independently reusable and are updated per sweep.
+            existing = [
+                item for item in existing
+                if item.get("risk_sweep_plan_sha256") == current_plan_digest
+            ]
     ordered: list[str] = []
     values: dict[str, dict[str, Any]] = {}
     for item in existing:
@@ -933,7 +1630,48 @@ def merge(
             ordered.append(identifier)
         values[identifier] = item
 
+    invalidated_ids: list[str] = []
+    if artifact_type == "critic" and context_root is not None:
+        # Upstream evidence can change independently for one candidate.  Remove
+        # only critics whose previously reviewed evidence snapshot is now stale;
+        # otherwise that stale peer would prevent an unrelated fresh critic from
+        # merging.  Broken ledgers/references are not silently discarded: they
+        # remain below and fail ordinary context validation.
+        for identifier in list(ordered):
+            retained = values[identifier]
+            expected, binding_errors = expected_critic_input_digests(
+                retained, context_root, f"critic ({identifier})",
+            )
+            stale = (
+                not binding_errors
+                and (
+                    retained.get("input_digests") != expected
+                    or retained.get("evidence_critic_prompt_version")
+                    != EVIDENCE_CRITIC_PROMPT_VERSION
+                )
+            )
+            if stale:
+                invalidated_ids.append(identifier)
+                ordered.remove(identifier)
+                values.pop(identifier, None)
+
     imported = 0
+    critic_history_path: Path | None = None
+    critic_history_values: list[dict[str, Any]] = []
+    critic_history_by_key: dict[str, dict[str, Any]] = {}
+    pending_critic_history: list[dict[str, Any]] = []
+    if artifact_type == "critic" and context_root is not None:
+        critic_history_path = context_root / "critic_review_history.jsonl"
+        if not critic_history_path.is_file() or critic_history_path.is_symlink():
+            raise ValueError("critic merge requires tool-owned critic_review_history.jsonl")
+        critic_history_values, history_errors = ac.load_jsonl(critic_history_path)
+        if history_errors:
+            raise ValueError("critic review history is invalid: " + "; ".join(history_errors))
+        for entry in critic_history_values:
+            key_value = str(entry.get("review_key") or "")
+            if not key_value or key_value in critic_history_by_key:
+                raise ValueError("critic review history contains a missing or duplicate review_key")
+            critic_history_by_key[key_value] = entry
     files = sorted(
         path for path in input_dir.rglob("*")
         if path.is_file() and path.suffix.lower() in {".json", ".jsonl"}
@@ -953,9 +1691,74 @@ def merge(
             imported_sources[identifier] = path
             imported_items.append((path, item))
 
+    submitted_sweep_ids: set[str] = set()
+    if artifact_type == "risk":
+        submitted_sweep_ids = {
+            str(item.get("sweep_id") or "") for _path, item in imported_items
+            if isinstance(item.get("sweep_id"), str) and item.get("sweep_id")
+        }
+        # One submitted sweep file is authoritative only for that sweep.  Remove
+        # its previous observations, preserving every other completed sweep.
+        replaced_ids = {
+            identifier for identifier in ordered
+            if values[identifier].get("sweep_id") in submitted_sweep_ids
+        }
+        if replaced_ids:
+            ordered = [identifier for identifier in ordered if identifier not in replaced_ids]
+            for identifier in replaced_ids:
+                values.pop(identifier, None)
+
     for _path, item in imported_items:
+        if artifact_type == "critic" and context_root is not None:
+            item = materialize_critic_bindings(
+                item,
+                context_root,
+                f"critic ({item.get('finding_id') or item.get('review_id') or '?'})",
+            )
+            history_key = _critic_history_key(item)
+            historical = critic_history_by_key.get(history_key)
+            item_sha256 = canonical_digest(item)
+            if historical is not None and historical.get("critic_sha256") != item_sha256:
+                raise HandoffValidationError({str(item.get("finding_id") or "?"): [
+                    f"critic ({item.get('finding_id') or '?'}): current evidence snapshot "
+                    "was already reviewed in critic history; new claim/finding/probe "
+                    "evidence is required before revision"
+                ]})
+            if historical is None:
+                history_entry = {
+                    "recorded_at": ac.now_iso(),
+                    "session_id": item.get("session_id"),
+                    "finding_id": item.get("finding_id"),
+                    "review_key": history_key,
+                    "input_digests": item.get("input_digests"),
+                    "evidence_critic_prompt_version": item.get(
+                        "evidence_critic_prompt_version"
+                    ),
+                    "critic_sha256": item_sha256,
+                }
+                pending_critic_history.append(history_entry)
+                critic_history_by_key[history_key] = history_entry
         identifier = str(item.get(key) or "")
         prior = values.get(identifier)
+        if artifact_type == "critic" and prior is not None:
+            same_snapshot = (
+                prior.get("input_digests") == item.get("input_digests")
+                and prior.get("evidence_critic_prompt_version")
+                == item.get("evidence_critic_prompt_version")
+            )
+            if prior == item:
+                # Exact retries are idempotent; they do not create a second review.
+                continue
+            if same_snapshot:
+                raise HandoffValidationError({identifier: [
+                    f"critic ({identifier}): current evidence snapshot was already "
+                    "reviewed; new claim/finding/probe evidence is required before revision"
+                ]})
+        if artifact_type == "risk" and prior is not None:
+            raise ValueError(
+                f"risk observation_id {identifier!r} conflicts with preserved sweep "
+                f"{prior.get('sweep_id')!r}"
+            )
         if (
             artifact_type == "task" and prior
             and prior.get("status") == "complete" and item.get("status") == "pending"
@@ -969,32 +1772,70 @@ def merge(
     validation_errors: dict[str, list[str]] = {}
     for identifier in ordered:
         item = values[identifier]
-        template = _load_template(
-            template_root, item, required=template_root is not None,
-        ) if artifact_type == "finding" else None
-        item_errors = validate_item(
-            item, artifact_type=artifact_type, identifier=identifier,
-            session_id=session_id, code_root=code_root, design_root=design_root,
-            template=template,
-        )
+        template_errors: list[str] = []
+        template = None
+        if artifact_type == "finding":
+            try:
+                template = _load_template(
+                    template_root, item, required=template_root is not None,
+                )
+            except (OSError, ValueError) as exc:
+                template_errors.append(f"finding ({identifier}): {exc}")
+        item_errors = [
+            *template_errors,
+            *validate_item(
+                item, artifact_type=artifact_type, identifier=identifier,
+                session_id=session_id, code_root=code_root, design_root=design_root,
+                template=template,
+            ),
+        ]
         if context_root is not None:
             item_errors.extend(_context_errors(
                 item, artifact_type, context_root, f"{artifact_type} ({identifier})",
             ))
         if item_errors:
             validation_errors[identifier] = item_errors
-    if validation_errors:
-        raise HandoffValidationError(validation_errors)
+    candidate_local_types = {"task", "finding", "probe", "critic"}
+    blocking_validation_errors = {
+        identifier: item_errors
+        for identifier, item_errors in validation_errors.items()
+        if artifact_type not in candidate_local_types
+        or identifier in imported_sources
+    }
+    if blocking_validation_errors:
+        raise HandoffValidationError(blocking_validation_errors)
+    retained_invalid_ids = sorted(
+        set(validation_errors) - set(blocking_validation_errors)
+    )
     if artifact_type == "risk":
         if context_root is None:
             raise ValueError("risk merge requires a state-root context")
         import risk_sweep_plan_validator as validator
 
-        coverage_errors, _coverage = validator.validate_risk_coverage(
-            values, context_root,
-        )
-        if coverage_errors:
-            raise ValueError("; ".join(coverage_errors))
+        expected_sweep_ids = _expected_risk_sweep_ids(context_root)
+        completed_sweep_ids = {
+            str(item.get("sweep_id") or "") for item in values.values()
+            if isinstance(item.get("sweep_id"), str) and item.get("sweep_id")
+        }
+        sweep_errors: list[str] = []
+        for sweep_id in sorted(completed_sweep_ids):
+            sweep_errors.extend(validator.validate_sweep_coverage(
+                [
+                    item for item in values.values()
+                    if item.get("sweep_id") == sweep_id
+                ],
+                context_root,
+                sweep_id,
+            ))
+        if sweep_errors:
+            raise ValueError("; ".join(sweep_errors))
+        closed = completed_sweep_ids == expected_sweep_ids
+        if closed:
+            coverage_errors, _coverage = validator.validate_risk_coverage(
+                values, context_root,
+            )
+            if coverage_errors:
+                raise ValueError("; ".join(coverage_errors))
 
     ac.ensure_dir(output.parent)
     temporary = output.with_suffix(output.suffix + ".tmp")
@@ -1003,27 +1844,92 @@ def merge(
         encoding="utf-8",
     )
     temporary.replace(output)
-    return {
+    if critic_history_path is not None and pending_critic_history:
+        history_temporary = critic_history_path.with_suffix(".jsonl.tmp")
+        history_temporary.write_text(
+            "".join(
+                json.dumps(entry, ensure_ascii=False) + "\n"
+                for entry in [*critic_history_values, *pending_critic_history]
+            ),
+            encoding="utf-8",
+        )
+        history_temporary.replace(critic_history_path)
+    validated_ids = [
+        identifier for identifier in ordered if identifier not in validation_errors
+    ]
+    result = {
         "files": len(files), "imported": imported, "ledger_entries": len(ordered),
-        "validated_ids": ordered,
+        "validated_ids": validated_ids,
     }
+    if artifact_type in candidate_local_types:
+        result["retained_invalid_ids"] = retained_invalid_ids
+    if artifact_type == "critic":
+        result["invalidated_ids"] = sorted(invalidated_ids)
+        result["critic_history_entries"] = len(
+            critic_history_values
+        ) + len(pending_critic_history)
+    if artifact_type == "task":
+        result["task_plan_ledger_sha256"] = task_plan_ledger_sha256(values)
+    if artifact_type == "risk":
+        expected = sorted(expected_sweep_ids)
+        completed = sorted(completed_sweep_ids)
+        result.update({
+            "expected_sweep_ids": expected,
+            "submitted_sweep_ids": sorted(submitted_sweep_ids),
+            # Kept as an explicit compatibility alias: validation in this call
+            # applies to submitted sweeps, not cumulative completion.
+            "validated_sweep_ids": sorted(submitted_sweep_ids),
+            "completed_sweep_ids": completed,
+            "missing_sweep_ids": sorted(expected_sweep_ids - completed_sweep_ids),
+            "closed": closed,
+            "global_coverage_validated": closed,
+        })
+    return result
 
 
-def _complete_tasks_for_findings(state_root: Path, session_id: str | None) -> dict[str, Any]:
-    """Apply the deterministic pending -> complete transition after a finding merge."""
+def _complete_tasks_for_findings(
+    state_root: Path, submitted_finding_ids: set[str],
+) -> dict[str, Any]:
+    """Apply finding-owned lifecycle updates without revalidating the stable plan."""
     task_path = state_root / "investigation_tasks.jsonl"
     finding_path = state_root / "investigation_findings.jsonl"
+    round_path = state_root / "investigation_rounds.jsonl"
     tasks, task_errors = ac.load_jsonl(task_path)
     findings, finding_errors = ac.load_jsonl(finding_path)
-    errors = [*task_errors, *finding_errors]
+    rounds, round_errors = ac.load_jsonl(round_path)
+    errors = [*task_errors, *finding_errors, *round_errors]
     task_index = {
         str(item.get("task_id") or ""): item for item in tasks if item.get("task_id")
     }
     findings_by_task: dict[str, list[dict[str, Any]]] = {}
     for finding in findings:
         findings_by_task.setdefault(str(finding.get("task_id") or ""), []).append(finding)
+    round_membership: dict[str, list[dict[str, Any]]] = {}
+    for round_item in rounds:
+        round_task_ids = round_item.get("task_ids")
+        if not isinstance(round_task_ids, list):
+            errors.append(
+                f"round {round_item.get('round_id') or '?'} task_ids must be an array"
+            )
+            continue
+        for task_id in round_task_ids:
+            if isinstance(task_id, str) and task_id:
+                round_membership.setdefault(task_id, []).append(round_item)
     transitioned: list[str] = []
+    linked_findings: list[str] = []
+    submitted_task_ids: list[str] = []
     for task_id, linked in findings_by_task.items():
+        submitted = [
+            finding for finding in linked
+            if str(finding.get("finding_id") or "") in submitted_finding_ids
+        ]
+        if not submitted:
+            # Retained findings were validated above and are deliberately not a
+            # prerequisite for this candidate-owned lifecycle transition.  A
+            # stale retained peer remains visible as retained_invalid_ids and
+            # must be repaired before the final gate, but it cannot roll back an
+            # unrelated candidate that passed its own template/context checks.
+            continue
         task = task_index.get(task_id)
         if task is None:
             errors.append(f"finding references unknown task {task_id!r}")
@@ -1032,6 +1938,9 @@ def _complete_tasks_for_findings(state_root: Path, session_id: str | None) -> di
             errors.append(f"task {task_id} has {len(linked)} findings; exactly one is required")
             continue
         finding = linked[0]
+        finding_id = str(finding.get("finding_id") or "")
+        if finding_id in submitted_finding_ids:
+            submitted_task_ids.append(task_id)
         if str(task.get("claim_id") or "") != str(finding.get("claim_id") or ""):
             errors.append(f"task/finding claim mismatch for {task_id}")
             continue
@@ -1043,12 +1952,25 @@ def _complete_tasks_for_findings(state_root: Path, session_id: str | None) -> di
             task["defer_reason"] = ""
             task.pop("defer_evidence", None)
             transitioned.append(task_id)
-    for task in tasks:
-        identifier = str(task.get("task_id") or "?")
-        errors.extend(validate_item(
-            task, artifact_type="task", identifier=identifier, session_id=session_id,
-        ))
-        errors.extend(_context_errors(task, "task", state_root, f"task ({identifier})"))
+        owning_rounds = round_membership.get(task_id, [])
+        if len(owning_rounds) != 1:
+            errors.append(
+                f"task {task_id} belongs to {len(owning_rounds)} rounds; exactly one is required"
+            )
+            continue
+        round_item = owning_rounds[0]
+        round_findings = round_item.get("finding_ids")
+        if not isinstance(round_findings, list):
+            errors.append(
+                f"round {round_item.get('round_id') or '?'} finding_ids must be an array"
+            )
+            continue
+        if round_findings.count(finding_id) > 1:
+            errors.append(f"round contains duplicate finding_id {finding_id}")
+            continue
+        if finding_id not in round_findings:
+            round_findings.append(finding_id)
+        linked_findings.append(finding_id)
     if errors:
         raise ValueError("; ".join(errors))
     temporary = task_path.with_suffix(task_path.suffix + ".tmp")
@@ -1057,11 +1979,81 @@ def _complete_tasks_for_findings(state_root: Path, session_id: str | None) -> di
         encoding="utf-8",
     )
     temporary.replace(task_path)
+    round_temporary = round_path.with_suffix(round_path.suffix + ".tmp")
+    round_temporary.write_text(
+        "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in rounds),
+        encoding="utf-8",
+    )
+    round_temporary.replace(round_path)
     return {
-        "validated_ids": [str(item["task_id"]) for item in tasks],
+        # Populated from the fresh candidate-aware lifecycle trace by the caller.
+        "validated_ids": [],
         "transitioned_ids": transitioned,
+        "submitted_task_ids": sorted(set(submitted_task_ids)),
+        "linked_finding_ids": sorted(linked_findings),
         "ledger_sha256": ac.sha256_file(task_path),
+        "rounds_sha256": ac.sha256_file(round_path),
     }
+
+
+def _task_lifecycle_trace_path(state_root: Path) -> Path | None:
+    manifest_path = state_root / "workspace_manifest.json"
+    if not manifest_path.is_file():
+        return None
+    manifest = ac.load_json(manifest_path)
+    log_root = manifest.get("paths", {}).get("log_root") if isinstance(manifest, dict) else None
+    if not isinstance(log_root, str) or not log_root:
+        return None
+    return Path(log_root).resolve() / "trace" / "task_lifecycle_validation.json"
+
+
+def _refresh_task_lifecycle_trace(
+    state_root: Path, *, code_root: Path | None, design_root: Path | None,
+    required_task_ids: set[str],
+) -> dict[str, Any]:
+    manifest = ac.load_json(state_root / "workspace_manifest.json")
+    paths = manifest.get("paths", {}) if isinstance(manifest, dict) else {}
+    resolved_code = code_root or Path(str(paths.get("code_root") or "")).resolve()
+    resolved_design = design_root or Path(str(paths.get("design_root") or "")).resolve()
+    result_root = Path(str(paths.get("result_root") or "")).resolve()
+    log_root = Path(str(paths.get("log_root") or "")).resolve()
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve().parent / "stage_artifact_validator.py"),
+        "--stage", "task-lifecycle",
+        "--code-root", str(resolved_code),
+        "--design-root", str(resolved_design),
+        "--result-root", str(result_root),
+        "--log-root", str(log_root),
+        "--state-root", str(state_root),
+    ]
+    result = subprocess.run(command, text=True, capture_output=True)
+    trace_path = log_root / "trace" / "task_lifecycle_validation.json"
+    trace = ac.load_json(trace_path) if trace_path.is_file() else {}
+    if not isinstance(trace, dict) or trace.get("global_passed") is not True:
+        detail = result.stdout.strip() or result.stderr.strip() or "unknown lifecycle error"
+        raise ValueError(
+            "task lifecycle validation has global structural errors after finding merge: "
+            + detail
+        )
+    trace_digests = trace.get("input_digests", {})
+    stale_inputs = [
+        name for name in (
+            "investigation_tasks.jsonl", "investigation_findings.jsonl",
+            "investigation_rounds.jsonl",
+        )
+        if trace_digests.get(name) != ac.sha256_file(state_root / name)
+    ] if isinstance(trace_digests, dict) else ["input_digests"]
+    if stale_inputs:
+        raise ValueError(
+            f"task lifecycle validation trace is stale after finding merge: {stale_inputs}"
+        )
+    missing = sorted(required_task_ids - set(trace.get("valid_task_ids", [])))
+    if missing:
+        raise ValueError(
+            f"submitted finding tasks failed lifecycle validation after merge: {missing}"
+        )
+    return trace
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1088,7 +2080,10 @@ def main(argv: list[str] | None = None) -> int:
     batch_missing_ids: list[str] = []
     batch_deferred_ids: list[str] = []
     risk_expected_sweep_ids: list[str] = []
+    risk_submitted_sweep_ids: list[str] = []
     risk_validated_sweep_ids: list[str] = []
+    risk_completed_sweep_ids: list[str] = []
+    risk_closed = False
     risk_plan_sha256 = ""
     risk_architecture_sha256 = ""
     task_lifecycle: dict[str, Any] | None = None
@@ -1121,6 +2116,9 @@ def main(argv: list[str] | None = None) -> int:
                     ac.sha256_file(architecture_path)
                     if architecture_path.is_file() else ""
                 )
+                risk_completed_sweep_ids = _risk_ledger_sweep_ids(
+                    state_root / "risk_observations.jsonl", state_root,
+                )
                 sweep_id, identifiers = _validate_risk_handoff_file(
                     check_path,
                     values,
@@ -1129,15 +2127,23 @@ def main(argv: list[str] | None = None) -> int:
                     code_root=code_root,
                     validate_items=True,
                 )
+                risk_submitted_sweep_ids = [sweep_id]
                 risk_validated_sweep_ids = [sweep_id]
+                risk_closed = set(risk_completed_sweep_ids) == set(
+                    risk_expected_sweep_ids
+                )
                 result = {
                     "files": 1,
                     "validated_ids": identifiers,
                     "expected_sweep_ids": risk_expected_sweep_ids,
+                    "submitted_sweep_ids": risk_submitted_sweep_ids,
                     "validated_sweep_ids": risk_validated_sweep_ids,
+                    "completed_sweep_ids": risk_completed_sweep_ids,
                     "missing_sweep_ids": sorted(
-                        set(risk_expected_sweep_ids) - set(risk_validated_sweep_ids)
+                        set(risk_expected_sweep_ids) - set(risk_completed_sweep_ids)
                     ),
+                    "closed": risk_closed,
+                    "global_coverage_validated": False,
                     "risk_sweep_plan_sha256": risk_plan_sha256,
                     "architecture_map_sha256": risk_architecture_sha256,
                 }
@@ -1145,6 +2151,16 @@ def main(argv: list[str] | None = None) -> int:
                 if len(values) != 1:
                     raise ValueError("--check-file must contain exactly one object")
                 item = values[0]
+                typed_state_root: Path | None = None
+                if args.artifact_type == "critic":
+                    typed_state_root = _critic_state_root_for_handoff(check_path)
+                    item = materialize_critic_bindings(
+                        item,
+                        typed_state_root,
+                        f"critic ({item.get('finding_id') or item.get('review_id') or '?'})",
+                    )
+                elif args.artifact_type == "probe":
+                    typed_state_root = _probe_state_root_for_handoff(check_path)
                 identifier = str(item.get(key) or "")
                 if not identifier:
                     raise ValueError(f"checked handoff lacks {key}")
@@ -1157,9 +2173,23 @@ def main(argv: list[str] | None = None) -> int:
                     session_id=args.session_id, code_root=code_root, design_root=design_root,
                     template=template,
                 )
+                if typed_state_root is not None:
+                    errors.extend(_context_errors(
+                        item,
+                        args.artifact_type,
+                        typed_state_root,
+                        f"{args.artifact_type} ({identifier})",
+                    ))
                 if errors:
                     raise HandoffValidationError({identifier: errors})
                 result = {"files": 1, "validated_ids": [identifier]}
+                if args.artifact_type == "critic":
+                    result.update({
+                        "input_digests": item["input_digests"],
+                        "evidence_critic_prompt_version": item[
+                            "evidence_critic_prompt_version"
+                        ],
+                    })
         else:
             if not args.output:
                 raise ValueError("--output is required with --input-dir")
@@ -1177,22 +2207,30 @@ def main(argv: list[str] | None = None) -> int:
                     ac.sha256_file(architecture_path)
                     if architecture_path.is_file() else ""
                 )
-                _validate_risk_batch(
+                risk_completed_sweep_ids = _risk_ledger_sweep_ids(
+                    output, output.parent,
+                )
+                risk_closed = set(risk_completed_sweep_ids) == set(
+                    risk_expected_sweep_ids
+                )
+                risk_submitted_sweep_ids = _validate_risk_batch(
                     input_dir, output.parent, risk_expected_sweep_ids,
                 )
+                risk_validated_sweep_ids = list(risk_submitted_sweep_ids)
             if args.artifact_type == "finding":
                 batch_expected_ids, batch_missing_ids, batch_deferred_ids = _finding_batch_expectation(output, input_dir)
-                if batch_missing_ids:
-                    raise HandoffValidationError({
-                        identifier: [f"finding batch is missing expected handoff {identifier}"]
-                        for identifier in batch_missing_ids
-                    })
                 deferred_input_errors = _deferred_finding_input_errors(output.parent, input_dir)
                 if deferred_input_errors:
                     raise HandoffValidationError(deferred_input_errors)
-                ledger_snapshot = _snapshot_files([
-                    output, output.parent / "investigation_tasks.jsonl",
-                ])
+                lifecycle_trace_path = _task_lifecycle_trace_path(output.parent)
+                lifecycle_files = [
+                    output,
+                    output.parent / "investigation_tasks.jsonl",
+                    output.parent / "investigation_rounds.jsonl",
+                ]
+                if lifecycle_trace_path is not None:
+                    lifecycle_files.append(lifecycle_trace_path)
+                ledger_snapshot = _snapshot_files(lifecycle_files)
             result = merge(
                 input_dir, output, key,
                 artifact_type=args.artifact_type, session_id=args.session_id,
@@ -1202,11 +2240,11 @@ def main(argv: list[str] | None = None) -> int:
             )
             result["ledger_sha256"] = ac.sha256_file(output)
             if args.artifact_type == "risk":
-                risk_validated_sweep_ids = risk_expected_sweep_ids
+                risk_submitted_sweep_ids = list(result["submitted_sweep_ids"])
+                risk_validated_sweep_ids = list(result["validated_sweep_ids"])
+                risk_completed_sweep_ids = list(result["completed_sweep_ids"])
+                risk_closed = result["closed"] is True
                 result.update({
-                    "expected_sweep_ids": risk_expected_sweep_ids,
-                    "validated_sweep_ids": risk_validated_sweep_ids,
-                    "missing_sweep_ids": [],
                     "risk_sweep_plan_sha256": risk_plan_sha256,
                     "architecture_map_sha256": risk_architecture_sha256,
                 })
@@ -1218,7 +2256,23 @@ def main(argv: list[str] | None = None) -> int:
                 result["missing_ids"] = []
                 result["deferred_ids"] = batch_deferred_ids
             if args.artifact_type == "finding":
-                task_lifecycle = _complete_tasks_for_findings(output.parent, args.session_id)
+                task_lifecycle = _complete_tasks_for_findings(
+                    output.parent, set(result.get("batch_validated_ids", [])),
+                )
+                lifecycle_trace = _refresh_task_lifecycle_trace(
+                    output.parent, code_root=code_root, design_root=design_root,
+                    required_task_ids=set(task_lifecycle["submitted_task_ids"]),
+                )
+                task_lifecycle.update({
+                    "validated_ids": lifecycle_trace.get("valid_task_ids", []),
+                    "task_lifecycle_sha256": lifecycle_trace.get("task_lifecycle_sha256"),
+                    "candidate_digests": lifecycle_trace.get("candidate_digests", {}),
+                    "valid_task_ids": lifecycle_trace.get("valid_task_ids", []),
+                    "invalid_task_ids": lifecycle_trace.get("invalid_task_ids", []),
+                    "lifecycle_trace": str(
+                        _task_lifecycle_trace_path(output.parent) or ""
+                    ),
+                })
     except (OSError, ValueError) as exc:
         if ledger_snapshot:
             try:
@@ -1236,10 +2290,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.artifact_type == "risk":
             report.update({
                 "expected_sweep_ids": risk_expected_sweep_ids,
+                "submitted_sweep_ids": risk_submitted_sweep_ids,
                 "validated_sweep_ids": risk_validated_sweep_ids,
+                "completed_sweep_ids": risk_completed_sweep_ids,
                 "missing_sweep_ids": sorted(
-                    set(risk_expected_sweep_ids) - set(risk_validated_sweep_ids)
+                    set(risk_expected_sweep_ids) - set(risk_completed_sweep_ids)
                 ),
+                "closed": risk_closed,
+                "global_coverage_validated": False,
                 "risk_sweep_plan_sha256": risk_plan_sha256,
                 "architecture_map_sha256": risk_architecture_sha256,
             })
@@ -1279,23 +2337,30 @@ def main(argv: list[str] | None = None) -> int:
                 "report": str(report_path) if report_path else "",
                 "report_sha256": ac.sha256_file(report_path) if report_path and report_path.is_file() else "",
                 "ledger_sha256": result.get("ledger_sha256", ""),
+                **({
+                    "task_plan_ledger_sha256": result.get(
+                        "task_plan_ledger_sha256", ""
+                    ),
+                } if args.artifact_type == "task" else {}),
             })
             if task_lifecycle is not None and report_path is not None:
-                task_report_path = report_path.parent / "task-handoff-merge.json"
+                task_report_path = report_path.parent / "task-lifecycle-transition.json"
                 task_report = {
-                    "passed": True, "artifact_type": "task", "errors": [],
+                    "passed": True, "artifact_type": "task-lifecycle", "errors": [],
                     **task_lifecycle,
                     "lifecycle_source": "validated finding handoff merge",
                 }
                 ac.save_json(task_report_path, task_report)
                 ac.append_jsonl(output.parent / "agent_run_ledger.jsonl", {
                     "recorded_at": ac.now_iso(), "session_id": state.get("session_id", ""),
-                    "event": "handoff_merge", "actor": "handoff_merge_helper",
-                    "phase": "investigation_planning", "status": "complete",
-                    "artifact_type": "task", "validated_ids": task_report["validated_ids"],
+                    "event": "task_lifecycle_transition", "actor": "handoff_merge_helper",
+                    "phase": "investigation", "status": "complete",
+                    "artifact_type": "task-lifecycle", "validated_ids": task_report["validated_ids"],
                     "report": str(task_report_path),
                     "report_sha256": ac.sha256_file(task_report_path),
                     "ledger_sha256": task_report["ledger_sha256"],
+                    "rounds_sha256": task_report["rounds_sha256"],
+                    "task_lifecycle_sha256": task_report["task_lifecycle_sha256"],
                     "transitioned_ids": task_report["transitioned_ids"],
                 })
             if args.artifact_type == "probe":
@@ -1305,7 +2370,8 @@ def main(argv: list[str] | None = None) -> int:
                     "scope": str(output.parent / "probes"), "decision": "auto_approved",
                     "rationale": (
                         "Validated probe handoffs are confined to session-owned copies and use "
-                        "design-derived oracles."
+                        "claim-bound design oracles, explicit non-triviality checks, and a "
+                        "secondary oracle when one is available."
                     ),
                 })
     print(json.dumps(report))

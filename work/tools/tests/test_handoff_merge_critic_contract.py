@@ -88,6 +88,7 @@ def critic_state(tmp_path: Path) -> dict[str, object]:
             "claim_id": "CLAIM-1", "session_id": "session-old",
         },
     ])
+    (state / "critic_review_history.jsonl").touch()
     return {"state": state, "handoffs": handoffs, "session_id": session_id}
 
 
@@ -117,7 +118,175 @@ def test_valid_critic_is_schema_complete_and_bound_to_current_artifacts(critic_s
     assert result["validated_ids"] == ["FINDING-1"]
     merged, errors = ac.load_jsonl(Path(critic_state["state"]) / "critic_reviews.jsonl")
     assert errors == []
-    assert merged == [critic]
+    assert merged == [{
+        **critic,
+        "input_digests": {
+            "claim_sha256": hm.canonical_digest({
+                "claim_id": "CLAIM-1", "session_id": critic_state["session_id"],
+            }),
+            "finding_sha256": hm.canonical_digest({
+                "finding_id": "FINDING-1", "claim_id": "CLAIM-1",
+                "session_id": critic_state["session_id"],
+            }),
+            "probe_sha256": "",
+        },
+        "evidence_critic_prompt_version": hm.EVIDENCE_CRITIC_PROMPT_VERSION,
+    }]
+
+
+def test_critic_becomes_stale_when_finding_changes_and_fresh_merge_rebinds_it(
+    critic_state,
+):
+    critic = _critic(str(critic_state["session_id"]))
+    _merge(critic_state, critic)
+    state = Path(critic_state["state"])
+    findings, errors = ac.load_jsonl(state / "investigation_findings.jsonl")
+    assert errors == []
+    findings[0]["new_evidence"] = "A newly discovered reachable path changes the evidence."
+    _write_jsonl(state / "investigation_findings.jsonl", findings)
+    retained = ac.load_jsonl(state / "critic_reviews.jsonl")[0][0]
+
+    binding_errors = hm.validate_critic_bindings(
+        retained, state, "critic (FINDING-1)",
+    )
+    assert any("input_digests do not match current" in error for error in binding_errors)
+
+    _merge(critic_state, critic)
+    rebound = ac.load_jsonl(state / "critic_reviews.jsonl")[0][0]
+    assert rebound["input_digests"]["finding_sha256"] == hm.canonical_digest(
+        findings[0]
+    )
+
+
+def test_critic_binding_includes_the_exact_reviewed_probe_snapshot(critic_state):
+    critic = _critic(
+        str(critic_state["session_id"]),
+        probe_id="PROBE-1",
+        probe_status="supports_contradiction",
+    )
+    _merge(critic_state, critic)
+    state = Path(critic_state["state"])
+    merged = ac.load_jsonl(state / "critic_reviews.jsonl")[0][0]
+    probes, errors = ac.load_jsonl(state / "dynamic_probes.jsonl")
+    assert errors == []
+    probe = next(item for item in probes if item["probe_id"] == "PROBE-1")
+    assert merged["input_digests"]["probe_sha256"] == hm.canonical_digest(probe)
+
+    probe["new_observation"] = "The environment changed after critic review."
+    _write_jsonl(state / "dynamic_probes.jsonl", probes)
+    binding_errors = hm.validate_critic_bindings(
+        merged, state, "critic (FINDING-1)",
+    )
+    assert any("input_digests do not match current" in error for error in binding_errors)
+
+
+def test_critic_rejects_supplied_stale_tool_owned_bindings(critic_state):
+    critic = _critic(str(critic_state["session_id"]))
+    critic["input_digests"] = {
+        "claim_sha256": "0" * 64,
+        "finding_sha256": "1" * 64,
+        "probe_sha256": "",
+    }
+    critic["evidence_critic_prompt_version"] = "evidence-critic-v1"
+
+    errors = _errors(critic_state, critic)
+
+    assert any("supplied input_digests do not match current evidence" in error for error in errors)
+    assert any("prompt_version is stale or unsupported" in error for error in errors)
+
+
+def test_same_evidence_cannot_be_recriticized_to_change_the_decision(critic_state):
+    critic = _critic(str(critic_state["session_id"]))
+    _merge(critic_state, critic)
+    changed_vote = _critic(str(critic_state["session_id"]))
+    changed_vote["review_id"] = "CRITIC-2"
+    changed_vote["decision"] = "reject_issue"
+    changed_vote["resolution"] = "The same evidence was reinterpreted without new facts."
+
+    errors = _errors(critic_state, changed_vote)
+
+    assert any(
+        "current evidence snapshot was already reviewed" in error
+        and "new claim/finding/probe evidence is required" in error
+        for error in errors
+    )
+
+
+def test_critic_history_rejects_changed_vote_after_current_ledger_is_deleted(
+    critic_state,
+):
+    critic = _critic(str(critic_state["session_id"]))
+    _merge(critic_state, critic)
+    (Path(critic_state["state"]) / "critic_reviews.jsonl").unlink()
+    changed_vote = _critic(str(critic_state["session_id"]))
+    changed_vote["review_id"] = "CRITIC-RECREATED"
+    changed_vote["decision"] = "reject_issue"
+    changed_vote["resolution"] = "Changed after deleting the current ledger."
+
+    errors = _errors(critic_state, changed_vote)
+
+    assert any("already reviewed in critic history" in error for error in errors)
+
+
+def test_exact_critic_retry_is_idempotent_not_a_second_review(critic_state):
+    critic = _critic(str(critic_state["session_id"]))
+    _merge(critic_state, critic)
+
+    result = _merge(critic_state, critic)
+
+    assert result["imported"] == 0
+    merged, errors = ac.load_jsonl(
+        Path(critic_state["state"]) / "critic_reviews.jsonl"
+    )
+    assert errors == []
+    assert len(merged) == 1
+
+
+def test_stale_peer_critic_is_invalidated_without_blocking_current_candidate(
+    critic_state,
+):
+    state = Path(critic_state["state"])
+    handoffs = Path(critic_state["handoffs"])
+    first = _critic(str(critic_state["session_id"]))
+    second = _critic(
+        str(critic_state["session_id"]),
+        finding_id="FINDING-2",
+        claim_id="CLAIM-2",
+    )
+    second["review_id"] = "CRITIC-2"
+    ac.save_json(handoffs / "critic-1.json", first)
+    ac.save_json(handoffs / "critic-2.json", second)
+    hm.merge(
+        handoffs,
+        state / "critic_reviews.jsonl",
+        "finding_id",
+        artifact_type="critic",
+        session_id=str(critic_state["session_id"]),
+        context_root=state,
+    )
+
+    findings, errors = ac.load_jsonl(state / "investigation_findings.jsonl")
+    assert errors == []
+    findings[0]["new_evidence"] = "Only the first candidate obtained new evidence."
+    _write_jsonl(state / "investigation_findings.jsonl", findings)
+    for path in handoffs.iterdir():
+        path.unlink()
+    ac.save_json(handoffs / "critic-2-retry.json", second)
+
+    result = hm.merge(
+        handoffs,
+        state / "critic_reviews.jsonl",
+        "finding_id",
+        artifact_type="critic",
+        session_id=str(critic_state["session_id"]),
+        context_root=state,
+    )
+
+    assert result["invalidated_ids"] == ["FINDING-1"]
+    assert result["imported"] == 0
+    merged, errors = ac.load_jsonl(state / "critic_reviews.jsonl")
+    assert errors == []
+    assert [item["finding_id"] for item in merged] == ["FINDING-2"]
 
 
 def test_critic_rejects_verdict_and_issue_fields(critic_state):

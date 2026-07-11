@@ -10,7 +10,10 @@ records hashes/provenance. It does not parse requirements or create findings.
 from __future__ import annotations
 
 import argparse
+import copy
+import hashlib
 import json
+import re
 import shutil
 import sys
 import urllib.error
@@ -24,6 +27,7 @@ import agent_common as ac
 
 
 TEXT_SUFFIXES = {".md", ".markdown", ".txt", ".rst", ".adoc", ".asc", ".json", ".yaml", ".yml", ".toml"}
+ARTIFACT_KINDS = {"inventory", "claims"}
 
 
 class _VisibleHTML(HTMLParser):
@@ -116,6 +120,214 @@ def _validate_text_bytes(data: bytes) -> None:
         data.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise ValueError("design source is not valid UTF-8 text") from exc
+
+
+def _canonical_json_sha256(value: Any) -> str:
+    payload = json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _canonical_source_path(design_root: Path, value: Any) -> tuple[Path, str]:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("source_ref.path must be a non-empty string")
+    candidate = ac.contained_path(design_root, value)
+    if candidate is None:
+        raise ValueError(f"source_ref.path is outside design root: {value}")
+    if not candidate.is_file():
+        raise ValueError(f"source_ref.path does not name a file: {value}")
+    return candidate, candidate.relative_to(design_root).as_posix()
+
+
+def _strict_line(value: Any, field: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError(f"source_ref.{field} must be an integer")
+    return value
+
+
+_NUMBERED_HEADING = re.compile(r"^(?:\d+(?:\.\d+)*\.?|[A-Z]\.)\s+\S")
+
+
+def _section_heading(lines: list[str], start: int, relative_path: str) -> str:
+    """Return a mechanical nearby heading, never a semantic interpretation."""
+    for index in range(min(start - 1, len(lines) - 1), -1, -1):
+        stripped = lines[index].strip()
+        if not stripped:
+            continue
+        if stripped.startswith("#"):
+            heading = stripped.lstrip("#").strip()
+            if heading:
+                return heading
+        if index + 1 < len(lines):
+            underline = lines[index + 1].strip()
+            if len(underline) >= 3 and set(underline) in ({"="}, {"-"}):
+                return stripped
+        if len(stripped) <= 200 and _NUMBERED_HEADING.match(stripped):
+            return stripped
+    return f"{relative_path} lines {start}"
+
+
+def materialize_source_ref(
+    item: dict[str, Any], design_root: Path, *, include_quote: bool,
+) -> dict[str, Any]:
+    """Materialize one model-selected path/range without adding semantic fields.
+
+    `source_ref` is authoritative. The returned object contains the canonical
+    nested source_ref plus deterministic compatibility fields used downstream.
+    """
+    if not isinstance(item, dict):
+        raise ValueError("source item must be an object")
+    raw_ref = item.get("source_ref")
+    if not isinstance(raw_ref, dict):
+        raise ValueError("source_ref must be an object")
+    source_path, relative_path = _canonical_source_path(design_root, raw_ref.get("path"))
+    start = _strict_line(raw_ref.get("line_start"), "line_start")
+    end = _strict_line(raw_ref.get("line_end"), "line_end")
+    if start < 1 or end < start:
+        raise ValueError(f"source_ref has invalid line range {start}-{end}")
+    try:
+        source_text = source_path.read_text(encoding="utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"source_ref file is not valid UTF-8: {relative_path}") from exc
+    if "\x00" in source_text:
+        raise ValueError(f"source_ref file contains binary NUL bytes: {relative_path}")
+    lines = source_text.splitlines()
+    if end > len(lines):
+        raise ValueError(
+            f"source_ref line range {start}-{end} exceeds {len(lines)} lines: {relative_path}"
+        )
+
+    materialized = copy.deepcopy(item)
+    source_ref = {
+        "path": relative_path,
+        "line_start": start,
+        "line_end": end,
+        "source_sha256": ac.sha256_file(source_path),
+    }
+    materialized["source_ref"] = source_ref
+    materialized["path"] = relative_path
+    materialized["line_start"] = start
+    materialized["line_end"] = end
+    materialized["section"] = _section_heading(lines, start, relative_path)
+    if include_quote:
+        materialized["quote"] = "\n".join(lines[start - 1:end])
+    else:
+        materialized.pop("quote", None)
+    return materialized
+
+
+def materialize_claims(values: list[dict[str, Any]], design_root: Path) -> list[dict[str, Any]]:
+    materialized: list[dict[str, Any]] = []
+    for value in values:
+        claim = materialize_source_ref(value, design_root, include_quote=True)
+        claim["document"] = Path(str(claim["path"])).name
+        materialized.append(claim)
+    return materialized
+
+
+def _materialize_inventory_section(section: dict[str, Any], design_root: Path) -> dict[str, Any]:
+    materialized = materialize_source_ref(section, design_root, include_quote=False)
+    materialized["heading"] = materialized.pop("section")
+    return materialized
+
+
+def materialize_inventory(value: dict[str, Any], design_root: Path) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError("design inventory must be an object")
+    groups = value.get("document_groups")
+    if not isinstance(groups, list):
+        raise ValueError("design inventory document_groups must be an array")
+    materialized = copy.deepcopy(value)
+    output_groups: list[dict[str, Any]] = []
+    for index, raw_group in enumerate(groups, start=1):
+        if not isinstance(raw_group, dict):
+            raise ValueError(f"document_groups[{index}] must be an object")
+        group = copy.deepcopy(raw_group)
+        evidence = group.get("scope_evidence")
+        if not isinstance(evidence, dict):
+            raise ValueError(f"document_groups[{index}].scope_evidence must be an object")
+        group["scope_evidence"] = materialize_source_ref(
+            evidence, design_root, include_quote=True,
+        )
+        sections = group.get("sections")
+        if not isinstance(sections, list):
+            raise ValueError(f"document_groups[{index}].sections must be an array")
+        materialized_sections: list[dict[str, Any]] = []
+        for section in sections:
+            if not isinstance(section, dict):
+                raise ValueError(f"document_groups[{index}].sections entries must be objects")
+            materialized_sections.append(_materialize_inventory_section(section, design_root))
+        group["sections"] = materialized_sections
+        group.pop("group_sha256", None)
+        group["group_sha256"] = _canonical_json_sha256(group)
+        output_groups.append(group)
+    materialized["document_groups"] = output_groups
+    return materialized
+
+
+def _load_claim_input(path: Path) -> list[dict[str, Any]]:
+    values, errors = ac.load_jsonl(path)
+    if errors:
+        raise ValueError("; ".join(errors))
+    return values
+
+
+def _is_within(root: Path, candidate: Path) -> bool:
+    try:
+        candidate.resolve().relative_to(root.resolve())
+    except ValueError:
+        return False
+    return True
+
+
+def materialize_artifact(args: argparse.Namespace) -> int:
+    design_root = Path(args.design_root).resolve()
+    input_path = Path(args.input).resolve()
+    output_path = Path(args.output).resolve()
+    trace_path = Path(args.trace).resolve() if args.trace else None
+    errors: list[str] = []
+    count = 0
+    if not design_root.is_dir():
+        errors.append(f"design root is not a directory: {design_root}")
+    if not input_path.is_file():
+        errors.append(f"artifact input is missing: {input_path}")
+    if _is_within(design_root, output_path):
+        errors.append("artifact output must be outside the read-only design root")
+    if trace_path and _is_within(design_root, trace_path):
+        errors.append("artifact trace must be outside the read-only design root")
+    if not errors:
+        try:
+            if args.materialize == "inventory":
+                raw = ac.load_json(input_path)
+                output = materialize_inventory(raw, design_root)
+                count = len(output.get("document_groups", []))
+                ac.save_json(output_path, output)
+            else:
+                output_claims = materialize_claims(_load_claim_input(input_path), design_root)
+                count = len(output_claims)
+                ac.ensure_dir(output_path.parent)
+                output_path.write_text(
+                    "".join(json.dumps(value, ensure_ascii=False) + "\n" for value in output_claims),
+                    encoding="utf-8",
+                )
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            errors.append(str(exc))
+    report = {
+        "materialized_at": ac.now_iso(),
+        "passed": not errors,
+        "artifact_kind": args.materialize,
+        "semantic_analysis_performed": False,
+        "design_root": str(design_root),
+        "input_path": str(input_path),
+        "output_path": str(output_path),
+        "objects": count,
+        "errors": errors,
+    }
+    if trace_path:
+        ac.save_json(trace_path, report)
+    print(json.dumps({"passed": not errors, "objects": count, "errors": len(errors)}))
+    return 0 if not errors else 1
 
 
 def materialize(args: argparse.Namespace) -> int:
@@ -251,6 +463,7 @@ def materialize(args: argparse.Namespace) -> int:
         "source_root": str(source_root),
         "output_root": str(output_root),
         "plan_path": str(plan_path),
+        "plan_sha256": ac.sha256_file(plan_path),
         "sources": records,
         "errors": errors,
     }
@@ -261,15 +474,32 @@ def materialize(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Materialize a model-authored design-source plan.")
-    parser.add_argument("--source-root", required=True)
-    parser.add_argument("--plan", required=True)
-    parser.add_argument("--output-root", required=True)
-    parser.add_argument("--manifest", required=True)
+    parser.add_argument("--materialize", choices=sorted(ARTIFACT_KINDS), default=None)
+    parser.add_argument("--design-root", default=None)
+    parser.add_argument("--input", default=None)
+    parser.add_argument("--output", default=None)
+    parser.add_argument("--trace", default=None)
+    parser.add_argument("--source-root", default=None)
+    parser.add_argument("--plan", default=None)
+    parser.add_argument("--output-root", default=None)
+    parser.add_argument("--manifest", default=None)
     parser.add_argument("--allow-network", action="store_true")
     parser.add_argument("--approval-log", default=None)
     parser.add_argument("--max-bytes", type=int, default=8 * 1024 * 1024)
     parser.add_argument("--timeout-seconds", type=int, default=30)
-    return materialize(parser.parse_args(argv))
+    args = parser.parse_args(argv)
+    if args.materialize:
+        missing = [name for name in ("design_root", "input", "output") if not getattr(args, name)]
+        if missing:
+            parser.error(f"--materialize requires: {', '.join('--' + name.replace('_', '-') for name in missing)}")
+        return materialize_artifact(args)
+    missing = [name for name in ("source_root", "plan", "output_root", "manifest") if not getattr(args, name)]
+    if missing:
+        parser.error(
+            "source-plan mode requires: "
+            + ", ".join("--" + name.replace("_", "-") for name in missing)
+        )
+    return materialize(args)
 
 
 if __name__ == "__main__":

@@ -171,6 +171,30 @@ def test_accepts_exactly_two_independent_architecture_components() -> None:
     assert all(len(component) == 3 for component in index["components"])
 
 
+def test_accepts_nonempty_valid_lens_subset_per_slice() -> None:
+    architecture = _architecture()
+    plan = _valid_plan(architecture)
+    plan["slices"][0]["review_lenses"] = [LENSES[0]]
+    plan["slices"][1]["review_lenses"] = [LENSES[1]]
+
+    errors, index = _validate(plan, architecture)
+
+    assert errors == []
+    assert index["slices"]["SWEEP-A"]["review_lenses"] == [LENSES[0]]
+    assert index["slices"]["SWEEP-B"]["review_lenses"] == [LENSES[1]]
+
+
+@pytest.mark.parametrize("lenses", [[], ["unknown lens"]])
+def test_rejects_empty_or_unknown_slice_lenses(lenses: list[str]) -> None:
+    architecture = _architecture()
+    plan = _valid_plan(architecture)
+    plan["slices"][0]["review_lenses"] = lenses
+
+    errors, _index = _validate(plan, architecture)
+
+    assert any("review_lenses" in error for error in errors)
+
+
 def test_accepts_more_than_two_focused_slices() -> None:
     architecture = _architecture()
     plan = _valid_plan(architecture)
@@ -252,16 +276,26 @@ def test_rejects_unsafe_sweep_id() -> None:
     assert any("safe single filename component" in error for error in errors)
 
 
-def test_repository_root_scope_contains_children_and_couples_components() -> None:
+def test_repository_root_scope_allows_one_true_connected_component() -> None:
     architecture = _architecture(distinct_boundary_paths=True)
     architecture["implementation_planes"][0]["paths"] = ["."]
     plan = _valid_plan(architecture)
+    plan["slices"] = [{
+        "sweep_id": "SWEEP-ALL",
+        "architecture_boundaries": ["BOUNDARY-A", "BOUNDARY-B"],
+        "implementation_planes": ["PLANE-A", "PLANE-B"],
+        "parallel_path_ids": ["PATH-A", "PATH-B"],
+        "anchor_paths": [".", "entry/a.py", "entry/b.py", "impl/b.py"],
+        "review_lenses": LENSES,
+        "scope_rationale": "Own the single connected repository component.",
+    }]
 
     errors, index = _validate(plan, architecture)
 
     assert validator._in_scope("src/child.py", ["."])
     assert len(index["components"]) == 1
-    assert any("fewer than two independent required risk components" in error for error in errors)
+    assert errors == []
+    assert set(index["slices"]) == {"SWEEP-ALL"}
 
 
 def test_rejects_nonexistent_anchor_in_review_snapshot(tmp_path: Path) -> None:
@@ -286,7 +320,7 @@ def test_rejects_nonexistent_anchor_in_review_snapshot(tmp_path: Path) -> None:
     )
 
 
-def test_fails_fast_when_required_risk_graph_is_one_connected_component() -> None:
+def test_accepts_one_slice_when_parallel_path_couples_all_risk_nodes() -> None:
     architecture = _architecture()
     architecture["parallel_behavior_paths"] = [{
         "path_id": "PATH-SHARED",
@@ -294,16 +328,21 @@ def test_fails_fast_when_required_risk_graph_is_one_connected_component() -> Non
     }]
     plan = _valid_plan(architecture)
     plan["required_coverage"]["parallel_path_ids"] = ["PATH-SHARED"]
-    plan["slices"][0]["parallel_path_ids"] = ["PATH-SHARED"]
-    plan["slices"][1]["parallel_path_ids"] = []
+    plan["slices"] = [{
+        "sweep_id": "SWEEP-SHARED",
+        "architecture_boundaries": ["BOUNDARY-A", "BOUNDARY-B"],
+        "implementation_planes": ["PLANE-A", "PLANE-B"],
+        "parallel_path_ids": ["PATH-SHARED"],
+        "anchor_paths": ["src/a.py", "src/b.py"],
+        "review_lenses": LENSES,
+        "scope_rationale": "The shared parallel path makes this one coupled component.",
+    }]
 
     errors, index = _validate(plan, architecture)
 
     assert len(index["components"]) == 1
-    assert any(
-        "fewer than two independent required risk components" in error
-        for error in errors
-    )
+    assert errors == []
+    assert set(index["slices"]) == {"SWEEP-SHARED"}
 
 
 @pytest.mark.parametrize(

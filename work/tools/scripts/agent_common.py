@@ -153,11 +153,15 @@ def validate_source_evidence(item: Any, root: Path, label: str, text_field: str)
         return [f"{label}: path is outside root: {path_value}"]
     if not path.is_file():
         return [f"{label}: cited file does not exist: {path_value}"]
-    try:
-        start = int(item.get("line_start") or 0)
-        end = int(item.get("line_end") or start)
-    except (TypeError, ValueError):
+    start_value = item.get("line_start")
+    end_value = item.get("line_end", start_value)
+    if (
+        not isinstance(start_value, int) or isinstance(start_value, bool)
+        or not isinstance(end_value, int) or isinstance(end_value, bool)
+    ):
         return [f"{label}: line range must be integers"]
+    start = start_value
+    end = end_value
     if start < 1 or end < start:
         return [f"{label}: invalid line range {start}-{end}"]
     try:
@@ -173,7 +177,7 @@ def validate_source_evidence(item: Any, root: Path, label: str, text_field: str)
     if not cited:
         return [f"{label}: missing {text_field}"]
     source = "\n".join(lines[start - 1:end])
-    if normalize_text(cited) not in normalize_text(source):
+    if normalize_text(cited) != normalize_text(source):
         return [f"{label}: {text_field} does not match cited source lines"]
     return []
 
@@ -196,6 +200,29 @@ def iter_files(root: Path, ignored_dirs: Iterable[str] = DEFAULT_IGNORED_DIRS) -
         for name in sorted(files):
             if name in {".git", ".hg", ".svn"}:
                 continue
+            yield base / name
+
+
+def iter_integrity_files(root: Path) -> Iterable[Path]:
+    """Walk every supplied-source entry without review/cache exclusions.
+
+    Directory symlinks are recorded as entries and never followed.  This is
+    intentionally stricter than the code-review inventory walker because a
+    catalog may legally point into a normally ignored directory.
+    """
+    if not root.exists():
+        return
+    for current, dirs, files in os.walk(root, followlinks=False):
+        base = Path(current)
+        retained_dirs: list[str] = []
+        for name in sorted(dirs):
+            path = base / name
+            if path.is_symlink():
+                yield path
+            else:
+                retained_dirs.append(name)
+        dirs[:] = retained_dirs
+        for name in sorted(files):
             yield base / name
 
 

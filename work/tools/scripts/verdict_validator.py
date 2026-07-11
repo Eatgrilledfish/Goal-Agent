@@ -14,12 +14,14 @@ from pathlib import Path
 from typing import Any
 
 import agent_common as ac
+import handoff_merge as hm
 
 
 EVIDENCE_INPUT_NAMES = (
     "design_claims.jsonl",
     "investigation_findings.jsonl",
     "critic_reviews.jsonl",
+    "critic_review_history.jsonl",
     "dynamic_probes.jsonl",
     "agent_review_verdicts.jsonl",
 )
@@ -89,13 +91,7 @@ def _validate_dynamic_probe(
     claim: dict[str, Any],
 ) -> list[str]:
     prefix = f"{finding_id}: dynamic probe"
-    errors: list[str] = []
-    for field in (
-        "probe_id", "session_id", "finding_id", "claim_id", "oracle", "selection_reason",
-        "isolation", "baseline", "execution", "interpretation", "limitations", "tool_trace",
-    ):
-        if not _nonempty(probe.get(field)) and field != "limitations":
-            errors.append(f"{prefix} missing/empty {field}")
+    errors = hm.validate_probe_contract(probe, prefix)
     if probe.get("session_id") != session_id:
         errors.append(f"{prefix} session does not match current session")
     if str(probe.get("finding_id") or "") != finding_id:
@@ -105,8 +101,13 @@ def _validate_dynamic_probe(
 
     oracle = probe.get("oracle") if isinstance(probe.get("oracle"), dict) else {}
     claim_oracle = claim.get("probe_oracle") if isinstance(claim.get("probe_oracle"), dict) else {}
-    if oracle.get("source") != "design_claim":
-        errors.append(f"{prefix} oracle source must be design_claim")
+    source_ref = claim.get("source_ref") if isinstance(claim.get("source_ref"), dict) else {}
+    if oracle.get("claim_id") != claim_id:
+        errors.append(f"{prefix} oracle.claim_id does not match the design claim")
+    if oracle.get("claim_sha256") != hm.canonical_digest(claim):
+        errors.append(f"{prefix} oracle.claim_sha256 does not match the current design claim")
+    if oracle.get("source_sha256") != source_ref.get("source_sha256"):
+        errors.append(f"{prefix} oracle.source_sha256 does not match the design source")
     for field in ("preconditions", "stimulus", "expected_observation"):
         if oracle.get(field) != claim_oracle.get(field):
             errors.append(f"{prefix} oracle.{field} does not match the design claim")
@@ -116,41 +117,7 @@ def _validate_dynamic_probe(
         errors.append(f"{prefix} isolation.kind must be session_copy")
     if isolation.get("original_target_unchanged") is not True:
         errors.append(f"{prefix} must attest original_target_unchanged=true")
-    workspace = str(isolation.get("workspace") or "")
-    probes_root = root / "probes"
-    if not workspace or ac.contained_path(probes_root, workspace) is None:
-        errors.append(f"{prefix} workspace must be below state/probes")
-
-    baseline = probe.get("baseline") if isinstance(probe.get("baseline"), dict) else {}
-    baseline_status = baseline.get("status")
-    if baseline_status not in {"passed", "failed", "not_available"}:
-        errors.append(f"{prefix} has invalid baseline status")
-    if not _nonempty(baseline.get("result")):
-        errors.append(f"{prefix} baseline needs a result")
-    if baseline_status != "not_available" and not _nonempty(baseline.get("command")):
-        errors.append(f"{prefix} baseline needs the command that was run")
-
-    execution = probe.get("execution") if isinstance(probe.get("execution"), dict) else {}
-    execution_status = execution.get("status")
-    if execution_status not in {"completed", "environment_failed", "not_executed"}:
-        errors.append(f"{prefix} has invalid execution status")
-    if not _nonempty(execution.get("observed")):
-        errors.append(f"{prefix} execution needs an observed result")
-    if execution_status == "completed":
-        if not _nonempty(execution.get("command")):
-            errors.append(f"{prefix} completed execution needs a command")
-        if not isinstance(execution.get("exit_code"), int):
-            errors.append(f"{prefix} completed execution needs an integer exit_code")
-
-    interpretation = probe.get("interpretation")
-    if interpretation not in PROBE_INTERPRETATIONS:
-        errors.append(f"{prefix} has invalid interpretation {interpretation!r}")
-    if (
-        baseline_status != "passed"
-        or execution_status != "completed"
-        or execution.get("target_reached") is not True
-    ) and interpretation != "inconclusive":
-        errors.append(f"{prefix} environment/baseline/reachability limitations must be inconclusive")
+    errors.extend(hm.validate_probe_workspace(probe, root, prefix))
     return errors
 
 
@@ -184,18 +151,15 @@ def validate_verdict(
             return errors
         assessment = finding.get("assessment")
         critic = critiques.get(finding_id)
-        if assessment in {"contradiction_supported", "uncertain"}:
-            if not critic:
-                errors.append(f"{prefix} reviewable finding lacks a critic artifact")
-            elif critic.get("decision") != "reject_issue":
-                errors.append(
-                    f"{prefix} rejected reviewable finding requires critic decision reject_issue"
-                )
-        elif assessment != "design_satisfied":
+        if assessment not in {
+            "contradiction_supported", "uncertain", "design_satisfied",
+        }:
             errors.append(f"{prefix} rejected verdict has invalid investigator assessment")
-        elif critic and critic.get("decision") != "reject_issue":
+        if not critic:
+            errors.append(f"{prefix} rejected finding lacks a critic artifact")
+        elif critic.get("decision") != "reject_issue":
             errors.append(
-                f"{prefix} design-satisfied finding has an incompatible retained critic decision"
+                f"{prefix} rejected finding requires critic decision reject_issue"
             )
         return errors
 
@@ -282,7 +246,7 @@ def validate_verdict(
     critic = verdict.get("critic_review")
     expected_critic_decisions = {
         "confirmed": {"confirm_contradiction"},
-        "probable": {"probable_contradiction", "needs_more_evidence"},
+        "probable": {"needs_more_evidence"},
     }[status]
     if not isinstance(critic, dict) or critic.get("decision") not in expected_critic_decisions:
         errors.append(
@@ -437,6 +401,19 @@ def run(args: argparse.Namespace) -> int:
     artifact_errors.extend(finding_errors)
     artifact_errors.extend(critique_errors)
     artifact_errors.extend(probe_errors)
+    for finding_id, critique in critiques.items():
+        artifact_errors.extend(hm.validate_item(
+            critique,
+            artifact_type="critic",
+            identifier=finding_id,
+            session_id=session_id,
+        ))
+        artifact_errors.extend(hm._context_errors(
+            critique,
+            "critic",
+            root,
+            f"critic ({finding_id})",
+        ))
     verdicts, verdict_parse_errors = ac.load_jsonl(root / "agent_review_verdicts.jsonl")
     artifact_errors.extend(verdict_parse_errors)
 
@@ -445,20 +422,18 @@ def run(args: argparse.Namespace) -> int:
         finding_id = str(verdict.get("finding_id") or "")
         if finding_id:
             latest[finding_id] = verdict
-    reviewable_finding_ids = {
-        finding_id for finding_id, finding in findings.items()
-        if finding.get("assessment") in {"contradiction_supported", "uncertain"}
-    }
-    missing_critics = sorted(reviewable_finding_ids - set(critiques))
+    missing_critics = sorted(set(findings) - set(critiques))
     extra_critics = sorted(set(critiques) - set(findings))
     if missing_critics:
         artifact_errors.append(
-            f"reviewable findings lack critic handoffs: {missing_critics}"
+            f"findings lack critic handoffs: {missing_critics}"
         )
     if extra_critics:
         artifact_errors.append(
             f"critic handoffs reference unknown findings: {extra_critics}"
         )
+    artifact_errors.extend(hm.validate_probe_chain(findings, probes, critiques))
+    artifact_errors.extend(hm.validate_critic_review_history(root, critiques))
     missing_verdicts = sorted(set(findings) - set(latest))
     extra_verdicts = sorted(set(latest) - set(findings))
     if missing_verdicts:

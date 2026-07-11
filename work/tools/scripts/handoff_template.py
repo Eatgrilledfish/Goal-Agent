@@ -12,26 +12,6 @@ import agent_common as ac
 import stage_artifact_validator as sav
 
 
-def _valid_deferred_task(task: dict[str, Any]) -> bool:
-    raw_evidence = task.get("defer_evidence")
-    evidence = raw_evidence if isinstance(raw_evidence, dict) else {}
-    attempts = evidence.get("attempts")
-    return (
-        task.get("status") == "deferred"
-        and bool(task.get("defer_reason"))
-        and evidence.get("kind") in {"provider_failure", "tool_failure"}
-        and isinstance(attempts, list)
-        and len(attempts) >= 2
-        and all(
-            isinstance(attempt, dict)
-            and attempt.get("attempt_id")
-            and attempt.get("outcome") == "failed"
-            and attempt.get("evidence")
-            for attempt in attempts
-        )
-    )
-
-
 def _index_jsonl(path: Path, key: str) -> dict[str, dict[str, Any]]:
     values, errors = ac.load_jsonl(path)
     if errors:
@@ -42,7 +22,9 @@ def _index_jsonl(path: Path, key: str) -> dict[str, dict[str, Any]]:
     return indexed
 
 
-def _current_task_validation(state_root: Path) -> tuple[dict[str, Any], list[str]]:
+def _current_task_validation(
+    state_root: Path, task_id: str,
+) -> tuple[dict[str, Any], list[str]]:
     errors: list[str] = []
     manifest_path = state_root / "workspace_manifest.json"
     state_path = state_root / "agent_loop_state.json"
@@ -54,30 +36,69 @@ def _current_task_validation(state_root: Path) -> tuple[dict[str, Any], list[str
     log_root_value = manifest.get("paths", {}).get("log_root") if isinstance(manifest, dict) else None
     if not isinstance(log_root_value, str) or not log_root_value:
         return {}, ["workspace_manifest.json lacks paths.log_root"]
-    trace_path = Path(log_root_value).resolve() / "trace" / "task_validation.json"
-    if not trace_path.is_file():
-        return {}, [f"current passed task validation is missing: {trace_path}"]
+    trace_root = Path(log_root_value).resolve() / "trace"
+    plan_path = trace_root / "task_plan_validation.json"
+    lifecycle_path = trace_root / "task_lifecycle_validation.json"
+    missing = [path for path in (plan_path, lifecycle_path) if not path.is_file()]
+    if missing:
+        return {}, [
+            "current task plan/lifecycle validation is missing: "
+            + ", ".join(str(path) for path in missing)
+        ]
     try:
-        trace = ac.load_json(trace_path)
+        plan_trace = ac.load_json(plan_path)
+        lifecycle_trace = ac.load_json(lifecycle_path)
+        contract = ac.load_json(state_root / "agent_loop_contract.json")
+        architecture = ac.load_json(state_root / "architecture_map.json")
+        claims = _index_jsonl(state_root / "design_claims.jsonl", "claim_id")
+        risks = _index_jsonl(state_root / "risk_observations.jsonl", "observation_id")
+        tasks = _index_jsonl(state_root / "investigation_tasks.jsonl", "task_id")
+        findings = _index_jsonl(state_root / "investigation_findings.jsonl", "finding_id")
+        rounds = _ordered_rounds(state_root / "investigation_rounds.jsonl")
     except (OSError, json.JSONDecodeError) as exc:
-        return {}, [f"cannot load task validation trace: {exc}"]
-    if not isinstance(trace, dict):
-        return {}, ["task validation trace must be an object"]
-    expected_inputs, expected_combined = sav._input_digests(
-        state_root, sav._stage_inputs(state_root, "task"),
-    )
+        return {}, [f"cannot load task plan/lifecycle validation inputs: {exc}"]
+    except ValueError as exc:
+        return {}, [f"cannot index task plan/lifecycle validation inputs: {exc}"]
+    if not isinstance(plan_trace, dict) or not isinstance(lifecycle_trace, dict):
+        return {}, ["task plan/lifecycle validation traces must be objects"]
     session_id = str(state.get("session_id") or "") if isinstance(state, dict) else ""
-    if trace.get("stage") != "task":
-        errors.append("task validation trace has the wrong stage")
-    if trace.get("passed") is not True:
-        errors.append("task validation trace has not passed")
-    if trace.get("session_id") != session_id:
-        errors.append("task validation trace belongs to a different session")
-    if trace.get("input_digests") != expected_inputs:
-        errors.append("task validation trace is stale for current frontier inputs")
-    if trace.get("combined_input_sha256") != expected_combined:
-        errors.append("task validation combined digest is stale")
-    return trace, errors
+    task = tasks.get(task_id)
+    if task is None:
+        return {}, [f"unknown task_id: {task_id}"]
+    claim = claims.get(str(task.get("claim_id") or ""))
+    task_findings = [
+        finding for finding in findings.values() if finding.get("task_id") == task_id
+    ]
+    expected_plan_sha256 = sav.task_plan_snapshot_sha256(
+        state_root, contract=contract, architecture=architecture, claims=claims,
+        risks=risks, tasks=tasks, rounds=rounds,
+    )
+    expected_lifecycle_sha256 = sav.task_lifecycle_snapshot_sha256(
+        tasks=tasks, findings=findings, rounds=rounds,
+    )
+    expected_plan_candidate = sav.task_plan_digest(task, claim, rounds)
+    expected_lifecycle_candidate = sav.task_lifecycle_digest(task, task_findings)
+    for trace, expected_stage, label in (
+        (plan_trace, "task-plan", "task plan"),
+        (lifecycle_trace, "task-lifecycle", "task lifecycle"),
+    ):
+        if trace.get("stage") != expected_stage:
+            errors.append(f"{label} validation trace has the wrong stage")
+        if trace.get("session_id") != session_id:
+            errors.append(f"{label} validation trace belongs to a different session")
+        if trace.get("global_passed") is not True:
+            errors.append(f"{label} global validation has not passed")
+        if task_id not in trace.get("valid_task_ids", []):
+            errors.append(f"{label} validation did not accept candidate {task_id}")
+    if plan_trace.get("task_plan_sha256") != expected_plan_sha256:
+        errors.append("task plan validation is stale for current stable plan inputs")
+    if lifecycle_trace.get("task_lifecycle_sha256") != expected_lifecycle_sha256:
+        errors.append("task lifecycle validation is stale for current lifecycle inputs")
+    if plan_trace.get("candidate_digests", {}).get(task_id) != expected_plan_candidate:
+        errors.append(f"task plan candidate digest is stale for {task_id}")
+    if lifecycle_trace.get("candidate_digests", {}).get(task_id) != expected_lifecycle_candidate:
+        errors.append(f"task lifecycle candidate digest is stale for {task_id}")
+    return {"plan": plan_trace, "lifecycle": lifecycle_trace}, errors
 
 
 def _ordered_rounds(path: Path) -> list[dict[str, Any]]:
@@ -118,6 +139,15 @@ def finding_template(task: dict[str, Any], claim: dict[str, Any]) -> dict[str, A
         raise ValueError("task claim_id does not match supplied claim")
     if task.get("session_id") != claim.get("session_id"):
         raise ValueError("task and claim sessions do not match")
+    obligation = claim.get("obligation")
+    observable_result = claim.get("observable_result")
+    if not isinstance(obligation, str) or not obligation.strip():
+        raise ValueError("supplied claim needs one non-empty obligation")
+    if not isinstance(observable_result, str) or not observable_result.strip():
+        raise ValueError("supplied claim needs one non-empty observable_result")
+    expected_obligation_digest = sav.claim_obligation_sha256(claim)
+    if task.get("obligation_sha256") != expected_obligation_digest:
+        raise ValueError("task obligation_sha256 does not match supplied claim")
     design_evidence = {
         "document": claim.get("document", ""),
         "path": claim.get("path", ""),
@@ -131,8 +161,12 @@ def finding_template(task: dict[str, Any], claim: dict[str, Any]) -> dict[str, A
         "session_id": task.get("session_id", ""),
         "task_id": task_id,
         "claim_id": claim_id,
-        "hypothesis": task.get("question", ""),
-        "expected_behavior": claim.get("behavior", ""),
+        "claim_branch": task.get("claim_branch", ""),
+        "obligation_sha256": task.get("obligation_sha256", ""),
+        "hypothesis": task.get("hypothesis", ""),
+        "expected_behavior": (
+            f"{obligation.strip()} Observable result: {observable_result.strip()}"
+        ),
         "observed_behavior": "",
         "design_evidence": [design_evidence],
         "code_evidence": [{
@@ -207,52 +241,21 @@ def main(argv: list[str] | None = None) -> int:
             "error": f"output filename must be {args.task_id}.json",
         }))
         return 2
-    gate_path = state_root / "investigator_batch_gate.json"
-    gate = ac.load_json(gate_path) if gate_path.is_file() else {}
-    if gate and gate.get("passed") is not True:
-        print(json.dumps({
-            "passed": False,
-            "error": "previous investigator batch has not passed merge; repair its invalid_ids first",
-            "gate": str(gate_path),
-        }))
-        return 3
     if output.exists() and not args.force:
         print(json.dumps({"passed": False, "error": "output already exists"}))
         return 2
-    _, validation_errors = _current_task_validation(state_root)
-    if validation_errors:
-        print(json.dumps({
-            "passed": False,
-            "error": "current passed task validation is required before template creation",
-            "validation_errors": validation_errors,
-        }))
-        return 3
     try:
         tasks = _index_jsonl(tasks_path, "task_id")
         rounds = _ordered_rounds(state_root / "investigation_rounds.jsonl")
     except (OSError, ValueError) as exc:
         print(json.dumps({"passed": False, "error": str(exc)}))
         return 1
-    validated_ids = set(gate.get("validated_ids", [])) if isinstance(gate, dict) else set()
-    deferred_ids = {
-        f"FINDING-{task_id}" for task_id, task in tasks.items()
-        if _valid_deferred_task(task)
-    }
-    existing_ids: set[str] = set()
-    if template_root.is_dir():
-        for path in template_root.glob("*.json"):
-            try:
-                value = ac.load_json(path)
-            except (OSError, json.JSONDecodeError):
-                continue
-            if isinstance(value, dict) and value.get("finding_id"):
-                existing_ids.add(str(value["finding_id"]))
-    unresolved = existing_ids - validated_ids - deferred_ids
-    if len(unresolved) >= 2 and f"FINDING-{args.task_id}" not in unresolved:
+    _, validation_errors = _current_task_validation(state_root, args.task_id)
+    if validation_errors:
         print(json.dumps({
             "passed": False,
-            "error": "two investigator templates are already unresolved; merge or repair that batch first",
-            "unresolved_ids": sorted(unresolved),
+            "error": "current task plan and lifecycle validation is required before template creation",
+            "validation_errors": validation_errors,
         }))
         return 3
     try:

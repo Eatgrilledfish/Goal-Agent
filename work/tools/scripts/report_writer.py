@@ -142,6 +142,12 @@ def run(args: argparse.Namespace) -> int:
         coverage_errors.append("coverage validation input digests are stale")
     if coverage_trace.get("combined_input_sha256") != expected_combined:
         coverage_errors.append("coverage validation combined digest is stale")
+    if coverage_trace.get("coverage_provenance_sha256") != \
+            sav.coverage_provenance_sha256(root):
+        coverage_errors.append("coverage validation merge provenance is stale")
+    if coverage_trace.get("claim_review_provenance_sha256") != \
+            sav.claim_review_provenance_sha256(root):
+        coverage_errors.append("coverage validation claim-review provenance is stale")
     if coverage_errors:
         print(json.dumps({"reported": False, "errors": coverage_errors}))
         return 2
