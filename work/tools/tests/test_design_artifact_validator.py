@@ -296,6 +296,21 @@ def test_every_materialized_claim_is_indexed_by_coverage(artifacts):
     assert any("not assigned to coverage groups" in error for error in trace["errors"])
 
 
+def test_required_or_in_scope_group_must_materialize_a_claim(artifacts):
+    coverage = load_coverage(artifacts)
+    coverage["document_groups"][0]["claim_ids"] = []
+    ac.save_json(Path(artifacts["state"]) / "design_coverage.json", coverage)
+
+    code, trace = run_validator(artifacts, "claims")
+
+    assert code == 1
+    assert trace["error_count_by_code"]["COVERAGE_CLAIM_MISSING"] == 1
+    assert any(
+        "required/in_scope design group must materialize at least one claim" in error
+        for error in trace["errors"]
+    )
+
+
 def test_catalog_provenance_does_not_force_declared_capability(artifacts):
     manifest = artifacts["manifest"]
     assert isinstance(manifest, dict)

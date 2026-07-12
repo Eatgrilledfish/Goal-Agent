@@ -1215,6 +1215,24 @@ def _context_errors(
                 errors.append(f"{label}: finding/critic claim mismatch for {finding_id}")
             if finding.get("session_id") != item.get("session_id"):
                 errors.append(f"{label}: finding belongs to a different session")
+            finding_assessment = finding.get("assessment")
+            critic_decision = item.get("decision")
+            if (
+                critic_decision == "confirm_contradiction"
+                and finding_assessment != "contradiction_supported"
+            ):
+                errors.append(
+                    f"{label}: confirm_contradiction requires a "
+                    "contradiction_supported finding"
+                )
+            if (
+                finding_assessment == "design_satisfied"
+                and critic_decision != "reject_issue"
+            ):
+                errors.append(
+                    f"{label}: design_satisfied finding requires reject_issue; "
+                    "new contradictory evidence must first revise the finding"
+                )
         if claim is None:
             errors.append(f"{label}: unknown claim_id {claim_id!r}")
         elif claim.get("session_id") != item.get("session_id"):

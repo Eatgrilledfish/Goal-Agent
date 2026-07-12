@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate non-overlapping, architecture-bound code-risk sweep slices."""
+"""Validate focused, non-overlapping code-risk sweep slices."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ PLAN_NAME = "risk_sweep_plan.json"
 ARCHITECTURE_NAME = "architecture_map.json"
 CONTRACT_NAME = "agent_loop_contract.json"
 SAFE_SWEEP_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+MAX_IMPLEMENTATION_PLANES_PER_SLICE = 6
 
 
 def plan_input_digests(state_root: Path) -> tuple[dict[str, str], str]:
@@ -76,8 +77,8 @@ def _required_coverage(
     boundaries: dict[str, dict], planes: dict[str, dict], paths: dict[str, dict],
 ) -> tuple[set[str], set[str], set[str]]:
     # The sweeps are the complete architecture breadth pass, not a high-risk
-    # sample.  High/medium/low remains useful for later frontier
-    # ordering, but every mapped reachable scope must have one owner here.
+    # sample. High/medium/low remains useful for later frontier ordering, but
+    # every mapped reachable scope must appear in at least one focused slice.
     required_boundaries = set(boundaries)
     required_paths = set(paths)
     required_planes = set(planes)
@@ -188,7 +189,7 @@ def validate_plan(
         boundaries, planes, parallel_paths,
     )
     if not components:
-        errors.append(f"{PLAN_NAME}: architecture has no required risk component")
+        errors.append(f"{PLAN_NAME}: architecture has no required risk scope")
 
     raw_slices = plan.get("slices")
     if not isinstance(raw_slices, list) or not raw_slices:
@@ -196,10 +197,11 @@ def validate_plan(
         raw_slices = []
     known_lenses = set(contract.get("coverage_contract", {}).get("portfolio_lenses", []))
     slices: dict[str, dict[str, Any]] = {}
-    owners: dict[str, dict[str, str]] = {
-        "boundary": {}, "plane": {}, "path": {},
+    coverage_by_kind: dict[str, set[str]] = {
+        "boundary": set(), "plane": set(), "path": set(),
     }
     anchor_owners: dict[str, str] = {}
+    assigned_lenses: set[str] = set()
     allowed_keys = {
         "sweep_id", "architecture_boundaries", "implementation_planes",
         "parallel_path_ids", "anchor_paths", "review_lenses", "scope_rationale",
@@ -231,22 +233,43 @@ def validate_plan(
             ("implementation_planes", "plane", set(planes)),
             ("parallel_path_ids", "path", set(parallel_paths)),
         ):
-            values, value_errors = _strings(item.get(field), f"{label}.{field}")
+            values, value_errors = _strings(
+                item.get(field), f"{label}.{field}",
+                allow_empty=kind != "plane",
+            )
             errors.extend(value_errors)
             values_by_kind[kind] = values
             unknown = set(values) - known
             if unknown:
                 errors.append(f"{label}.{field}: unknown IDs {sorted(unknown)}")
-            for value in values:
-                prior = owners[kind].get(value)
-                if prior:
-                    errors.append(
-                        f"{label}.{field}: {value} overlaps sweep {prior}"
-                    )
-                else:
-                    owners[kind][value] = sweep_id
-        if not any(values_by_kind.values()):
-            errors.append(f"{label}: slice must own at least one boundary, plane, or path")
+            coverage_by_kind[kind].update(values)
+        if len(values_by_kind["plane"]) > MAX_IMPLEMENTATION_PLANES_PER_SLICE:
+            errors.append(
+                f"{label}.implementation_planes must contain at most "
+                f"{MAX_IMPLEMENTATION_PLANES_PER_SLICE} values"
+            )
+        for boundary_id in values_by_kind["boundary"]:
+            linked_planes = set(
+                boundaries.get(boundary_id, {}).get("plane_ids", [])
+            )
+            if boundary_id in boundaries and not linked_planes.intersection(
+                values_by_kind["plane"]
+            ):
+                errors.append(
+                    f"{label}.architecture_boundaries: {boundary_id} has no linked "
+                    "implementation plane in this slice"
+                )
+        for path_id in values_by_kind["path"]:
+            linked_planes = set(
+                parallel_paths.get(path_id, {}).get("plane_ids", [])
+            )
+            if path_id in parallel_paths and not linked_planes.intersection(
+                values_by_kind["plane"]
+            ):
+                errors.append(
+                    f"{label}.parallel_path_ids: {path_id} has no linked "
+                    "implementation plane in this slice"
+                )
         anchors, anchor_errors = _strings(
             item.get("anchor_paths"), f"{label}.anchor_paths", allow_empty=False,
         )
@@ -257,22 +280,51 @@ def validate_plan(
             if parsed.is_absolute() or ".." in parsed.parts:
                 errors.append(f"{label}.anchor_paths: path must be relative without traversal: {anchor}")
                 continue
-            normalized_anchors.add(str(parsed))
-        expected_anchors = {
-            str(PurePosixPath(path))
-            for boundary_id in values_by_kind["boundary"]
-            for path in boundaries.get(boundary_id, {}).get("paths", [])
-        } | {
-            str(PurePosixPath(path))
-            for plane_id in values_by_kind["plane"]
-            for path in planes.get(plane_id, {}).get("paths", [])
+            normalized = str(parsed)
+            if normalized == ".":
+                errors.append(
+                    f"{label}.anchor_paths: repository root is not a focused code scope"
+                )
+                continue
+            normalized_anchors.add(normalized)
+        scoped_paths_by_id = {
+            **{
+                f"boundary:{boundary_id}": [
+                    str(PurePosixPath(path))
+                    for path in boundaries.get(boundary_id, {}).get("paths", [])
+                ]
+                for boundary_id in values_by_kind["boundary"]
+            },
+            **{
+                f"plane:{plane_id}": [
+                    str(PurePosixPath(path))
+                    for path in planes.get(plane_id, {}).get("paths", [])
+                ]
+                for plane_id in values_by_kind["plane"]
+            },
         }
-        if normalized_anchors != expected_anchors:
-            errors.append(
-                f"{label}.anchor_paths must exactly equal assigned architecture paths; "
-                f"missing={sorted(expected_anchors - normalized_anchors)}, "
-                f"extra={sorted(normalized_anchors - expected_anchors)}"
-            )
+        for scoped_id, scoped_paths in scoped_paths_by_id.items():
+            if not any(
+                _in_scope(path, list(normalized_anchors))
+                or _in_scope(anchor, scoped_paths)
+                for path in scoped_paths for anchor in normalized_anchors
+            ):
+                errors.append(
+                    f"{label}.anchor_paths: {scoped_id} has no local primary scope"
+                )
+        architecture_paths = [
+            path for paths_for_id in scoped_paths_by_id.values()
+            for path in paths_for_id
+        ]
+        for anchor in normalized_anchors:
+            if not any(
+                _in_scope(anchor, [path]) or _in_scope(path, [anchor])
+                for path in architecture_paths
+            ):
+                errors.append(
+                    f"{label}.anchor_paths: {anchor} is unrelated to assigned "
+                    "architecture boundary or plane paths"
+                )
         if review_code_root is not None:
             for anchor in normalized_anchors:
                 scope_error = _scope_path_error(review_code_root, anchor)
@@ -296,6 +348,7 @@ def validate_plan(
         unknown_lenses = set(lenses) - known_lenses
         if unknown_lenses:
             errors.append(f"{label}.review_lenses: unknown values {sorted(unknown_lenses)}")
+        assigned_lenses.update(lenses)
         if not isinstance(item.get("scope_rationale"), str) or not item.get(
             "scope_rationale", "",
         ).strip():
@@ -307,25 +360,18 @@ def validate_plan(
         "path": required_paths,
     }
     for kind, expected in expected_by_kind.items():
-        actual = set(owners[kind])
+        actual = coverage_by_kind[kind]
         if actual != expected:
             errors.append(
-                f"{PLAN_NAME}: {kind} ownership must exactly cover required IDs; "
+                f"{PLAN_NAME}: {kind} coverage must include all required IDs; "
                 f"missing={sorted(expected - actual)}, extra={sorted(actual - expected)}"
             )
-
-    node_owners: dict[str, str] = {}
-    for kind, values in owners.items():
-        for identifier, sweep_id in values.items():
-            node_owners[f"{kind}:{identifier}"] = sweep_id
-    for component in components:
-        component_owners = {node_owners.get(node, "") for node in component}
-        component_owners.discard("")
-        if len(component_owners) > 1:
-            errors.append(
-                f"{PLAN_NAME}: coupled risk component is split across sweeps: "
-                f"nodes={sorted(component)}, sweeps={sorted(component_owners)}"
-            )
+    if assigned_lenses != known_lenses:
+        errors.append(
+            f"{PLAN_NAME}: review_lenses must cover the complete contract portfolio; "
+            f"missing={sorted(known_lenses - assigned_lenses)}, "
+            f"extra={sorted(assigned_lenses - known_lenses)}"
+        )
 
     return errors, {
         "slices": slices,

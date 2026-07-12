@@ -913,7 +913,7 @@ def validate_task_plan_stage(
     ordered_rounds = _validate_round_plan(
         tasks, rounds, max_tasks_per_round, global_errors, errors_by_task,
     )
-    max_initial_rounds = iteration_policy.get("maximum_initial_frontier_rounds", 2)
+    max_initial_rounds = iteration_policy.get("maximum_initial_frontier_rounds", 6)
     if (
         not isinstance(max_initial_rounds, int)
         or isinstance(max_initial_rounds, bool)
@@ -922,7 +922,7 @@ def validate_task_plan_stage(
         global_errors.append(
             "agent_loop_contract.json: maximum_initial_frontier_rounds must be a positive integer"
         )
-        max_initial_rounds = 2
+        max_initial_rounds = 6
     initial_task_ids = {
         task_id for task_id, task in tasks.items()
         if not task.get("coverage_request_sha256")
@@ -948,6 +948,25 @@ def validate_task_plan_stage(
             "initial evidence-pair frontier must include a design-origin or "
             "capability-absence task; code-risk observations cannot be the sole entry"
         )
+    completed_risk_sweeps = {
+        str(risk.get("sweep_id") or "") for risk in risks.values()
+        if risk.get("sweep_id")
+    }
+    represented_risk_sweeps = {
+        str(risks[risk_id].get("sweep_id") or "")
+        for task_id in initial_task_ids
+        if tasks[task_id].get("exploration_mode")
+        == "code-to-design risk backtracking"
+        for risk_id in tasks[task_id].get("risk_observation_ids", [])
+        if risk_id in risks and risks[risk_id].get("sweep_id")
+    }
+    missing_risk_sweeps = completed_risk_sweeps - represented_risk_sweeps
+    if missing_risk_sweeps:
+        global_errors.append(
+            "initial evidence-pair frontier must include at least one "
+            "code-to-design task from every completed risk sweep; "
+            f"missing={sorted(missing_risk_sweeps)}"
+        )
     valid_task_ids = sorted(
         task_id for task_id, task_errors in errors_by_task.items() if not task_errors
     )
@@ -962,6 +981,8 @@ def validate_task_plan_stage(
         "claims": len(claims), "risks": len(risks), "tasks": len(tasks),
         "claim_review_scope": len(claim_scope),
         "investigation_rounds": len(ordered_rounds),
+        "completed_risk_sweeps": sorted(completed_risk_sweeps),
+        "represented_risk_sweeps": sorted(represented_risk_sweeps),
         "global_passed": not global_errors,
         "valid_task_ids": valid_task_ids,
         "invalid_task_ids": invalid_task_ids,
@@ -1522,6 +1543,11 @@ def _validate_coverage_audit(
         errors.append(
             f"{label}: remaining_scoped_claims must equal uninvestigated, "
             f"non-deferred scoped claims {sorted(expected_remaining)}"
+        )
+    if remaining_claims:
+        errors.append(
+            f"{label}: all accepted claims must be investigated or structurally "
+            "deferred before coverage audit; remaining_scoped_claims is not a stop condition"
         )
 
     next_tasks = _validate_next_tasks(

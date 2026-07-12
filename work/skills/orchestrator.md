@@ -74,14 +74,14 @@ Portfolio scope ID逐值使用：`ARCHITECTURE-MAP`、`DESIGN-INVENTORY`；claim
   "slices":[{
     "sweep_id":"RISK-SWEEP-01","architecture_boundaries":["..."],
     "implementation_planes":["..."],"parallel_path_ids":["..."],
-    "anchor_paths":["assigned architecture paths完整并集"],
-    "review_lenses":["与该互斥代码范围最相关的非空contract lens子集"],
-    "scope_rationale":"为何该slice内部耦合且与其他slice互斥"
+    "anchor_paths":["本slice独占且与所列架构ID有关的主代码路径"],
+    "review_lenses":["与该主代码范围相关的非空contract lens子集"],
+    "scope_rationale":"为何主代码范围聚焦且与其他slice不重叠"
   }]
 }
 ```
 
-Plan至少一个真实非空 focused slice；三类 required IDs在计划层分别精确覆盖且互斥，同一 boundary与其planes、同一parallel path与其planes不可拆开，共享/父子 paths不可跨slice。每个 slice只分配非空、合法且与其范围相关的 lens子集，不要求每个 slice重复完整 portfolio。Risk Explorer必须审阅整个已分配slice，但只输出有具体代码证据、能形成设计问题的高信息量 observation；observation无需重复计划的每个ID/lens，不得用泛化描述填满配额。真实 map只有一个不可拆 component时使用一个 slice正常运行；多个 slices按计划顺序每批最多并发两个 Task，不复制范围或按lens伪造额外 slice。
+Plan至少一个真实非空focused slice。各slice的primary `anchor_paths`必须存在、不得为仓库根、彼此不得相同或父子重叠，每个slice最多6个implementation planes。三类required IDs在plan整体全部出现；宽boundary/plane/path若横跨多个互斥anchor范围可以重复引用，但每次必须有本地anchor关系及关联plane。所有slice的lens并集必须精确覆盖contract完整portfolio，使用满足约束的最少focused slices。Risk Explorer审阅整个已分配slice，但只输出有具体代码证据、能形成设计问题的高信息量observation；observation无需重复计划的每个ID/lens，不得用泛化描述填满配额。多个slices按计划顺序每批最多并发两个Task。
 
 ## 阶段命令
 
@@ -129,7 +129,7 @@ Design inventory完成后立即从每个适用 section 的独立 `behavior_famil
 
 模型依据当前证据的适用性、规范强度、可达性、外部可观察性、替代路径和信息增益选择，不按 claim 顺序、标签数量、固定领域或分数选择。能力缺失需要 supplied design 对当前产品 scope 的正面证据；全仓无命中不是充分证据。
 
-初始 frontier最多两轮、每轮最多4项。先在不同 document group、behavior family、execution plane和 exploration mode之间扩展，再在同一候选上深挖；只要存在适用设计，初始 frontier不得全部来自 code-only risk。Design-origin seed即使尚无 risk observation，也可以用`origin=design_section`发起claim解析，再由 investigator在architecture map中寻找实现、替代实现或能力缺失证据。
+首次resolution让每个`required|in_scope` document group至少有一条原子claim，累计review scope最多24条。随后最多六轮、每轮最多4项，把每条accepted claim调查并critic后才能进入coverage。先在不同document group、behavior family、execution plane和exploration mode之间扩展，再在同一候选上深挖；只要存在适用设计，frontier不得全部来自code-only risk。每个已经产出有效observation的已完成risk sweep也必须至少输送一个引用该sweep observation的code-to-design task。Design-origin seed即使尚无risk observation，也可以用`origin=design_section`发起claim解析。
 
 若设计义务尚未 materialize，写 `design_lookup_requests.jsonl`：
 
@@ -269,7 +269,7 @@ Critic raw handoff必须包含结构化`normative_assessment`；self-check/merge
 
 ## Coverage 与停止条件
 
-初始 frontier完成并早期 critic齐全后运行一次 Coverage Critic。它输出 `semantic_coverage.json` 与 `coverage_audit.json`，记录未覆盖 inventory/group/lens/boundary/plane/risk/critic request；不审批单项 finding。审计必须逐项对账所有适用 inventory section/behavior family，优先把完全未探索的设计域变成具体 gap；不能用多个同域候选掩盖另一个完全未探索的设计域。
+全部accepted claims已有finding+critic或结构化deferred后才运行Coverage Critic。`remaining_scoped_claims`非空必须返回调查阶段，不能作为gap关闭。Coverage输出未物化inventory/group/lens/boundary/plane/risk/critic request；不审批单项finding。
 
 `supplement_rounds` 只能 0/1。`next_round_tasks` 只能引用具体 gap，不能因 candidate数量创建。`coverage_supplement_history.json`是helper-owned只读状态：首次有效非空任务集合由`coverage-check`记录，相同请求幂等，任何不同或第二次请求拒绝；你和Coverage Critic都不得编辑/重置它。若决定 supplement，执行一次完整 claim→task→finding→probe/critic；之后 final coverage 必须 `supplement_rounds=1,next_round_tasks=[]`，其余 gap留在 `remaining_gaps`。运行：
 
@@ -281,7 +281,7 @@ python3 ${WORK_ROOT}/tools/scripts/goal_runner.py coverage-check \
 
 若gap尚无 accepted claim，先用`origin=design_section`完成 claim resolution/review，再由Coverage Critic基于该claim形成唯一 supplement task；不得虚构claim或因为第一次审计没有claim就静默关闭该设计域。若history已有请求，按其`task_specs`创建新task/new round，并复制`source_gap_ids`与`coverage_request_sha256=request_sha256`；不得编辑history或用既有task冒充补扫。
 
-Coverage `closed=true` 只表示当前 accepted frontier 的 `remaining_scoped_claims=[]`、无 pending/in_progress、最多一次 supplement已决策且 `next_round_tasks=[]`；允许 scope 外存在 `gap_recorded/remaining_gaps`。这些 gap不使已闭环 claim/finding失效。
+只有coverage trace同时为`passed=true,closed=true`才能启动Final Judge；命令返回0、checkpoint文字或`passed=true,closed=false`都不够。Scope外仍可存在`gap_recorded/remaining_gaps`。
 
 Frontier与 supplement排空、coverage通过后，只启动一个 fresh Final Judge，为每个 finding写一条 verdict，并把下面 `review` 命令作为它的 self-check：
 

@@ -116,7 +116,7 @@ def replay_source(tmp_path: Path) -> dict[str, Path | str]:
         "state": str(state / "agent_loop_state.json"),
     }
     ac.save_json(state / "agent_loop_contract.json", {
-        "contract_version": 15,
+        "contract_version": 17,
         "execution_model": "opencode-owned-model-driven-loop",
         "session": {"session_id": session_id, "artifacts": artifacts},
         "coverage_contract": {
@@ -386,9 +386,9 @@ def replay_source(tmp_path: Path) -> dict[str, Path | str]:
             "disconfirming_evidence_needed": ["an adapter validation guard"],
             "review_lenses": ["input acceptance"],
             "exploration_mode": "code-to-design risk backtracking",
-            "architecture_boundaries": ["BOUNDARY-AUDIT"],
-            "implementation_planes": ["PLANE-AUDIT"],
-            "parallel_path_ids": [], "risk_observation_ids": ["OBS-2"],
+            "architecture_boundaries": ["BOUNDARY-SERVICE", "BOUNDARY-AUDIT"],
+            "implementation_planes": ["PLANE-SERVICE", "PLANE-AUDIT"],
+            "parallel_path_ids": [], "risk_observation_ids": ["OBS-1", "OBS-2"],
             "status": "pending", "defer_reason": "",
         },
     ]
@@ -800,7 +800,7 @@ def test_claims_prepare_writes_frozen_manifest_and_no_llm(replay_source, tmp_pat
     assert manifest["development_only"] is True
     assert manifest["llm_invoked"] is False
     assert manifest["runtime"] == {"provider": "provider-a", "model": "model-b"}
-    assert manifest["schema"]["contract_version"] == 15
+    assert manifest["schema"]["contract_version"] == 17
     assert len(manifest["source_digest"]) == 64
     assert len(manifest["replay_input_digest"]) == 64
     assert len(manifest["prompt"]["sha256"]) == 64
@@ -1040,7 +1040,8 @@ def test_investigator_replay_copies_only_selected_task_context(replay_source, tm
     )
 
     assert manifest["selection"] == {
-        "task_id": "TASK-2", "claim_id": "CLAIM-2", "risk_observation_ids": ["OBS-2"],
+        "task_id": "TASK-2", "claim_id": "CLAIM-2",
+        "risk_observation_ids": ["OBS-1", "OBS-2"],
     }
     assert [item["task_id"] for item in _jsonl(
         replay / "state" / "investigation_tasks.jsonl",
@@ -1050,7 +1051,7 @@ def test_investigator_replay_copies_only_selected_task_context(replay_source, tm
     )] == ["CLAIM-2"]
     assert [item["observation_id"] for item in _jsonl(
         replay / "state" / "risk_observations.jsonl",
-    )] == ["OBS-2"]
+    )] == ["OBS-1", "OBS-2"]
     envelope = ac.load_json(replay / "prompt_envelope.json")
     assert "state/risk_sweep_plan.json" in envelope["inputs"]
     assert not (replay / "state" / "investigation_findings.jsonl").exists()

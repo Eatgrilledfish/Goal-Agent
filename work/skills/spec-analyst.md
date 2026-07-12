@@ -51,7 +51,7 @@ Materializer 生成最终 `scope_evidence.source_ref.source_sha256`、exact quot
 
 ## Claim resolution mode
 
-输入只包括 inventory、当前 `design_lookup_requests.jsonl`、相关 document/section、现有 design claims/coverage（若有）和输出路径。Lookup request只定位设计问题；你必须独立重读原文。只为已进入 evidence-pair frontier 的一个规范义务分支 materialize claim，不为全部 inventory sections生成详细 claim/oracle。
+输入只包括 inventory、当前 `design_lookup_requests.jsonl`、相关 document/section、现有 design claims/coverage（若有）和输出路径。Lookup request只定位设计问题；你必须独立重读原文。首次resolution必须让每个`required|in_scope` document group至少有一条代表性原子claim，累计claim review scope最多24条；不需要为每个section或每句话生成claim。后续只为进入frontier的新义务补充。
 
 先写/更新累计 `${STATE_ROOT}/handoffs/design/claims.raw.jsonl`。可原样保留已有已验证 claim的语义与 ID；新增 claim只需要以下模型字段，materializer会覆盖任何 derived字段：
 

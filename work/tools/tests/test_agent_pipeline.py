@@ -454,7 +454,12 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
         ],
     }
     risk_observations: list[dict] = []
-    for prefix, base in (("RISK-API", risk), ("RISK-AUDIT", audit_risk)):
+    risk_sources: list[tuple[str, dict]] = []
+    if count >= 2:
+        risk_sources.append(("RISK-API", risk))
+    if count >= 3:
+        risk_sources.append(("RISK-AUDIT", audit_risk))
+    for prefix, base in risk_sources:
         for chunk_index, start in enumerate(range(0, len(lenses), 3), start=1):
             item = dict(base)
             item["observation_id"] = f"{prefix}-{chunk_index:03d}"
@@ -534,6 +539,20 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
         task_boundary = "BOUNDARY-AUDIT" if audit_scope else "BOUNDARY-API"
         task_plane = "PLANE-AUDIT" if audit_scope else "PLANE-SERVICE"
         task_risk = "RISK-AUDIT-001" if audit_scope else "RISK-API-001"
+        exploration_modes = contract["coverage_contract"]["exploration_modes"]
+        task_mode = [
+            exploration_modes[0], exploration_modes[1],
+            exploration_modes[2], exploration_modes[1],
+        ][index - 1]
+        task_boundaries = [task_boundary]
+        task_planes = [task_plane]
+        task_risk_ids = [task_risk] if (
+            task_mode == "code-to-design risk backtracking"
+        ) else []
+        if count == 3 and index == 2:
+            task_boundaries = ["BOUNDARY-API", "BOUNDARY-AUDIT"]
+            task_planes = ["PLANE-SERVICE", "PLANE-AUDIT"]
+            task_risk_ids = ["RISK-API-001", "RISK-AUDIT-001"]
         hypothesis = "Does the reachable implementation enforce this one design obligation?"
         obligation_sha256 = stage_artifact_validator.claim_obligation_sha256(claim)
         append(state / "investigation_tasks.jsonl", {
@@ -549,14 +568,11 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
             "status": "complete",
             "defer_reason": "",
             "review_lenses": task_lenses,
-            "exploration_mode": contract["coverage_contract"]["exploration_modes"][(index - 1) % 3],
-            "architecture_boundaries": [task_boundary],
-            "implementation_planes": [task_plane],
+            "exploration_mode": task_mode,
+            "architecture_boundaries": task_boundaries,
+            "implementation_planes": task_planes,
             "parallel_path_ids": [],
-            "risk_observation_ids": [task_risk] if (
-                contract["coverage_contract"]["exploration_modes"][(index - 1) % 3]
-                == "code-to-design risk backtracking"
-            ) else [],
+            "risk_observation_ids": task_risk_ids,
         })
         finding = {
             "finding_id": finding_id,
@@ -1147,7 +1163,7 @@ def test_prepare_is_semantic_neutral_and_writes_agent_contract(workspace):
     assert "paths" not in design_manifest
     assert "code_root" not in json.dumps(design_manifest)
     assert contract["execution_model"] == "opencode-owned-model-driven-loop"
-    assert contract["contract_version"] == 15
+    assert contract["contract_version"] == 17
     assert contract["handoff_integrity"]["max_concurrent_subagent_tasks"] == 2
     assert contract["tool_protocol"]["agent_event_contract"]["required_fields"] == [
         "event", "role", "phase", "scope_id", "scope",
@@ -2189,8 +2205,8 @@ def test_instruction_requires_risk_plan_gate_before_parallel_risk_tasks():
     launch_position = instruction.index("按 plan 启动 fresh `risk-explorer`")
     assert gate_position < launch_position
     assert "通过后" in instruction[gate_position:launch_position]
-    assert "切片按真实耦合 component" in instruction[:launch_position]
-    assert "不得重叠" in instruction[:launch_position]
+    assert "primary code scope" in instruction[:launch_position]
+    assert "彼此不得相同或父子重叠" in instruction[:launch_position]
 
 
 def test_discovery_policy_uses_dual_entry_frontier_without_synthetic_risk_padding():
@@ -2206,10 +2222,12 @@ def test_discovery_policy_uses_dual_entry_frontier_without_synthetic_risk_paddin
     assert "design-origin" in instruction
     assert "design-origin" in skill
     assert "Risk observation不是唯一入口" in orchestrator
-    assert "初始 frontier最多两轮" in orchestrator
+    assert "最多六轮" in orchestrator
+    assert "每条accepted claim" in orchestrator
+    assert "passed=true,closed=true" in orchestrator
     assert "不要求 observation 的 boundary/plane/path/lens 并集覆盖整个 slice" in risk
     assert "不得制造 observation" in risk
-    assert "当前输入" in instruction
+    assert "当前 supplied design" in instruction
     assert "动态发现" in skill
 
 
@@ -2528,6 +2546,32 @@ def test_coverage_passed_is_not_closed_while_next_round_tasks_exist(workspace):
         Path(workspace["result"]), Path(workspace["logs"]), check=False,
     )
     assert report.returncode != 0
+
+
+def test_coverage_rejects_uninvestigated_accepted_claims_as_a_stop_condition(
+    workspace,
+):
+    populate_handoffs(workspace)
+    state = workspace["state"]
+    assert isinstance(state, Path)
+    coverage = ac.load_json(state / "coverage_audit.json")
+    coverage["remaining_scoped_claims"] = [{
+        "claim_id": "CLAIM-001",
+        "reason": "The accepted claim has not been investigated.",
+    }]
+    ac.save_json(state / "coverage_audit.json", coverage)
+
+    proc = run_runner(
+        "coverage-check", Path(workspace["code"]), Path(workspace["design"]),
+        Path(workspace["result"]), Path(workspace["logs"]), check=False,
+    )
+
+    assert proc.returncode == 1
+    trace = ac.load_json(Path(workspace["logs"]) / "trace" / "coverage_validation.json")
+    assert any(
+        "remaining_scoped_claims is not a stop condition" in error
+        for error in trace["errors"]
+    )
 
 
 def test_unselected_on_demand_claim_does_not_invalidate_scoped_reviews(workspace):
@@ -2855,8 +2899,6 @@ def test_parallel_path_can_be_covered_by_linked_split_plane_tasks(workspace):
     tasks[1]["implementation_planes"] = ["PLANE-ALTERNATE"]
     tasks[1]["exploration_mode"] = "code-to-design risk backtracking"
     tasks[1]["risk_observation_ids"] = ["RISK-API-001"]
-    tasks[3]["exploration_mode"] = "capability-absence reconciliation"
-    tasks[3]["risk_observation_ids"] = []
     (state / "investigation_tasks.jsonl").write_text(
         "\n".join(json.dumps(item) for item in tasks) + "\n", encoding="utf-8"
     )

@@ -74,11 +74,11 @@ def critic_state(tmp_path: Path) -> dict[str, object]:
     _write_jsonl(state / "investigation_findings.jsonl", [
         {
             "finding_id": "FINDING-1", "claim_id": "CLAIM-1",
-            "session_id": session_id,
+            "session_id": session_id, "assessment": "contradiction_supported",
         },
         {
             "finding_id": "FINDING-2", "claim_id": "CLAIM-2",
-            "session_id": session_id,
+            "session_id": session_id, "assessment": "contradiction_supported",
         },
     ])
     _write_jsonl(state / "dynamic_probes.jsonl", [
@@ -135,6 +135,7 @@ def test_valid_critic_is_schema_complete_and_bound_to_current_artifacts(critic_s
             "finding_sha256": hm.canonical_digest({
                 "finding_id": "FINDING-1", "claim_id": "CLAIM-1",
                 "session_id": critic_state["session_id"],
+                "assessment": "contradiction_supported",
             }),
             "probe_sha256": "",
         },
@@ -371,6 +372,23 @@ def test_critic_normative_assessment_must_match_claim_strength(critic_state):
     errors = _errors(critic_state, critic)
     assert any("claim_strength does not match" in error for error in errors)
     assert any("incompatible with claim strength" in error for error in errors)
+
+
+@pytest.mark.parametrize("decision", ["confirm_contradiction", "needs_more_evidence"])
+def test_design_satisfied_finding_cannot_be_reinterpreted_by_critic(
+    critic_state, decision,
+):
+    state = Path(critic_state["state"])
+    findings, errors = ac.load_jsonl(state / "investigation_findings.jsonl")
+    assert errors == []
+    findings[0]["assessment"] = "design_satisfied"
+    _write_jsonl(state / "investigation_findings.jsonl", findings)
+    critic = _critic(str(critic_state["session_id"]))
+    critic["decision"] = decision
+
+    errors = _errors(critic_state, critic)
+
+    assert any("design_satisfied finding requires reject_issue" in error for error in errors)
 
 
 def test_optional_claim_requires_adoption_to_confirm(critic_state):

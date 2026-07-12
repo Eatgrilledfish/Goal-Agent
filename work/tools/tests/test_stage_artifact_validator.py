@@ -221,7 +221,7 @@ def test_task_plan_isolates_task_outside_accepted_claim_review_scope(workspace):
     ac.save_json(review_path, original_review)
 
 
-def test_task_plan_does_not_hard_code_first_round_semantic_portfolio(workspace):
+def test_initial_frontier_rejects_design_only_entry_when_risks_exist(workspace):
     populate_handoffs(workspace)
     _prepare_claim_scope(workspace)
     state = workspace["state"]
@@ -234,7 +234,37 @@ def test_task_plan_does_not_hard_code_first_round_semantic_portfolio(workspace):
     _rewrite_jsonl(state / "investigation_tasks.jsonl", tasks)
 
     proc = _run_stage(workspace, "task-plan-check", check=False)
-    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.returncode == 1
+    trace = ac.load_json(workspace["logs"] / "trace" / "task_plan_validation.json")
+    assert any(
+        "code-to-design task from every completed risk sweep" in error
+        for error in trace["errors"]
+    )
+
+
+def test_initial_frontier_rejects_an_unrepresented_completed_risk_sweep(workspace):
+    populate_handoffs(workspace)
+    _prepare_claim_scope(workspace)
+    state = workspace["state"]
+    assert isinstance(state, Path)
+    tasks, errors = ac.load_jsonl(state / "investigation_tasks.jsonl")
+    assert errors == []
+    audit_task = next(
+        task for task in tasks
+        if task["exploration_mode"] == "code-to-design risk backtracking"
+        and task["architecture_boundaries"] == ["BOUNDARY-AUDIT"]
+    )
+    audit_task["exploration_mode"] = "design-to-code obligation tracing"
+    audit_task["risk_observation_ids"] = []
+    _rewrite_jsonl(state / "investigation_tasks.jsonl", tasks)
+
+    proc = _run_stage(workspace, "task-plan-check", check=False)
+
+    assert proc.returncode == 1
+    trace = ac.load_json(workspace["logs"] / "trace" / "task_plan_validation.json")
+    assert any(
+        "missing=['RISK-SWEEP-AUDIT']" in error for error in trace["errors"]
+    )
 
 
 def test_initial_frontier_rejects_code_risk_as_its_only_entry(workspace):
@@ -262,7 +292,7 @@ def test_initial_frontier_rejects_code_risk_as_its_only_entry(workspace):
     )
 
 
-def test_initial_frontier_rejects_more_than_two_rounds(workspace):
+def test_initial_frontier_obeys_configured_round_limit(workspace):
     populate_handoffs(workspace)
     _prepare_claim_scope(workspace)
     state = workspace["state"]
@@ -270,6 +300,10 @@ def test_initial_frontier_rejects_more_than_two_rounds(workspace):
     tasks, errors = ac.load_jsonl(state / "investigation_tasks.jsonl")
     assert errors == []
     template = ac.load_jsonl(state / "investigation_rounds.jsonl")[0][0]
+    contract_path = state / "agent_loop_contract.json"
+    contract = ac.load_json(contract_path)
+    contract["iteration_policy"]["maximum_initial_frontier_rounds"] = 2
+    ac.save_json(contract_path, contract)
     task_groups = [tasks[:2], tasks[2:3], tasks[3:]]
     rounds = []
     for index, group in enumerate(task_groups, start=1):

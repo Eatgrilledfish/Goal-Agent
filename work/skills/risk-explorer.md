@@ -2,9 +2,9 @@
 
 你只从代码反查“这里实际做了什么，值得去设计里核对什么”，不读取任何设计文档、inventory、claim、公开答案或旧 finding，也不判断一致/不一致。Orchestrator 可能让一个 design-inventory Task 与你并行；两者没有信息交换，你仍保持 code-only。
 
-只在 orchestrator 提供的 session-local `review_code_root` 读取、搜索和导航。启动前 `risk-plan-check` 必须已通过；输入必须包含当前 `risk_sweep_plan.json` 路径及 SHA-256、你的完整 slice、所有其他 slices 的 ownership IDs、唯一输出路径、唯一 self-check report 和命令。先用仓库入口、构建/注册/配置和主要可达目录反查 architecture map 是否漏掉 adapter、imported、generated、fast/slow plane 或真实集成 boundary；再严格检查本 slice 分配的 execution planes、boundaries、parallel paths 和 lenses，沿真实入口、调用链、配置、构建与平行路径形成可观察语义。
+只在 orchestrator 提供的 session-local `review_code_root` 读取、搜索和导航。启动前 `risk-plan-check` 必须已通过；输入必须包含当前 `risk_sweep_plan.json` 路径及 SHA-256、你的完整 slice、所有其他 slices 的 primary anchor scopes、唯一输出路径、唯一 self-check report 和命令。先用仓库入口、构建/注册/配置和主要可达目录反查 architecture map 是否漏掉 adapter、imported、generated、fast/slow plane 或真实集成 boundary；再严格检查本 slice 分配的 execution planes、boundaries、parallel paths 和 lenses，沿真实入口、调用链、配置、构建与平行路径形成可观察语义。
 
-所有 slices 的 ownership 必须互斥，但文件读取权限不是硬切目录：你可以在整个 review code root 导航，必要时读取其他 slice 的调用者/被调用者来判断路径去向；这些跨 slice 内容只能作为导航上下文，不能写进你的 observation coverage IDs 或 `code_evidence`，也不能声称已覆盖其他 slice。不得因为另一目录更容易搜索而换掉分配范围。搜索只是导航，必须阅读上下文。
+所有slices的primary anchor scopes必须互斥；架构ID可能因横跨范围而在plan中重复，但你只能使用当前slice明确列出的ID。文件读取权限不是硬切目录：你可以在整个review code root导航，必要时读取其他slice的调用者/被调用者来判断路径去向；这些跨slice内容只能作为导航上下文，不能写进`code_evidence`，也不能声称已覆盖其他slice。不得因为另一目录更容易搜索而换掉分配范围。搜索只是导航，必须阅读上下文。
 
 若发现真实可达但 architecture map 未记录的 plane/boundary，或一项实质 observation 必须引用其他 slice 的 boundary/plane/path 或代码证据，说明 architecture/plan 漏掉真实耦合。不得把它硬塞进现有 ID，也不得静默忽略；聊天返回 `plan_repair_required`、精确代码路径和可达性证据，不写 risk handoff。orchestrator 修 map、重跑 architecture-check、重写 plan 后，所有 slices 都必须由 fresh Tasks 重做。这个反查只依据代码，不接触设计。
 
@@ -12,7 +12,7 @@
 
 每项 observation 必须是一个可由设计回答的中性行为问题，并给出当前代码实际行为、精确代码行、至少一项替代路径/配置/调用者反查和真实 tool trace。Risk阶段只负责高召回线索，完整反证链留给 investigator/critic。禁止使用 “violates/MUST missing/issue/bug” 等 verdict，禁止写 design evidence、claim_id、assessment、confidence 或 recommendation。不得把“全仓无命中”单独当 observation。
 
-每个 Task 必须真实检查本 slice 的全部 boundary、plane 和 parallel path，但只为发现的具体高信息量语义风险写 observation。不得为证明范围已读而把正常入口、正确实现或宽泛架构描述写成 observation，也不要求 observation 的 boundary/plane/path/lens 并集覆盖整个 slice。每条 observation 声明的 ID 都必须属于本 slice，并由该 ID 自身 path 与 anchor 内的代码证据支持。Plan只会给本 slice一个非空且相关的 lens子集，未分配 lens不得自行扩张。一个真实 observation 可以覆盖同一调用链连接且各自有本地证据的多个 ID，但不能代表未读取的路径或引用另一 slice 的 ownership ID。将发现的 observations 写成 orchestrator 指定的独立 JSON 数组。每项字段严格为：
+每个 Task 必须真实检查本 slice 的全部 boundary、plane、parallel path和lens，但只为发现的具体高信息量语义风险写 observation。不得为证明范围已读而把正常入口、正确实现或宽泛架构描述写成 observation，也不要求 observation 的 boundary/plane/path/lens 并集覆盖整个 slice。每条 observation 声明的 ID 都必须属于本 slice，并由该 ID 自身 path 与anchor内的代码证据支持。Plan整体已覆盖完整lens portfolio；你不得忽略当前slice分配的lens或自行扩张到未分配lens。一个真实observation可以覆盖同一调用链连接且各自有本地证据的多个ID，但不能代表未读取的路径或引用当前slice未列出的ID。将发现的observations写成orchestrator指定的独立JSON数组。每项字段严格为：
 
 ```json
 {

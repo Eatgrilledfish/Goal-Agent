@@ -4,7 +4,7 @@
 
 只读取当前 session 的：workspace/loop contract、architecture map、design inventory/coverage/claims、claim review trace、risk observations、tasks、findings、critic requests、rounds和helper-owned `coverage_supplement_history.json`。可读取 probe/critic以识别反证或补证请求，但不得使用 final verdict决定 coverage。只用 stable IDs与已存在 evidence，不发明设计/代码事实。`coverage_supplement_history.json` 只读，不得创建、清空或编辑。
 
-初始 frontier（所有已创建 tasks complete/deferred，所有 findings均已完成早期 critic）后运行本角色。若你决定一次 supplement，补扫完成后再运行一次，且不得推荐第二次 supplement。
+只有全部accepted claims都已有complete finding+critic或结构化deferred后才运行本角色。`remaining_scoped_claims`非空是调用时机错误，直接返回调查阶段，不能靠`remaining_gaps`关闭。若决定一次supplement，补扫完成后再运行一次，且不得推荐第二次。
 
 ## 审计问题
 
@@ -111,4 +111,4 @@ python3 ${WORK_ROOT}/tools/scripts/goal_runner.py coverage-check \
   --result-root ${RESULT_ROOT} --log-root ${LOG_ROOT} --state-root ${STATE_ROOT}
 ```
 
-Schema/ID/accounting错误在本 Task内根据 `${LOG_ROOT}/trace/coverage_validation.json` 修正并重跑。语义 gap选择仍由你负责，orchestrator不得补写。只有命令返回0且 trace `passed=true` 才返回；若 `closed=false`，同时返回唯一的 supplement task列表与其 gap IDs。
+Schema/ID/accounting错误在本 Task内根据 `${LOG_ROOT}/trace/coverage_validation.json` 修正并重跑。只有trace同时`passed=true,closed=true`才允许交给Final Judge；`passed=true,closed=false`必须返回调查或唯一supplement动作，不能声称完成。

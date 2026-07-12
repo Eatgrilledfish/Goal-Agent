@@ -276,7 +276,7 @@ def test_rejects_unsafe_sweep_id() -> None:
     assert any("safe single filename component" in error for error in errors)
 
 
-def test_repository_root_scope_allows_one_true_connected_component() -> None:
+def test_rejects_repository_root_as_an_unfocused_anchor() -> None:
     architecture = _architecture(distinct_boundary_paths=True)
     architecture["implementation_planes"][0]["paths"] = ["."]
     plan = _valid_plan(architecture)
@@ -294,7 +294,7 @@ def test_repository_root_scope_allows_one_true_connected_component() -> None:
 
     assert validator._in_scope("src/child.py", ["."])
     assert len(index["components"]) == 1
-    assert errors == []
+    assert any("repository root is not a focused code scope" in error for error in errors)
     assert set(index["slices"]) == {"SWEEP-ALL"}
 
 
@@ -348,20 +348,17 @@ def test_accepts_one_slice_when_parallel_path_couples_all_risk_nodes() -> None:
 @pytest.mark.parametrize(
     ("case", "expected_error"),
     [
-        ("overlap", "BOUNDARY-A overlaps sweep SWEEP-A"),
-        ("missing", "boundary ownership must exactly cover required IDs"),
+        ("missing", "boundary coverage must include all required IDs"),
         ("unknown", "unknown IDs ['PLANE-UNKNOWN']"),
         ("derived_coverage", "must equal architecture-derived IDs"),
     ],
 )
-def test_rejects_overlap_missing_unknown_or_inexact_coverage(
+def test_rejects_missing_unknown_or_inexact_coverage(
     case: str, expected_error: str,
 ) -> None:
     architecture = _architecture()
     plan = _valid_plan(architecture)
-    if case == "overlap":
-        plan["slices"][1]["architecture_boundaries"].append("BOUNDARY-A")
-    elif case == "missing":
+    if case == "missing":
         plan["slices"][0]["architecture_boundaries"] = []
     elif case == "unknown":
         plan["slices"][0]["implementation_planes"].append("PLANE-UNKNOWN")
@@ -373,38 +370,118 @@ def test_rejects_overlap_missing_unknown_or_inexact_coverage(
     assert any(expected_error in error for error in errors), errors
 
 
-def test_rejects_boundary_and_path_plane_components_split_across_sweeps() -> None:
+def test_accepts_connected_architecture_split_by_disjoint_primary_code_scope() -> None:
     architecture = _architecture(distinct_boundary_paths=True)
+    plan = _valid_plan(architecture)
+    architecture["parallel_behavior_paths"] = [{
+        "path_id": "PATH-SHARED", "plane_ids": ["PLANE-A", "PLANE-B"],
+    }]
+    plan["required_coverage"]["parallel_path_ids"] = ["PATH-SHARED"]
+    plan["slices"] = [
+        {
+            "sweep_id": "SWEEP-A",
+            "architecture_boundaries": ["BOUNDARY-A"],
+            "implementation_planes": ["PLANE-A"],
+            "parallel_path_ids": ["PATH-SHARED"],
+            "anchor_paths": ["entry/a.py", "impl/a.py"],
+            "review_lenses": [LENSES[0]],
+            "scope_rationale": "Inspect one disjoint pair of primary code paths.",
+        },
+        {
+            "sweep_id": "SWEEP-B",
+            "architecture_boundaries": ["BOUNDARY-B"],
+            "implementation_planes": ["PLANE-B"],
+            "parallel_path_ids": ["PATH-SHARED"],
+            "anchor_paths": ["entry/b.py", "impl/b.py"],
+            "review_lenses": [LENSES[1]],
+            "scope_rationale": "Inspect the other disjoint pair of primary code paths.",
+        },
+    ]
+
+    errors, index = _validate(plan, architecture)
+
+    assert errors == []
+    assert set(index["slices"]) == {"SWEEP-A", "SWEEP-B"}
+
+
+def test_allows_architecture_ids_to_be_shared_across_disjoint_primary_scopes() -> None:
+    architecture = _architecture()
+    architecture["implementation_planes"][0]["paths"] = ["src"]
+    architecture["integration_boundaries"][0]["paths"] = ["src"]
     plan = _valid_plan(architecture)
     plan["slices"] = [
         {
             "sweep_id": "SWEEP-A",
             "architecture_boundaries": ["BOUNDARY-A"],
-            "implementation_planes": ["PLANE-B"],
-            "parallel_path_ids": ["PATH-B"],
-            "anchor_paths": ["entry/a.py", "impl/b.py"],
+            "implementation_planes": ["PLANE-A"],
+            "parallel_path_ids": ["PATH-A"],
+            "anchor_paths": ["src/a.py"],
             "review_lenses": [LENSES[0]],
-            "scope_rationale": "Intentionally invalid cross-component assignment.",
+            "scope_rationale": "Inspect the first disjoint primary path.",
         },
         {
             "sweep_id": "SWEEP-B",
-            "architecture_boundaries": ["BOUNDARY-B"],
-            "implementation_planes": ["PLANE-A"],
-            "parallel_path_ids": ["PATH-A"],
-            "anchor_paths": ["entry/b.py", "impl/a.py"],
+            "architecture_boundaries": ["BOUNDARY-A", "BOUNDARY-B"],
+            "implementation_planes": ["PLANE-A", "PLANE-B"],
+            "parallel_path_ids": ["PATH-A", "PATH-B"],
+            "anchor_paths": ["src/b.py"],
             "review_lenses": [LENSES[1]],
-            "scope_rationale": "Intentionally invalid cross-component assignment.",
+            "scope_rationale": "Inspect the second disjoint primary path.",
         },
     ]
 
     errors, _index = _validate(plan, architecture)
 
-    split_errors = [
-        error for error in errors if "coupled risk component is split across sweeps" in error
-    ]
-    assert len(split_errors) == 2
-    assert any("boundary:BOUNDARY-A" in error and "path:PATH-A" in error for error in split_errors)
-    assert any("boundary:BOUNDARY-B" in error and "path:PATH-B" in error for error in split_errors)
+    assert errors == []
+
+
+def test_rejects_plan_that_does_not_assign_every_portfolio_lens() -> None:
+    architecture = _architecture()
+    plan = _valid_plan(architecture)
+    for item in plan["slices"]:
+        item["review_lenses"] = [LENSES[0]]
+
+    errors, _index = _validate(plan, architecture)
+
+    assert any(
+        "review_lenses must cover the complete contract portfolio" in error
+        and LENSES[1] in error
+        for error in errors
+    )
+
+
+def test_rejects_more_than_six_implementation_planes_in_one_slice() -> None:
+    architecture = _architecture()
+    plan = _valid_plan(architecture)
+    for suffix in ("C", "D", "E", "F", "G", "H"):
+        plane_id = f"PLANE-{suffix}"
+        code_path = f"src/{suffix.lower()}.py"
+        architecture["implementation_planes"].append({
+            "plane_id": plane_id, "paths": [code_path],
+        })
+        plan["required_coverage"]["plane_ids"].append(plane_id)
+        plan["slices"][0]["implementation_planes"].append(plane_id)
+        plan["slices"][0]["anchor_paths"].append(code_path)
+
+    errors, _index = _validate(plan, architecture)
+
+    assert any(
+        "implementation_planes must contain at most 6 values" in error
+        for error in errors
+    )
+
+
+def test_rejects_anchor_unrelated_to_assigned_architecture_paths() -> None:
+    architecture = _architecture()
+    plan = _valid_plan(architecture)
+    plan["slices"][0]["anchor_paths"] = ["unrelated.py"]
+
+    errors, _index = _validate(plan, architecture)
+
+    assert any(
+        "unrelated.py is unrelated to assigned architecture" in error
+        for error in errors
+    )
 
 
 def test_allows_nested_anchor_paths_within_one_sweep() -> None:

@@ -435,10 +435,10 @@ def validate_coverage(
 ) -> dict[str, dict[str, Any]]:
     """Mechanically validate the current incremental coverage index.
 
-    This intentionally does not infer applicability, require claims for an
-    applicable group, or decide whether the model selected enough claims.  It
-    only binds the model-authored coverage state to the validated inventory and
-    materialized claim ledger.
+    Applicability remains model-authored in the inventory.  Once the model has
+    marked a document group required or in_scope, however, at least one atomic
+    claim is required so the implementation review cannot silently skip the
+    entire design domain.
     """
     if coverage.get("session_id") != session_id:
         issues.add(
@@ -510,6 +510,15 @@ def validate_coverage(
         claim_ids = _validate_string_list(
             group.get("claim_ids"), f"{label}.claim_ids", issues,
         )
+        if (
+            isinstance(inventory_group, dict)
+            and inventory_group.get("scope_relation") in {"required", "in_scope"}
+            and not claim_ids
+        ):
+            issues.add(
+                "COVERAGE_CLAIM_MISSING",
+                f"{label}: required/in_scope design group must materialize at least one claim",
+            )
         families = _validate_string_list(
             group.get("behavior_families"), f"{label}.behavior_families", issues,
         )
