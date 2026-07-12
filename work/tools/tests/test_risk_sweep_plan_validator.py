@@ -171,7 +171,7 @@ def test_accepts_exactly_two_independent_architecture_components() -> None:
     assert all(len(component) == 3 for component in index["components"])
 
 
-def test_accepts_nonempty_valid_lens_subset_per_slice() -> None:
+def test_rejects_partial_lens_portfolio_in_any_slice() -> None:
     architecture = _architecture()
     plan = _valid_plan(architecture)
     plan["slices"][0]["review_lenses"] = [LENSES[0]]
@@ -179,9 +179,11 @@ def test_accepts_nonempty_valid_lens_subset_per_slice() -> None:
 
     errors, index = _validate(plan, architecture)
 
-    assert errors == []
-    assert index["slices"]["SWEEP-A"]["review_lenses"] == [LENSES[0]]
-    assert index["slices"]["SWEEP-B"]["review_lenses"] == [LENSES[1]]
+    assert len([
+        error for error in errors
+        if "review_lenses must equal the complete contract portfolio" in error
+    ]) == 2
+    assert set(index["slices"]) == {"SWEEP-A", "SWEEP-B"}
 
 
 @pytest.mark.parametrize("lenses", [[], ["unknown lens"]])
@@ -384,7 +386,7 @@ def test_accepts_connected_architecture_split_by_disjoint_primary_code_scope() -
             "implementation_planes": ["PLANE-A"],
             "parallel_path_ids": ["PATH-SHARED"],
             "anchor_paths": ["entry/a.py", "impl/a.py"],
-            "review_lenses": [LENSES[0]],
+            "review_lenses": LENSES,
             "scope_rationale": "Inspect one disjoint pair of primary code paths.",
         },
         {
@@ -393,7 +395,7 @@ def test_accepts_connected_architecture_split_by_disjoint_primary_code_scope() -
             "implementation_planes": ["PLANE-B"],
             "parallel_path_ids": ["PATH-SHARED"],
             "anchor_paths": ["entry/b.py", "impl/b.py"],
-            "review_lenses": [LENSES[1]],
+            "review_lenses": LENSES,
             "scope_rationale": "Inspect the other disjoint pair of primary code paths.",
         },
     ]
@@ -416,7 +418,7 @@ def test_allows_architecture_ids_to_be_shared_across_disjoint_primary_scopes() -
             "implementation_planes": ["PLANE-A"],
             "parallel_path_ids": ["PATH-A"],
             "anchor_paths": ["src/a.py"],
-            "review_lenses": [LENSES[0]],
+            "review_lenses": LENSES,
             "scope_rationale": "Inspect the first disjoint primary path.",
         },
         {
@@ -425,7 +427,7 @@ def test_allows_architecture_ids_to_be_shared_across_disjoint_primary_scopes() -
             "implementation_planes": ["PLANE-A", "PLANE-B"],
             "parallel_path_ids": ["PATH-A", "PATH-B"],
             "anchor_paths": ["src/b.py"],
-            "review_lenses": [LENSES[1]],
+            "review_lenses": LENSES,
             "scope_rationale": "Inspect the second disjoint primary path.",
         },
     ]
@@ -444,7 +446,7 @@ def test_rejects_plan_that_does_not_assign_every_portfolio_lens() -> None:
     errors, _index = _validate(plan, architecture)
 
     assert any(
-        "review_lenses must cover the complete contract portfolio" in error
+        "review_lenses must equal the complete contract portfolio" in error
         and LENSES[1] in error
         for error in errors
     )
@@ -634,3 +636,24 @@ def test_risk_coverage_still_requires_one_observation_per_planned_sweep(
     errors, _metrics = validator.validate_risk_coverage(risks, state_root)
 
     assert any("do not include completed sweeps: ['SWEEP-B']" in error for error in errors)
+
+
+def test_sweep_rejects_more_than_eight_observations(tmp_path: Path) -> None:
+    state_root, _plan = _write_valid_state(tmp_path)
+    items = []
+    for index in range(9):
+        item = _observation(
+            state_root,
+            sweep="SWEEP-A",
+            boundary="BOUNDARY-A",
+            plane="PLANE-A",
+            path_id="PATH-A",
+            code_file="src/a.py",
+            lens=LENSES[index % len(LENSES)],
+        )
+        item["observation_id"] = f"RISK-A-{index}"
+        items.append(item)
+
+    errors = validator.validate_sweep_coverage(items, state_root, "SWEEP-A")
+
+    assert any("may emit at most 8" in error for error in errors)

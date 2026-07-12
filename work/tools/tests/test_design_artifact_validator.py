@@ -306,8 +306,94 @@ def test_required_or_in_scope_group_must_materialize_a_claim(artifacts):
     assert code == 1
     assert trace["error_count_by_code"]["COVERAGE_CLAIM_MISSING"] == 1
     assert any(
-        "required/in_scope design group must materialize at least one claim" in error
+        "must materialize at least 1 breadth-balanced atomic claims" in error
         for error in trace["errors"]
+    )
+
+
+def test_claim_distribution_uses_behavior_breadth_without_domain_names() -> None:
+    groups = {
+        "broad": {
+            "scope_relation": "required",
+            "sections": [{"behavior_families": ["a", "b", "c", "d"]}],
+        },
+        "narrow": {
+            "scope_relation": "in_scope",
+            "sections": [{"behavior_families": ["x"]}],
+        },
+        "supporting": {
+            "scope_relation": "informational",
+            "sections": [{"behavior_families": ["ignored"]}],
+        },
+    }
+
+    assert validator.required_claim_distribution(groups) == {
+        "broad": 4,
+        "narrow": 1,
+    }
+
+
+def test_claim_distribution_caps_large_portfolio_at_twenty_four() -> None:
+    groups = {
+        f"group-{index:02d}": {
+            "scope_relation": "in_scope",
+            "sections": [{
+                "behavior_families": [f"behavior-{offset}" for offset in range(width)],
+            }],
+        }
+        for index, width in enumerate([37, 33, 33, 27, 26, 22, 20, 19, 15, 13, 13, 11, 11, 10, 10])
+    }
+
+    allocation = validator.required_claim_distribution(groups)
+
+    assert sum(allocation.values()) == 24
+    assert max(allocation.values()) >= 3
+    assert min(allocation.values()) == 1
+
+
+def test_breadth_claims_cover_distinct_sections_before_reusing_one() -> None:
+    inventory_groups = {
+        "broad": {
+            "document_key": "broad",
+            "members": ["broad.md"],
+            "scope_relation": "required",
+            "sections": [
+                {
+                    "section_id": "SECTION-A", "path": "broad.md",
+                    "line_start": 1, "line_end": 2,
+                    "behavior_families": ["a"],
+                },
+                {
+                    "section_id": "SECTION-B", "path": "broad.md",
+                    "line_start": 3, "line_end": 4,
+                    "behavior_families": ["b"],
+                },
+            ],
+        },
+    }
+    claims = {
+        "CLAIM-A": {"path": "broad.md", "line_start": 1, "line_end": 1},
+        "CLAIM-B": {"path": "broad.md", "line_start": 2, "line_end": 2},
+    }
+    coverage = {
+        "session_id": "session",
+        "document_groups": [{
+            "document_key": "broad", "members": ["broad.md"],
+            "disposition": "applicable", "evidence": "The group is in scope.",
+            "claim_ids": ["CLAIM-A", "CLAIM-B"],
+            "behavior_families": ["a", "b"],
+        }],
+    }
+    issues = validator.Issues()
+
+    validator.validate_coverage(
+        coverage, "session", inventory_groups, claims,
+        {"broad.md": "broad"}, issues,
+    )
+
+    assert any(
+        "across at least 2 distinct inventory sections; found 1" in error
+        for error in issues.errors
     )
 
 

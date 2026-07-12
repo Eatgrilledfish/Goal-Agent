@@ -108,6 +108,49 @@ def test_task_check_rejects_code_to_design_task_without_risk_refs(workspace):
     )
 
 
+def test_task_plan_requires_one_task_for_every_accepted_claim(workspace):
+    populate_handoffs(workspace)
+    _prepare_claim_scope(workspace)
+    state = workspace["state"]
+    assert isinstance(state, Path)
+    tasks, errors = ac.load_jsonl(state / "investigation_tasks.jsonl")
+    assert errors == []
+    tasks[-1]["claim_id"] = "CLAIM-003"
+    _rewrite_jsonl(state / "investigation_tasks.jsonl", tasks)
+
+    proc = _run_stage(workspace, "task-plan-check", check=False)
+
+    assert proc.returncode == 1
+    trace = ac.load_json(workspace["logs"] / "trace" / "task_plan_validation.json")
+    assert any(
+        "every accepted claim must have an investigation task" in error
+        and "CLAIM-004" in error
+        for error in trace["errors"]
+    )
+
+
+def test_code_to_design_task_may_link_related_observations_from_multiple_sweeps(workspace):
+    populate_handoffs(workspace)
+    _prepare_claim_scope(workspace)
+    state = workspace["state"]
+    assert isinstance(state, Path)
+    tasks, errors = ac.load_jsonl(state / "investigation_tasks.jsonl")
+    assert errors == []
+    task = next(
+        item for item in tasks
+        if item["exploration_mode"] == "code-to-design risk backtracking"
+        and item["architecture_boundaries"] == ["BOUNDARY-API"]
+    )
+    task["risk_observation_ids"].append("RISK-AUDIT-001")
+    task["architecture_boundaries"].append("BOUNDARY-AUDIT")
+    task["implementation_planes"].append("PLANE-AUDIT")
+    _rewrite_jsonl(state / "investigation_tasks.jsonl", tasks)
+
+    proc = _run_stage(workspace, "task-plan-check", check=False)
+
+    assert proc.returncode == 0
+
+
 def test_task_check_requires_each_task_in_exactly_one_round(workspace):
     populate_handoffs(workspace)
     _prepare_claim_scope(workspace)
@@ -179,14 +222,13 @@ def test_task_check_freezes_later_round_until_earlier_round_drains(workspace):
     )
 
 
-def test_task_plan_isolates_task_outside_accepted_claim_review_scope(workspace):
+def test_claim_review_rejects_partial_materialized_claim_scope(workspace):
     populate_handoffs(workspace)
     _prepare_claim_scope(workspace)
     state = workspace["state"]
     assert isinstance(state, Path)
     review_path = state / "design_claim_review.json"
     review = ac.load_json(review_path)
-    original_review = json.loads(json.dumps(review))
     scope_path = state / "claim_review_scope.json"
     scope = ac.load_json(scope_path)
     scope["claim_ids"] = ["CLAIM-001", "CLAIM-002", "CLAIM-003"]
@@ -202,23 +244,16 @@ def test_task_plan_isolates_task_outside_accepted_claim_review_scope(workspace):
         )
     }
     ac.save_json(review_path, review)
-    run_runner(
+    proc = run_runner(
         "claim-check", workspace["code"], workspace["design"],
-        workspace["result"], workspace["logs"],
+        workspace["result"], workspace["logs"], check=False,
     )
-
-    proc = _run_stage(workspace, "task-plan-check", check=False)
     assert proc.returncode == 1
-    trace = ac.load_json(workspace["logs"] / "trace" / "task_plan_validation.json")
+    trace = ac.load_json(workspace["logs"] / "trace" / "claim_review_validation.json")
     assert any(
-        "task TASK-004: claim_id 'CLAIM-004' is outside accepted claim review scope" in error
+        "must include every materialized claim" in error and "CLAIM-004" in error
         for error in trace["errors"]
     )
-
-    assert trace["global_passed"] is True
-    assert "TASK-004" in trace["invalid_task_ids"]
-    assert set(trace["valid_task_ids"]) == {"TASK-001", "TASK-002", "TASK-003"}
-    ac.save_json(review_path, original_review)
 
 
 def test_initial_frontier_rejects_design_only_entry_when_risks_exist(workspace):

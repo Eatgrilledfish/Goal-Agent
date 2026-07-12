@@ -18,6 +18,7 @@ ARCHITECTURE_NAME = "architecture_map.json"
 CONTRACT_NAME = "agent_loop_contract.json"
 SAFE_SWEEP_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 MAX_IMPLEMENTATION_PLANES_PER_SLICE = 6
+MAX_OBSERVATIONS_PER_SWEEP = 8
 
 
 def plan_input_digests(state_root: Path) -> tuple[dict[str, str], str]:
@@ -201,7 +202,6 @@ def validate_plan(
         "boundary": set(), "plane": set(), "path": set(),
     }
     anchor_owners: dict[str, str] = {}
-    assigned_lenses: set[str] = set()
     allowed_keys = {
         "sweep_id", "architecture_boundaries", "implementation_planes",
         "parallel_path_ids", "anchor_paths", "review_lenses", "scope_rationale",
@@ -348,7 +348,12 @@ def validate_plan(
         unknown_lenses = set(lenses) - known_lenses
         if unknown_lenses:
             errors.append(f"{label}.review_lenses: unknown values {sorted(unknown_lenses)}")
-        assigned_lenses.update(lenses)
+        if set(lenses) != known_lenses:
+            errors.append(
+                f"{label}.review_lenses must equal the complete contract portfolio; "
+                f"missing={sorted(known_lenses - set(lenses))}, "
+                f"extra={sorted(set(lenses) - known_lenses)}"
+            )
         if not isinstance(item.get("scope_rationale"), str) or not item.get(
             "scope_rationale", "",
         ).strip():
@@ -366,13 +371,6 @@ def validate_plan(
                 f"{PLAN_NAME}: {kind} coverage must include all required IDs; "
                 f"missing={sorted(expected - actual)}, extra={sorted(actual - expected)}"
             )
-    if assigned_lenses != known_lenses:
-        errors.append(
-            f"{PLAN_NAME}: review_lenses must cover the complete contract portfolio; "
-            f"missing={sorted(known_lenses - assigned_lenses)}, "
-            f"extra={sorted(assigned_lenses - known_lenses)}"
-        )
-
     return errors, {
         "slices": slices,
         "required_boundaries": required_boundaries,
@@ -575,6 +573,11 @@ def validate_sweep_coverage(
     sweep = index.get("slices", {}).get(sweep_id)
     if not isinstance(sweep, dict):
         return [f"risk sweep {sweep_id}: unknown sweep_id"]
+    if len(items) > MAX_OBSERVATIONS_PER_SWEEP:
+        errors.append(
+            f"risk sweep {sweep_id}: may emit at most "
+            f"{MAX_OBSERVATIONS_PER_SWEEP} high-information observations"
+        )
     foreign = sorted({
         str(item.get("sweep_id") or "") for item in items
         if item.get("sweep_id") != sweep_id

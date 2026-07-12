@@ -150,7 +150,7 @@ python3 ${WORK_ROOT}/tools/scripts/goal_runner.py inventory-check \
 
 ### 3.3 互斥 code-only risk sweeps
 
-architecture-check 通过后，主 Agent写 digest-bound `${STATE_ROOT}/risk_sweep_plan.json`。Plan至少包含一个真实非空 focused slice，并按可独立阅读的 primary code scope切分：各 slice的`anchor_paths`必须存在、不得为仓库根`.`、彼此不得相同或父子重叠，每个 slice最多包含6个 implementation planes。Boundary/plane/parallel-path ID是架构关系引用，不是独占锁；三类 required ID必须在plan整体中全部出现，若一个宽架构ID确实横跨多个互斥主代码范围可以重复，但它在每个slice中都必须有本地anchor关系和关联plane。Plan整体的`review_lenses`并集必须等于contract完整portfolio，由模型按相关性分配；使用满足这些条件的最少focused slices。observation只记录 explorer实际发现的高信息量语义风险，不要求 observation 的 ID/lens并集再次覆盖整个 slice，也不得用正确实现、普通入口或宽泛架构描述填满coverage checklist。slice较多时每批最多并发两个Task。
+architecture-check 通过后，主 Agent写 digest-bound `${STATE_ROOT}/risk_sweep_plan.json`。Plan至少包含一个真实非空 focused slice，并按可独立阅读的 primary code scope切分：各 slice的`anchor_paths`必须存在、不得为仓库根`.`、彼此不得相同或父子重叠，每个 slice最多包含6个 implementation planes。Boundary/plane/parallel-path ID是架构关系引用，不是独占锁；三类 required ID必须在plan整体中全部出现，若一个宽架构ID确实横跨多个互斥主代码范围可以重复，但它在每个slice中都必须有本地anchor关系和关联plane。每个slice都必须使用contract完整的8类`review_lenses`，因为同一完整性、时序、链遍历或边界语义可能出现在任意互斥代码范围；重复的是审阅问题，不是代码范围。使用满足这些条件的最少focused slices。每个slice最多输出8条最强、具体、异常或不对称的observation；正确实现和普通入口不输出。slice较多时每批最多并发两个Task。
 
 ```bash
 python3 ${WORK_ROOT}/tools/scripts/goal_runner.py risk-plan-check \
@@ -187,7 +187,7 @@ Inventory通过后立即建立 design-origin breadth frontier；architecture map
 
 候选可由 design-to-code、code-to-design 或 capability-absence 三种方向产生。Design-to-code 可直接从 inventory 的独立 section/behavior family 创建 `origin=design_section` lookup，即使尚无 risk observation；capability-absence也可从 supplied design 的正面能力语义创建。选择依据是当前 supplied design 的适用性、规范强度、代码行为是否具体可达、外部可观察性、替代路径与预期信息增益；禁止固定打分或预置领域关键词排序。
 
-首次 claim resolution 必须让每个 `required|in_scope` document group至少物化一条可执行原子 claim，并把累计 claim review scope限制在24条以内。随后最多使用六个 round、每轮最多4个 task，把每条 accepted claim调查为一个finding并完成critic；不得在 accepted claim仍未调查时提前进入coverage。选择顺序先覆盖不同 document group、独立 behavior family、execution plane与 exploration mode，再深入同一行为族。只要存在适用设计，frontier不能全部源于code-only risk，必须包含design-to-code或capability-absence路径；反过来，每个已经产生有效observation的已完成risk sweep也必须至少向初始frontier输送一个引用该sweep observation的code-to-design task。这里限制的是六小时内的调查预算，不是issue数量目标。
+首次 claim resolution 使用最多24条的单一bounded portfolio。先给每个`required|in_scope` document group一条原子claim，再按该组inventory中不同`behavior_families`数量相对于当前claim数的比例逐槽分配剩余预算，直到24条或所有behavior-family seed均已分配；同组多个槽先覆盖不同section，再在同section选择不同义务分支。不得让少数风险观察占满portfolio，也不得保留未进入review scope的materialized claim。`claim_review_scope.claim_ids`必须包含当前全部materialized claims。随后最多使用六个round、每轮最多4个task，每条accepted claim至少对应一个task并调查为finding、完成critic后才能coverage。只要存在适用设计，frontier必须有design-to-code或capability-absence路径；每个已完成risk sweep必须至少被一个code-to-design task引用。这里限制的是六小时内的调查预算，不是issue数量目标。
 
 主 Agent把 design-origin、risk-origin、capability reconciliation 与 critic request统一写入 `${STATE_ROOT}/design_lookup_requests.jsonl`，只包含设计语义问题、document/section scope 与来源 stable ID，不泄漏代码答案。fresh spec analyst 只为进入 frontier 的义务生成/更新累计 raw claims 与 `design_coverage.json`，然后物化：
 
@@ -206,7 +206,7 @@ Claim draft的 nested `source_ref` 是唯一模型填写的引用；不得用 to
 
 ### 4.1 Per-claim spec review
 
-主 Agent写累计 `${STATE_ROOT}/claim_review_scope.json`。`claim_ids` 是所有已被当前 session 的 task/finding 使用的 accepted claims 与本批新增 claims 的去重并集；不得删除仍被引用的旧 claim：
+主 Agent写 `${STATE_ROOT}/claim_review_scope.json`。`claim_ids`必须逐值包含当前 bounded portfolio中的全部materialized claims；claim repair后先重跑materializer并重建完整scope，不能留下未经spec critic审查的旁路claim：
 
 ```json
 {"session_id":"当前session","round_id":"ROUND-...","claim_ids":["累计CLAIM-..."]}
@@ -224,7 +224,7 @@ python3 ${WORK_ROOT}/tools/scripts/goal_runner.py claim-check \
 
 ### 4.2 原子 task 与 plan/lifecycle gate
 
-每个 task 只绑定一个 accepted claim、`claim_branch`、`hypothesis` 和 `obligation_sha256`。不同义务、分支或需独立裁决的 plane 拆成不同 task；每轮最多 4 项。写独立 plan handoff 并合并：
+每个 task 只绑定一个 accepted claim、`claim_branch`、`hypothesis` 和 `obligation_sha256`。对 design-to-code/capability-absence claim，先用 architecture map 找出可能承载同一设计行为的全部可达 plane 与 integration boundary；相关 plane 可在一个 task 内共同核验，需要独立裁决时拆成不同 task，不能只调查最显眼的核心目录。不同义务或状态分支也拆成不同 task；每轮最多 4 项。写独立 plan handoff并合并：
 
 ```bash
 python3 ${WORK_ROOT}/tools/scripts/handoff_merge.py \
@@ -323,9 +323,9 @@ Critic raw handoff不手填 digest。Self-check/merge确定性加入 `input_dige
 
 ## 6. 一次 coverage 补扫
 
-只有全部 accepted claims 都已有 complete finding+critic或结构化deferred后，才启动 fresh `coverage-critic`。`remaining_scoped_claims`非空是验证错误，不能通过记录gap绕过调查。Coverage 不审批单项 finding；它只记录尚未物化的 document section、architecture boundary/parallel plane、语义 lens、未映射 risk和critic evidence request，并决定是否值得做一次具体 supplement。
+只有全部 accepted claims 都已有 complete finding+critic或结构化deferred后，才启动 fresh `coverage-critic`。Coverage会重新执行task-plan门禁，不能绕过缺失claim task或缺失risk sweep task。`remaining_scoped_claims`非空是验证错误，不能通过记录gap绕过调查。Coverage不审批单项finding；它只记录本轮证据实际暴露的具体lens、boundary、parallel path或critic request缺口，并决定是否值得做一次supplement；不要求为每个未选inventory section、已被spec critic拒绝的claim或普通未映射risk制造gap。
 
-`coverage_audit.json.supplement_rounds` 只能是 0 或 1，`remaining_gaps` 必须逐项对账 applicable inventory section/behavior family，而不只是已有 claim/risk；完全未探索的适用设计域优先于对同一行为族继续加深，除非当前证据说明后者信息增益更高。若高价值 gap 尚无 accepted claim，先由 orchestrator走 design lookup→claim review，再重做初始coverage决策，不能因为 next task schema需要claim而跳过该设计域。`semantic_coverage` lens 可为 `investigated|inapplicable|gap_recorded`。每个`next_round_tasks`必须用非空`source_gap_ids`逐值引用当前`remaining_gaps.gap_id`，只能来自具体证据缺口，不能来自数量目标。`${STATE_ROOT}/coverage_supplement_history.json` 是 helper-owned 只读状态，Coverage/Orchestrator不得创建、清空或编辑；首次通过验证的非空 next task集合由`coverage-check`原子记录，完全相同的重放幂等，任何不同或第二次请求均机械拒绝。若选择 supplement，执行一次第4–5节流程；之后最终审计写`supplement_rounds=1,next_round_tasks=[]`，不再创建第二次coverage supplement。运行：
+`coverage_audit.json.supplement_rounds`只能是0或1。`remaining_gaps`只写有当前artifact证据支持且可能改变结论的具体缺口，不做逐section完整性台账。`semantic_coverage` lens可为`investigated|inapplicable|gap_recorded`；标为investigated时，只能引用其`review_lenses`逐值包含该lens的task和finding，否则改为gap_recorded。每个`next_round_tasks`必须用非空`source_gap_ids`引用当前gap。`${STATE_ROOT}/coverage_supplement_history.json`是helper-owned只读状态；首次通过验证的非空next task集合由`coverage-check`原子记录，只允许一次supplement。运行：
 
 ```bash
 python3 ${WORK_ROOT}/tools/scripts/goal_runner.py coverage-check \

@@ -488,6 +488,12 @@ def run(args: argparse.Namespace) -> int:
         errors.append(
             f"claim_review_scope.json has unknown claim_ids: {unknown_scope_claim_ids}"
         )
+    missing_scope_claim_ids = sorted(claim_ids - scope_claim_ids)
+    if missing_scope_claim_ids:
+        errors.append(
+            "claim_review_scope.json must include every materialized claim in the "
+            f"bounded portfolio; missing={missing_scope_claim_ids}"
+        )
 
     try:
         coverage = ac.load_json(coverage_path)

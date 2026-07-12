@@ -24,6 +24,7 @@ NORMATIVE_STRENGTHS = {
 PRIORITIES = {"high", "medium", "low"}
 TESTABILITY = {"candidate", "not_suitable", "unknown"}
 COVERAGE_DISPOSITIONS = {"applicable", "inapplicable", "superseded", "supporting"}
+MAX_CLAIM_PORTFOLIO = 24
 
 
 class Issues:
@@ -427,6 +428,49 @@ def validate_claims(
     return claim_index
 
 
+def required_claim_distribution(
+    inventory_groups: dict[str, dict[str, Any]],
+) -> dict[str, int]:
+    """Allocate the bounded claim portfolio by supplied-design breadth.
+
+    Every required/in-scope group receives one claim first. Remaining slots are
+    assigned proportionally to the number of distinct behavior-family seeds so
+    one broad document cannot be reduced to a single arbitrary obligation.
+    Domain names and implementation evidence never participate in this guardrail.
+    """
+    breadth: dict[str, int] = {}
+    for document_key, group in inventory_groups.items():
+        if group.get("scope_relation") not in {"required", "in_scope"}:
+            continue
+        families = {
+            family
+            for section in group.get("sections", [])
+            if isinstance(section, dict)
+            for family in section.get("behavior_families", [])
+            if isinstance(family, str) and family.strip()
+        }
+        breadth[document_key] = max(1, len(families))
+    allocation = {document_key: 1 for document_key in breadth}
+    budget = min(MAX_CLAIM_PORTFOLIO, sum(breadth.values()))
+    while sum(allocation.values()) < budget:
+        candidates = [
+            document_key for document_key in breadth
+            if allocation[document_key] < breadth[document_key]
+        ]
+        if not candidates:
+            break
+        selected = max(
+            candidates,
+            key=lambda document_key: (
+                breadth[document_key] / allocation[document_key],
+                breadth[document_key],
+                document_key,
+            ),
+        )
+        allocation[selected] += 1
+    return allocation
+
+
 def validate_coverage(
     coverage: dict[str, Any], session_id: str,
     inventory_groups: dict[str, dict[str, Any]],
@@ -510,15 +554,6 @@ def validate_coverage(
         claim_ids = _validate_string_list(
             group.get("claim_ids"), f"{label}.claim_ids", issues,
         )
-        if (
-            isinstance(inventory_group, dict)
-            and inventory_group.get("scope_relation") in {"required", "in_scope"}
-            and not claim_ids
-        ):
-            issues.add(
-                "COVERAGE_CLAIM_MISSING",
-                f"{label}: required/in_scope design group must materialize at least one claim",
-            )
         families = _validate_string_list(
             group.get("behavior_families"), f"{label}.behavior_families", issues,
         )
@@ -562,6 +597,58 @@ def validate_coverage(
                     f"{label}: claim {claim_id!r} belongs to document group "
                     f"{claim_group!r}, not {document_key!r}",
                 )
+
+    claim_distribution = required_claim_distribution(inventory_groups)
+    for document_key, required_count in sorted(claim_distribution.items()):
+        group = coverage_groups.get(document_key)
+        group_claim_ids = {
+            claim_id for claim_id in (
+                group.get("claim_ids", []) if isinstance(group, dict) else []
+            )
+            if isinstance(claim_id, str) and claim_id
+        }
+        actual_count = len(group_claim_ids)
+        if actual_count < required_count:
+            issues.add(
+                "COVERAGE_CLAIM_MISSING",
+                "design_coverage.json document group "
+                f"{document_key!r} must materialize at least {required_count} "
+                "breadth-balanced atomic claims; "
+                f"found {actual_count}",
+            )
+        inventory_group = inventory_groups.get(document_key, {})
+        valid_sections = [
+            section for section in inventory_group.get("sections", [])
+            if isinstance(section, dict)
+            and _relative_design_path(section.get("path")) is not None
+            and isinstance(section.get("line_start"), int)
+            and not isinstance(section.get("line_start"), bool)
+            and isinstance(section.get("line_end"), int)
+            and not isinstance(section.get("line_end"), bool)
+        ]
+        required_sections = min(required_count, len(valid_sections))
+        covered_sections = {
+            str(section.get("section_id") or "")
+            for section in valid_sections
+            for claim_id in group_claim_ids
+            for claim in [claim_index.get(claim_id)]
+            if isinstance(claim, dict)
+            and _relative_design_path(claim.get("path"))
+            == _relative_design_path(section.get("path"))
+            and isinstance(claim.get("line_start"), int)
+            and isinstance(claim.get("line_end"), int)
+            and claim["line_start"] <= section["line_end"]
+            and claim["line_end"] >= section["line_start"]
+            and section.get("section_id")
+        }
+        if actual_count >= required_count and len(covered_sections) < required_sections:
+            issues.add(
+                "COVERAGE_CLAIM_MISSING",
+                "design_coverage.json document group "
+                f"{document_key!r} must distribute its breadth-balanced claims "
+                f"across at least {required_sections} distinct inventory sections; "
+                f"found {len(covered_sections)}",
+            )
 
     missing = sorted(set(inventory_groups) - set(coverage_groups))
     extra = sorted(set(coverage_groups) - set(inventory_groups))

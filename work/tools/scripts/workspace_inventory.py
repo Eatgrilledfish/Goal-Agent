@@ -375,7 +375,7 @@ def loop_contract(
     state_root = Path(paths["state_root"])
     artifacts = {name: str(state_root / filename) for name, filename in ARTIFACT_NAMES.items()}
     return {
-        "contract_version": 17,
+        "contract_version": 18,
         "execution_model": "opencode-owned-model-driven-loop",
         "session": {
             "session_id": session_id,
@@ -414,8 +414,8 @@ def loop_contract(
                 "owner": "risk-explorer",
                 "output": [artifacts["risk_sweep_plan"], artifacts["risk_observations"]],
                 "done_when": (
-                    "A digest-bound plan covers every required architecture ID and every portfolio lens through focused, "
-                    "non-overlapping primary code scopes of at most six implementation planes; explorers emit only concrete high-information semantic leads, "
+                    "A digest-bound plan covers every required architecture ID through focused, non-overlapping primary code scopes of at most six implementation planes; "
+                    "each scope receives the complete lens portfolio and emits at most eight concrete high-information semantic leads, "
                     "and the scheduler runs at most two mutually exclusive tasks at once while design inventory may occupy one slot."
                 ),
             },
@@ -428,7 +428,7 @@ def loop_contract(
                 ],
                 "done_when": (
                     "Design-origin and code-origin evidence-pair frontier obligations are materialized as atomic claims from source_ref spans; "
-                    "every required/in_scope design group has at least one claim, the reviewed portfolio is capped at 24, "
+                    "the breadth-balanced portfolio is capped at 24 with one claim per required/in-scope group before proportional behavior-family allocation, "
                     "and exact quotes/source hashes are derived deterministically."
                 ),
             },
@@ -437,7 +437,7 @@ def loop_contract(
                 "owner": "spec-critic",
                 "output": [artifacts["claim_review_scope"], artifacts["design_claim_review"]],
                 "done_when": (
-                    "A fresh design-only critic accepted each executable claim for quote entailment, normative strength, "
+                    "A fresh design-only critic reviewed every materialized claim and accepted each executable claim for quote entailment, normative strength, "
                     "atomicity, and applicability using per-claim/source digests; unrelated group gaps remain expansion signals."
                 ),
             },
@@ -446,7 +446,7 @@ def loop_contract(
                 "owner": "orchestrator",
                 "output": artifacts["investigation_tasks"],
                 "done_when": (
-                    "Claims are converted into evidence questions using vocabulary dynamically discovered from the current input; "
+                    "Every accepted claim is converted into an evidence question using vocabulary dynamically discovered from the current input; "
                     "the initial frontier starts from both design behavior seeds and code risk observations."
                 ),
             },
@@ -562,7 +562,7 @@ def loop_contract(
             "risk_discovery_batch": (
                 "After risk-plan-check, keep at most two tasks active. Start one design-inventory task and one risk sweep; "
                 "as either completes, fill the free slot with the next disjoint risk slice or bounded design-resolution task. "
-                "Every sweep owns a disjoint primary anchor scope and one isolated handoff; architecture IDs may repeat only when they have local paths in each scope. Observations are sparse semantic leads, "
+                "Every sweep owns a disjoint primary anchor scope, receives the complete lens portfolio, and writes one isolated handoff with at most eight observations; architecture IDs may repeat only when they have local paths in each scope. Observations are sparse semantic leads, "
                 "not an exact restatement of every assigned ID or lens."
             ),
             "parallel_write_rule": "Each risk/investigator/probe/critic task writes one isolated JSON file under state/handoffs; never append to a shared JSONL from parallel tasks.",
@@ -696,11 +696,10 @@ def loop_contract(
                 "single coverage supplement. Listing a lens only in a round is insufficient."
             ),
             "claim_rule": (
-                "Design inventory is the searchable breadth map; only on-demand claims with accepted per-claim reviews form the executable frontier. "
-                "Start the initial frontier from both design-origin behavior seeds and code-origin risk observations, first diversifying across "
-                "document groups, behavior families, execution planes, and modes. Every completed risk sweep with observations contributes at least one code-to-design task. Use a risk-diverse evidence-pair portfolio rather than materializing every sentence or treating every high label as mandatory work. A compliant finding is valid evidence but cannot be published. "
+                "Design inventory is the searchable breadth map. Build one bounded portfolio of at most 24 claims: assign one to every required/in-scope group, then allocate remaining slots by behavior-family breadth divided by current claims. "
+                "Review every materialized claim and create at least one task for every accepted claim. Every completed risk sweep with observations is referenced by at least one code-to-design task. A compliant finding is valid evidence but cannot be published. "
                 "Optional/recommended behavior and completely absent capabilities remain eligible design claims; normative strength affects "
-                "classification and severity. Every applicable inventory section/behavior family is investigated or explicitly recorded as a concrete gap; unmaterialized sections are gaps, not invalid claims."
+                "classification and severity. Coverage gaps record only concrete evidence limitations exposed by the bounded frontier; they do not enumerate every unselected section, rejected claim, or ordinary unmapped risk."
             ),
             "boundary_rule": (
                 "Code-only risk sweeps account for every high-risk integration boundary. Candidate investigation either links a completed "

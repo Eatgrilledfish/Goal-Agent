@@ -901,6 +901,16 @@ def validate_task_plan_stage(
             task, task_id=task_id, session_id=session_id, root=root,
             claims=claims, accepted_claim_ids=claim_scope,
         ))
+    represented_claim_ids = {
+        str(task.get("claim_id") or "") for task in tasks.values()
+        if task.get("claim_id")
+    }
+    missing_claim_tasks = claim_scope - represented_claim_ids
+    if missing_claim_tasks:
+        global_errors.append(
+            "every accepted claim must have an investigation task before the "
+            f"frontier can run; missing={sorted(missing_claim_tasks)}"
+        )
     iteration_policy = contract.get("iteration_policy", {})
     max_tasks_per_round = iteration_policy.get("max_tasks_per_round")
     if (
@@ -1557,14 +1567,6 @@ def _validate_coverage_audit(
         parallel_paths=architecture_indexes["parallel_paths"],
         gap_ids=set(gaps), errors=errors,
     )
-    next_claims = {str(item.get("claim_id") or "") for item in next_tasks}
-    accounted_remaining_claims = next_claims | gap_refs.get("frontier_claim", set())
-    if remaining_claims - accounted_remaining_claims:
-        errors.append(
-            f"{label}: remaining scoped claims lack next task or recorded gap "
-            f"{sorted(remaining_claims - accounted_remaining_claims)}"
-        )
-
     missing_modes = modes - observed_modes
     planned_modes = {
         str(item.get("exploration_mode") or "") for item in next_tasks
@@ -1650,20 +1652,20 @@ def validate_coverage_stage(
     scoped_claim_ids = _validated_claim_review_scope(
         root, session_id, claims, errors,
     )
-    iteration_policy = contract.get("iteration_policy", {})
-    max_tasks_per_round = iteration_policy.get("max_tasks_per_round")
-    if (
-        not isinstance(max_tasks_per_round, int)
-        or isinstance(max_tasks_per_round, bool)
-        or max_tasks_per_round < 1
-    ):
-        errors.append("agent_loop_contract.json: max_tasks_per_round must be a positive integer")
-        max_tasks_per_round = 1
-    lifecycle_errors_by_task = {task_id: [] for task_id in tasks}
     round_values = list(rounds.values())
-    _validate_round_plan(
-        tasks, round_values, max_tasks_per_round, errors, lifecycle_errors_by_task,
+    task_plan_errors, task_plan_errors_by_task, _task_plan_metrics = (
+        validate_task_plan_stage(
+            root=root, code_root=code_root, session_id=session_id,
+            contract=contract, architecture=architecture, claims=claims,
+            risks=risks, tasks=tasks, rounds=round_values,
+        )
     )
+    errors.extend(task_plan_errors)
+    errors.extend(
+        error for task_errors in task_plan_errors_by_task.values()
+        for error in task_errors
+    )
+    lifecycle_errors_by_task = {task_id: [] for task_id in tasks}
     _validate_round_lifecycle(
         tasks, findings, round_values, errors, lifecycle_errors_by_task,
     )
@@ -2033,54 +2035,6 @@ def validate_coverage_stage(
         if isinstance(kind, str) and isinstance(ref_id, str) and kind and ref_id:
             recorded_gap_refs.setdefault(kind, set()).add(ref_id)
 
-    unaccounted_materialized_claims = (
-        set(claims) - scoped_claim_ids - recorded_gap_refs.get("frontier_claim", set())
-    )
-    if unaccounted_materialized_claims:
-        errors.append(
-            "materialized claims outside the current accepted scope require "
-            "frontier_claim remaining gaps: "
-            f"{sorted(unaccounted_materialized_claims)}"
-        )
-
-    inventory_groups = {
-        str(item.get("document_key") or ""): item
-        for item in design_inventory.get("document_groups", [])
-        if isinstance(item, dict) and item.get("document_key")
-    } if isinstance(design_inventory, dict) else {}
-    for group_id, coverage_group in design_groups.items():
-        if coverage_group.get("disposition") != "applicable":
-            continue
-        inventory_group = inventory_groups.get(group_id, {})
-        for section in inventory_group.get("sections", []):
-            if not isinstance(section, dict):
-                continue
-            section_id = str(section.get("section_id") or "")
-            section_path = str(section.get("path") or "")
-            section_start = section.get("line_start")
-            section_end = section.get("line_end")
-            if not (
-                section_id and section_path
-                and isinstance(section_start, int) and not isinstance(section_start, bool)
-                and isinstance(section_end, int) and not isinstance(section_end, bool)
-            ):
-                continue
-            materialized = any(
-                claim.get("document_key") == group_id
-                and claim.get("path") == section_path
-                and isinstance(claim.get("line_start"), int)
-                and isinstance(claim.get("line_end"), int)
-                and claim["line_start"] <= section_end
-                and claim["line_end"] >= section_start
-                for claim in claims.values()
-            )
-            if not materialized and section_id not in recorded_gap_refs.get(
-                "inventory", set()
-            ):
-                errors.append(
-                    "applicable design inventory section has neither a materialized "
-                    f"claim nor an inventory gap: {section_id}"
-                )
     log_root_value = manifest.get("paths", {}).get("log_root")
     claim_review_trace = {}
     if isinstance(log_root_value, str) and log_root_value:

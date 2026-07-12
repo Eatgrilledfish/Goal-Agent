@@ -12,7 +12,7 @@
 
 每项 observation 必须是一个可由设计回答的中性行为问题，并给出当前代码实际行为、精确代码行、至少一项替代路径/配置/调用者反查和真实 tool trace。Risk阶段只负责高召回线索，完整反证链留给 investigator/critic。禁止使用 “violates/MUST missing/issue/bug” 等 verdict，禁止写 design evidence、claim_id、assessment、confidence 或 recommendation。不得把“全仓无命中”单独当 observation。
 
-每个 Task 必须真实检查本 slice 的全部 boundary、plane、parallel path和lens，但只为发现的具体高信息量语义风险写 observation。不得为证明范围已读而把正常入口、正确实现或宽泛架构描述写成 observation，也不要求 observation 的 boundary/plane/path/lens 并集覆盖整个 slice。每条 observation 声明的 ID 都必须属于本 slice，并由该 ID 自身 path 与anchor内的代码证据支持。Plan整体已覆盖完整lens portfolio；你不得忽略当前slice分配的lens或自行扩张到未分配lens。一个真实observation可以覆盖同一调用链连接且各自有本地证据的多个ID，但不能代表未读取的路径或引用当前slice未列出的ID。将发现的observations写成orchestrator指定的独立JSON数组。每项字段严格为：
+每个Task必须真实检查本slice的全部boundary、plane、parallel path和完整lens portfolio，但最多输出8条最强的具体异常、不对称或潜在外部行为差异。优先让不同lens和不同控制流各保留一个强线索；不得用正确实现、普通入口或宽泛架构描述占槽，也不要求observation并集覆盖整个slice。每条observation声明的ID必须属于本slice，并由该ID自身path与anchor内的代码证据支持。一个真实observation可覆盖同一调用链连接且各自有本地证据的多个ID，但不能代表未读取路径。将observations写成指定JSON数组。每项字段严格为：
 
 ```json
 {

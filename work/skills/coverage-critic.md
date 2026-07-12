@@ -16,7 +16,7 @@
 - 当前 pending/in_progress/deferred状态是否诚实；
 - 是否值得在剩余预算内做一次有明确信息增益的 supplement。
 
-未覆盖 gap是合法输出。每个适用 inventory section/behavior family都必须被investigated或明确记为具体gap，但不要求每个都生成task；不要因 group gap阻塞已接受 claim；不要为 candidate/confirmed数量创建 task。少量合规 finding不能证明整个域合规，也不能替代对另一个完全未探索设计域的对账。
+未覆盖gap是合法输出，但只记录当前frontier证据暴露的具体缺口，不把整个inventory展开成逐section账单；不要因普通未选section阻塞已接受claim，也不要为candidate/confirmed数量创建task。少量合规finding不能证明整个域合规。
 
 ## `semantic_coverage.json`
 
@@ -95,7 +95,7 @@
 
 首次通过validator的非空`next_round_tasks`由`coverage-check`按完整任务集合摘要原子写入helper-owned history；相同请求重放幂等，改变任务或gap形成的第二请求必定失败。补扫完成后已解决的source gap可以从`remaining_gaps`移除，history仍保留原请求证据。
 
-Gap的 `kind/ref_id` 必须可机器对账：`claim_review_expansion` 使用 claim-review trace 的 `expansion_request_id`；`lens` 使用完整 lens；`architecture_boundary/parallel_path/exploration_mode/frontier_claim/critic_request` 分别使用对应稳定 ID；文档组或 section gap用 `inventory`。`gap_recorded` lens的 task/finding arrays必须为空，并有同 lens `remaining_gaps`；high-risk boundary或parallel path未直接调查时也必须有对应 gap。
+Gap的`kind/ref_id`必须可机器对账，但只记录当前artifact证据已经暴露的具体缺口，不枚举每个未选inventory section、被spec critic拒绝的claim或普通未映射risk。构造每个lens项时先按lens字符串过滤tasks，再只保留其linked finding也逐值声明该lens的证据；不得把未声明lens的task/finding挂到`investigated`。没有这种证据时使用`gap_recorded`，task/finding arrays为空并写同lens gap。high-risk boundary或parallel path未直接调查时仍需对应具体gap。
 
 Next task必须来自具体 gap，不得写宽泛“再检查整个模块”。若最高信息增益gap尚无 accepted claim，先记录具体design lookup/section/behavior-family gap并返回`closed=false`，由orchestrator完成claim resolution/review后重新运行本次初始审计；不能虚构claim ID，也不能因为暂时没有claim就跳过该域并关闭coverage。Deferred只接受 task中两次 provider/tool failure的结构化证据；普通证据不足不是 deferred。
 

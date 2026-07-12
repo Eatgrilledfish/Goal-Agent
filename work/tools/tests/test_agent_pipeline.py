@@ -549,10 +549,9 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
         task_risk_ids = [task_risk] if (
             task_mode == "code-to-design risk backtracking"
         ) else []
-        if count == 3 and index == 2:
-            task_boundaries = ["BOUNDARY-API", "BOUNDARY-AUDIT"]
-            task_planes = ["PLANE-SERVICE", "PLANE-AUDIT"]
-            task_risk_ids = ["RISK-API-001", "RISK-AUDIT-001"]
+        if count == 3 and index == 3:
+            task_mode = "code-to-design risk backtracking"
+            task_risk_ids = ["RISK-AUDIT-001"]
         hypothesis = "Does the reachable implementation enforce this one design obligation?"
         obligation_sha256 = stage_artifact_validator.claim_obligation_sha256(claim)
         append(state / "investigation_tasks.jsonl", {
@@ -774,6 +773,19 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
         for task in tasks_for_templates for lens in task.get("review_lenses", [])
     }
     tasks_by_id = {str(task["task_id"]): task for task in tasks_for_templates}
+    actual_modes = list(dict.fromkeys(
+        str(task["exploration_mode"]) for task in tasks_for_templates
+    ))
+    missing_mode_gaps = [{
+        "gap_id": f"GAP-MODE-{index:03d}",
+        "kind": "exploration_mode",
+        "ref_id": mode,
+        "reason": "The bounded fixture frontier did not require this mode.",
+        "evidence": "No fixture task selected this exploration mode.",
+    } for index, mode in enumerate(
+        sorted(set(contract["coverage_contract"]["exploration_modes"]) - set(actual_modes)),
+        start=1,
+    )]
     ac.save_json(state / "semantic_coverage.json", {
         "session_id": workspace["session_id"],
         "lenses": [{
@@ -793,7 +805,7 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
         "session_id": workspace["session_id"],
         "round_id": "ROUND-001",
         "strategy": "Check externally visible service behaviors.",
-        "exploration_modes": contract["coverage_contract"]["exploration_modes"],
+        "exploration_modes": actual_modes,
         "document_groups": ["contract"],
         "architecture_boundaries": (
             ["BOUNDARY-API", "BOUNDARY-AUDIT"] if count >= 3 else ["BOUNDARY-API"]
@@ -814,7 +826,7 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
         "claims_total": count,
         "claims_investigated": count,
         "rounds_completed": 1,
-        "exploration_modes_completed": contract["coverage_contract"]["exploration_modes"],
+        "exploration_modes_completed": actual_modes,
         "document_groups_total": 1,
         "document_groups_accounted": 1,
         "code_areas_reviewed": ["service.py", "audit.py"],
@@ -833,7 +845,7 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
         "false_positive_samples_rechecked": [f"FINDING-TASK-{index:03d}" for index in range(1, count + 1)],
         "next_round_tasks": [],
         "supplement_rounds": 0,
-        "remaining_gaps": [],
+        "remaining_gaps": missing_mode_gaps,
         "stop_reason": "All high-priority fixture claims were investigated and independently reviewed.",
     })
     task_ids = [f"TASK-{index:03d}" for index in range(1, count + 1)]
@@ -1163,7 +1175,7 @@ def test_prepare_is_semantic_neutral_and_writes_agent_contract(workspace):
     assert "paths" not in design_manifest
     assert "code_root" not in json.dumps(design_manifest)
     assert contract["execution_model"] == "opencode-owned-model-driven-loop"
-    assert contract["contract_version"] == 17
+    assert contract["contract_version"] == 18
     assert contract["handoff_integrity"]["max_concurrent_subagent_tasks"] == 2
     assert contract["tool_protocol"]["agent_event_contract"]["required_fields"] == [
         "event", "role", "phase", "scope_id", "scope",
@@ -2225,7 +2237,7 @@ def test_discovery_policy_uses_dual_entry_frontier_without_synthetic_risk_paddin
     assert "最多六轮" in orchestrator
     assert "每条accepted claim" in orchestrator
     assert "passed=true,closed=true" in orchestrator
-    assert "不要求 observation 的 boundary/plane/path/lens 并集覆盖整个 slice" in risk
+    assert "不要求observation并集覆盖整个slice" in risk
     assert "不得制造 observation" in risk
     assert "当前 supplied design" in instruction
     assert "动态发现" in skill
@@ -2574,7 +2586,7 @@ def test_coverage_rejects_uninvestigated_accepted_claims_as_a_stop_condition(
     )
 
 
-def test_unselected_on_demand_claim_does_not_invalidate_scoped_reviews(workspace):
+def test_new_on_demand_claim_must_join_complete_review_scope(workspace):
     populate_handoffs(workspace)
     state = workspace["state"]
     assert isinstance(state, Path)
@@ -2609,45 +2621,21 @@ def test_unselected_on_demand_claim_does_not_invalidate_scoped_reviews(workspace
     design_coverage = ac.load_json(state / "design_coverage.json")
     design_coverage["document_groups"][0]["claim_ids"].append("CLAIM-INDEX-ONLY")
     ac.save_json(state / "design_coverage.json", design_coverage)
-    coverage = ac.load_json(state / "coverage_audit.json")
-    coverage["claims_total"] = 5
-    ac.save_json(state / "coverage_audit.json", coverage)
-    for command in ("design-check", "claim-check", "task-check"):
-        run_runner(
-            command, Path(workspace["code"]), Path(workspace["design"]),
-            Path(workspace["result"]), Path(workspace["logs"]),
-        )
-    missing_gap = run_runner(
-        "coverage-check", Path(workspace["code"]), Path(workspace["design"]),
-        Path(workspace["result"]), Path(workspace["logs"]), check=False,
-    )
-    assert missing_gap.returncode == 1
-    missing_trace = ac.load_json(Path(workspace["logs"]) / "trace" / "coverage_validation.json")
-    assert any(
-        "materialized claims outside the current accepted scope" in error
-        for error in missing_trace["errors"]
-    )
-    coverage["remaining_gaps"] = [{
-        "gap_id": "GAP-UNSELECTED-CLAIM",
-        "kind": "frontier_claim",
-        "ref_id": "CLAIM-INDEX-ONLY",
-        "reason": "The materialized obligation was not selected into the bounded frontier.",
-        "evidence": "No accepted review/task currently binds this claim.",
-    }]
-    ac.save_json(state / "coverage_audit.json", coverage)
     run_runner(
-        "coverage-check", Path(workspace["code"]), Path(workspace["design"]),
+        "design-check", Path(workspace["code"]), Path(workspace["design"]),
         Path(workspace["result"]), Path(workspace["logs"]),
     )
-    trace = ac.load_json(Path(workspace["logs"]) / "trace" / "coverage_validation.json")
-    assert trace["passed"] is True
-    assert trace["closed"] is True
-    assert trace["metrics"]["scoped_claims"] == 4
-    assert trace["metrics"]["claims"] == 5
-    claim_trace = ac.load_json(Path(workspace["logs"]) / "trace" / "claim_review_validation.json")
-    assert claim_trace["accepted_claim_ids"] == [
-        "CLAIM-001", "CLAIM-002", "CLAIM-003", "CLAIM-004",
-    ]
+    proc = run_runner(
+        "claim-check", Path(workspace["code"]), Path(workspace["design"]),
+        Path(workspace["result"]), Path(workspace["logs"]), check=False,
+    )
+    assert proc.returncode == 1
+    trace = ac.load_json(Path(workspace["logs"]) / "trace" / "claim_review_validation.json")
+    assert any(
+        "must include every materialized claim" in error
+        and "CLAIM-INDEX-ONLY" in error
+        for error in trace["errors"]
+    )
     assert review_path.read_bytes() == review_before
 
 
@@ -3311,7 +3299,7 @@ def test_validator_forces_environment_failure_to_inconclusive(workspace):
     assert any("environment/baseline/reachability limitations must be inconclusive" in error for error in trace["errors"])
 
 
-def test_inventory_obligation_can_remain_unmaterialized_when_gap_recorded(workspace):
+def test_unselected_inventory_section_does_not_require_synthetic_gap(workspace):
     populate_handoffs(workspace)
     state = workspace["state"]
     assert isinstance(state, Path)
@@ -3349,29 +3337,6 @@ def test_inventory_obligation_can_remain_unmaterialized_when_gap_recorded(worksp
             command, Path(workspace["code"]), Path(workspace["design"]),
             Path(workspace["result"]), Path(workspace["logs"]),
         )
-    missing_gap = run_runner(
-        "coverage-check", Path(workspace["code"]), Path(workspace["design"]),
-        Path(workspace["result"]), Path(workspace["logs"]), check=False,
-    )
-    assert missing_gap.returncode == 1
-    missing_trace = ac.load_json(
-        Path(workspace["logs"]) / "trace" / "coverage_validation.json"
-    )
-    assert any(
-        "SECTION-NOT-MATERIALIZED" in error
-        and "neither a materialized claim nor an inventory gap" in error
-        for error in missing_trace["errors"]
-    )
-    coverage = ac.load_json(state / "coverage_audit.json")
-    coverage["remaining_gaps"] = [{
-        "gap_id": "GAP-INVENTORY-001",
-        "kind": "inventory",
-        "ref_id": "SECTION-NOT-MATERIALIZED",
-        "reason": "The bounded evidence-pair frontier did not materialize this section.",
-        "evidence": "design_inventory.json retains the section and its exact source reference.",
-    }]
-    ac.save_json(state / "coverage_audit.json", coverage)
-
     run_runner(
         "coverage-check", Path(workspace["code"]), Path(workspace["design"]),
         Path(workspace["result"]), Path(workspace["logs"]),
@@ -3380,7 +3345,7 @@ def test_inventory_obligation_can_remain_unmaterialized_when_gap_recorded(worksp
     assert trace["passed"] is True
     assert trace["closed"] is True
     assert trace["metrics"]["claims"] == 4
-    assert trace["metrics"]["remaining_gaps"] == 1
+    assert trace["metrics"]["remaining_gaps"] == 0
 
 
 def test_gap_recorded_lens_requires_matching_gap_evidence(workspace):

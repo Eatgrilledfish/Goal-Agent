@@ -5,10 +5,10 @@
 Scope 格式：
 
 ```json
-{"session_id":"当前session","round_id":"ROUND-...","claim_ids":["已有task/finding使用的accepted claims与本批新增claims的去重并集"]}
+{"session_id":"当前session","round_id":"ROUND-...","claim_ids":["当前bounded portfolio中的全部materialized claims"]}
 ```
 
-可以逐值复用上一版 accepted claim review，但仅当该项的 `claim_sha256`、`source_sha256`、`spec_critic_prompt_version` 都与当前完全相同。新增/改变 claim必须由本 fresh Task独立重审。`group_reviews` 默认省略或为空；只有当前 claim审查暴露具体 group gap，或需要生成有原文证据的 coverage expansion时，才读取对应 inventory group并输出 review。已有 group review只在 `group_sha256` 完全相同时复用。Whole-file `design_claims.jsonl` digest只作审计，新增无关 claim不得使旧 review失效。
+可以逐值复用上一版accepted claim review，但仅当该项的`claim_sha256`、`source_sha256`、`spec_critic_prompt_version`完全相同。新增/改变claim必须独立重审，并加入完整scope；不得留下未审materialized claim。`group_reviews`默认省略或为空；只有当前claim审查暴露具体group gap时才输出。Whole-file digest只作审计，不使未改变的逐项review失效。
 
 ## 输出 schema
 

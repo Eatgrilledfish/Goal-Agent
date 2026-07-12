@@ -75,13 +75,13 @@ Portfolio scope ID逐值使用：`ARCHITECTURE-MAP`、`DESIGN-INVENTORY`；claim
     "sweep_id":"RISK-SWEEP-01","architecture_boundaries":["..."],
     "implementation_planes":["..."],"parallel_path_ids":["..."],
     "anchor_paths":["本slice独占且与所列架构ID有关的主代码路径"],
-    "review_lenses":["与该主代码范围相关的非空contract lens子集"],
+    "review_lenses":["逐值包含完整contract lens portfolio"],
     "scope_rationale":"为何主代码范围聚焦且与其他slice不重叠"
   }]
 }
 ```
 
-Plan至少一个真实非空focused slice。各slice的primary `anchor_paths`必须存在、不得为仓库根、彼此不得相同或父子重叠，每个slice最多6个implementation planes。三类required IDs在plan整体全部出现；宽boundary/plane/path若横跨多个互斥anchor范围可以重复引用，但每次必须有本地anchor关系及关联plane。所有slice的lens并集必须精确覆盖contract完整portfolio，使用满足约束的最少focused slices。Risk Explorer审阅整个已分配slice，但只输出有具体代码证据、能形成设计问题的高信息量observation；observation无需重复计划的每个ID/lens，不得用泛化描述填满配额。多个slices按计划顺序每批最多并发两个Task。
+Plan至少一个真实非空focused slice。各slice的primary `anchor_paths`必须存在、不得为仓库根、彼此不得相同或父子重叠，每个slice最多6个implementation planes。三类required IDs在plan整体全部出现；宽ID可在有本地anchor关系时重复。每个slice逐值分配完整contract lens portfolio，并最多产出8条最强异常/不对称observation。多个slices按计划顺序每批最多并发两个Task。
 
 ## 阶段命令
 
@@ -129,7 +129,7 @@ Design inventory完成后立即从每个适用 section 的独立 `behavior_famil
 
 模型依据当前证据的适用性、规范强度、可达性、外部可观察性、替代路径和信息增益选择，不按 claim 顺序、标签数量、固定领域或分数选择。能力缺失需要 supplied design 对当前产品 scope 的正面证据；全仓无命中不是充分证据。
 
-首次resolution让每个`required|in_scope` document group至少有一条原子claim，累计review scope最多24条。随后最多六轮、每轮最多4项，把每条accepted claim调查并critic后才能进入coverage。先在不同document group、behavior family、execution plane和exploration mode之间扩展，再在同一候选上深挖；只要存在适用设计，frontier不得全部来自code-only risk。每个已经产出有效observation的已完成risk sweep也必须至少输送一个引用该sweep observation的code-to-design task。Design-origin seed即使尚无risk observation，也可以用`origin=design_section`发起claim解析。
+首次resolution建立最多24条的breadth-balanced claim portfolio：先每个`required|in_scope` group一条，再按behavior-family广度/当前claim数分配剩余槽。所有materialized claims逐值进入一个review scope；每条accepted claim至少建立一个task。最多六轮、每轮4项，全部finding+critic完成后才能coverage。每个已完成risk sweep至少被一个code-to-design task引用。Design-origin seed无需risk observation即可发起claim解析。
 
 若设计义务尚未 materialize，写 `design_lookup_requests.jsonl`：
 
@@ -178,7 +178,7 @@ Fresh Spec Critic 默认只完成 per-claim review，然后运行 `goal_runner.p
 
 初始task不得写`coverage_request_sha256/source_gap_ids`。唯一coverage supplement的实际task必须从helper-owned history逐值复制规范化spec，并增加`coverage_request_sha256=<history request_sha256>`与非空`source_gap_ids`；使用新task ID和新round。Plan gate会拒绝history之前伪装成supplement的task、未绑定的新task或与请求不一致的task。
 
-`obligation_sha256` 是 canonical JSON `{"claim_id":claim_id,"obligation":claim.obligation}` 的小写 SHA-256。旧 `question` 字段被直接拒绝，即使等于 hypothesis也不得写。不同义务、状态 branch或独立 plane拆 task。每轮最多4项，写 `investigation_rounds.jsonl`：
+`obligation_sha256` 是 canonical JSON `{"claim_id":claim_id,"obligation":claim.obligation}` 的小写 SHA-256。旧 `question` 字段被直接拒绝，即使等于 hypothesis也不得写。对 design-to-code/capability-absence claim，先从 architecture map 枚举可能承载同一设计行为的全部可达 plane 与 integration boundary；相关 plane 可在一个 task 内共同核验，需要独立裁决时拆 task，不能默认核心实现目录就是唯一实现。不同义务或状态 branch也拆 task。每轮最多4项，写 `investigation_rounds.jsonl`：
 
 ```json
 {"round_id":"ROUND-...","session_id":"session-...","strategy":"...","exploration_modes":["..."],"document_groups":["..."],"architecture_boundaries":["..."],"implementation_planes":["..."],"lenses":["..."],"claim_ids":["..."],"task_ids":["..."],"finding_ids":[],"outcome":"","next_strategy":""}
@@ -269,7 +269,7 @@ Critic raw handoff必须包含结构化`normative_assessment`；self-check/merge
 
 ## Coverage 与停止条件
 
-全部accepted claims已有finding+critic或结构化deferred后才运行Coverage Critic。`remaining_scoped_claims`非空必须返回调查阶段，不能作为gap关闭。Coverage输出未物化inventory/group/lens/boundary/plane/risk/critic request；不审批单项finding。
+全部accepted claims已有finding+critic或结构化deferred后才运行Coverage Critic；coverage-check会重新验证完整task plan。`remaining_scoped_claims`非空必须返回调查阶段。Coverage只输出当前证据暴露的具体lens/boundary/parallel/critic gap，不枚举所有未选section或被spec critic拒绝的claim。
 
 `supplement_rounds` 只能 0/1。`next_round_tasks` 只能引用具体 gap，不能因 candidate数量创建。`coverage_supplement_history.json`是helper-owned只读状态：首次有效非空任务集合由`coverage-check`记录，相同请求幂等，任何不同或第二次请求拒绝；你和Coverage Critic都不得编辑/重置它。若决定 supplement，执行一次完整 claim→task→finding→probe/critic；之后 final coverage 必须 `supplement_rounds=1,next_round_tasks=[]`，其余 gap留在 `remaining_gaps`。运行：
 

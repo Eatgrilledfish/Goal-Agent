@@ -169,7 +169,7 @@ def review_workspace(tmp_path: Path) -> dict[str, object]:
         "code": code, "design": design, "result": result, "logs": logs,
         "state": state, "session_id": session_id,
     }
-    write_scope(values, ["CLAIM-1"])
+    write_scope(values, ["CLAIM-1", "CLAIM-2"])
     write_valid_review(values)
     return values
 
@@ -246,8 +246,8 @@ def test_valid_complete_review_passes_and_writes_bound_trace(review_workspace):
     assert code == 0
     assert trace["passed"] is True
     assert trace["metrics"] == {
-        "claims": 2, "claim_reviews": 1, "document_groups": 2,
-        "group_reviews": 1, "repairs": 0, "expansion_requests": 0,
+        "claims": 2, "claim_reviews": 2, "document_groups": 2,
+        "group_reviews": 2, "repairs": 0, "expansion_requests": 0,
     }
     state = Path(review_workspace["state"])
     assert trace["input_digests"] == {
@@ -260,12 +260,12 @@ def test_valid_complete_review_passes_and_writes_bound_trace(review_workspace):
     assert trace["scope_digest"] == ac.sha256_file(
         Path(review_workspace["state"]) / "claim_review_scope.json"
     )
-    assert trace["accepted_claim_ids"] == ["CLAIM-1"]
+    assert trace["accepted_claim_ids"] == ["CLAIM-1", "CLAIM-2"]
     assert trace["repaired_claim_ids"] == []
     assert trace["expansion_requests"] == []
 
 
-def test_review_requires_exact_claim_coverage_and_rejects_out_of_scope_groups(review_workspace):
+def test_review_requires_exact_claim_coverage(review_workspace):
     review = load_review(review_workspace)
     review["claim_reviews"] = [
         _accepted_claim(
@@ -283,8 +283,6 @@ def test_review_requires_exact_claim_coverage_and_rejects_out_of_scope_groups(re
     code, trace = run_validator(review_workspace)
     assert code == 1
     assert any("missing claim reviews: ['CLAIM-1']" in error for error in trace["errors"])
-    assert any("out-of-scope claim reviews: ['CLAIM-2']" in error for error in trace["errors"])
-    assert any("out-of-scope group reviews: ['status']" in error for error in trace["errors"])
 
 
 def test_group_review_is_optional_when_no_concrete_group_gap_was_found(review_workspace):
@@ -296,7 +294,7 @@ def test_group_review_is_optional_when_no_concrete_group_gap_was_found(review_wo
 
     assert code == 0
     assert trace["passed"] is True
-    assert trace["accepted_claim_ids"] == ["CLAIM-1"]
+    assert trace["accepted_claim_ids"] == ["CLAIM-1", "CLAIM-2"]
     assert trace["metrics"]["group_reviews"] == 0
 
 
@@ -309,7 +307,7 @@ def test_group_review_field_may_be_omitted_when_no_concrete_gap_was_found(review
 
     assert code == 0
     assert trace["passed"] is True
-    assert trace["accepted_claim_ids"] == ["CLAIM-1"]
+    assert trace["accepted_claim_ids"] == ["CLAIM-1", "CLAIM-2"]
     assert trace["metrics"]["group_reviews"] == 0
 
 
@@ -347,7 +345,7 @@ def test_review_source_binding_detects_changed_design_source(review_workspace):
 
     code, trace = run_validator(review_workspace)
     assert code == 1
-    assert trace["accepted_claim_ids"] == []
+    assert trace["accepted_claim_ids"] == ["CLAIM-2"]
     assert any(
         "source_ref.source_sha256 does not match source file" in error
         for error in trace["errors"]
@@ -443,7 +441,7 @@ def test_claim_repair_decision_must_follow_assessments_and_have_action(review_wo
     assert trace["passed"] is True
     assert trace["repair_required"] is True
     assert trace["metrics"]["repairs"] == 1
-    assert trace["accepted_claim_ids"] == []
+    assert trace["accepted_claim_ids"] == ["CLAIM-2"]
     assert trace["repaired_claim_ids"] == ["CLAIM-1"]
 
 
@@ -472,7 +470,7 @@ def test_group_gap_becomes_nonblocking_expansion_request(review_workspace):
     assert code == 0
     assert trace["schema_valid"] is True
     assert trace["repair_required"] is False
-    assert trace["accepted_claim_ids"] == ["CLAIM-1"]
+    assert trace["accepted_claim_ids"] == ["CLAIM-1", "CLAIM-2"]
     assert trace["repaired_claim_ids"] == []
     assert trace["metrics"]["expansion_requests"] == 1
     assert trace["expansion_requests"][0]["blocking"] is False
@@ -514,12 +512,12 @@ def test_group_gap_affecting_claim_semantics_requires_that_claim_to_repair(revie
 
     code, trace = run_validator(review_workspace)
     assert code == 0
-    assert trace["accepted_claim_ids"] == []
+    assert trace["accepted_claim_ids"] == ["CLAIM-2"]
     assert trace["repaired_claim_ids"] == ["CLAIM-1"]
     assert trace["expansion_requests"][0]["blocking"] is True
 
 
-def test_unrelated_claim_addition_does_not_invalidate_accepted_review(review_workspace):
+def test_new_materialized_claim_must_join_the_bounded_review_scope(review_workspace):
     state = Path(review_workspace["state"])
     claims, errors = ac.load_jsonl(state / "design_claims.jsonl")
     assert not errors
@@ -534,9 +532,14 @@ def test_unrelated_claim_addition_does_not_invalidate_accepted_review(review_wor
     _write_jsonl(state / "design_claims.jsonl", claims)
 
     code, trace = run_validator(review_workspace)
-    assert code == 0
-    assert trace["passed"] is True
-    assert trace["accepted_claim_ids"] == ["CLAIM-1"]
+    assert code == 1
+    assert trace["passed"] is False
+    assert any(
+        "must include every materialized claim" in error
+        and "CLAIM-UNSCOPED" in error
+        for error in trace["errors"]
+    )
+    assert trace["accepted_claim_ids"] == ["CLAIM-1", "CLAIM-2"]
     assert trace["metrics"]["claims"] == 3
 
 
