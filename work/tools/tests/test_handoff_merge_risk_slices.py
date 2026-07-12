@@ -33,10 +33,24 @@ def _risk(
         "session_id": session_id,
         "sweep_id": sweep_id,
         "risk_sweep_plan_sha256": "plan-sha256",
+        "direction": "code_to_design",
         "behavior_question": "Can the reachable entry point bypass the expected guard?",
+        "mismatch_signal": "direct_conflict",
+        "design_requirement": {
+            "source_ref": {
+                "path": "contract.md", "line_start": 2, "line_end": 2,
+            },
+            "subject": "The reachable service entry point",
+            "trigger": "When an amount is submitted",
+            "obligation": "Reject an amount that bypasses the expected guard.",
+            "observable_result": "The service rejects an unguarded amount.",
+            "normative_strength": "mandatory",
+            "applicability": "The public service entry point is in scope.",
+            "exceptions": ["No exception is modeled by this fixture."],
+            "ambiguities": ["No ambiguity is modeled by this fixture."],
+        },
         "observed_code_behavior": "The reachable entry point returns without a guard.",
         "design_section_ids": ["SECTION-CONTRACT"],
-        "design_alignment": "The section defines the behavior of this reachable entry point.",
         "review_lenses": ["externally visible behavior"],
         "architecture_boundaries": (
             ["BOUNDARY-API"] if boundary_ids is None else boundary_ids
@@ -67,9 +81,6 @@ def _risk(
                 "target": "charge adapters",
                 "result": "No compensating adapter was found.",
             },
-        ],
-        "design_lookup_questions": [
-            "Does the service contract require a guard for amount inputs?",
         ],
         "tool_trace": [
             {
@@ -206,11 +217,11 @@ def test_risk_scope_arrays_must_have_at_least_one_combined_entry() -> None:
         boundary_ids=[], plane_ids=[], path_ids=[],
     )
     errors = hm.validate_artifact(item, "risk", "risk (RISK-1)")
-    assert any("must contain at least one entry in total" in error for error in errors)
+    assert any("code_to_design candidate must identify at least one" in error for error in errors)
 
     item["parallel_path_ids"] = ["PATH-ALTERNATE"]
     errors = hm.validate_artifact(item, "risk", "risk (RISK-1)")
-    assert not any("must contain at least one entry in total" in error for error in errors)
+    assert not any("code_to_design candidate must identify at least one" in error for error in errors)
 
 
 def test_risk_check_accepts_multi_observation_slice_and_checks_each_context(

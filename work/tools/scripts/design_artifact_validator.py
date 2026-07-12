@@ -26,6 +26,10 @@ TESTABILITY = {"candidate", "not_suitable", "unknown"}
 COVERAGE_DISPOSITIONS = {"applicable", "inapplicable", "superseded", "supporting"}
 MAX_CLAIM_PORTFOLIO = 12
 MAX_INVENTORY_SECTION_LINES = 800
+MISMATCH_SIGNALS = {
+    "direct_conflict", "capability_absence", "cross_plane_mismatch", "uncertain",
+}
+SCOUT_DIRECTIONS = {"code_to_design", "design_to_code"}
 
 
 class Issues:
@@ -481,6 +485,274 @@ def validate_claims(
     return claim_index
 
 
+def _load_jsonl_index(
+    path: Path, key: str, parse_code: str, duplicate_code: str, issues: Issues,
+) -> dict[str, dict[str, Any]]:
+    values, parse_errors = ac.load_jsonl(path)
+    issues.extend(parse_code, parse_errors)
+    result: dict[str, dict[str, Any]] = {}
+    for index, item in enumerate(values, start=1):
+        identifier = item.get(key)
+        label = f"{path.name}:{index}"
+        if not isinstance(identifier, str) or not identifier.strip():
+            issues.add(parse_code, f"{label}: missing/non-string {key}")
+        elif identifier in result:
+            issues.add(duplicate_code, f"{label}: duplicate {key} {identifier!r}")
+        else:
+            result[identifier] = item
+    return result
+
+
+def _inventory_section_index(
+    inventory_groups: dict[str, dict[str, Any]],
+) -> dict[str, tuple[str, dict[str, Any]]]:
+    result: dict[str, tuple[str, dict[str, Any]]] = {}
+    for document_key, group in inventory_groups.items():
+        sections = group.get("sections") if isinstance(group.get("sections"), list) else []
+        for section in sections:
+            if not isinstance(section, dict):
+                continue
+            section_id = section.get("section_id")
+            if isinstance(section_id, str) and section_id:
+                result[section_id] = (document_key, section)
+    return result
+
+
+def _source_range(value: Any) -> tuple[Any, Any, Any]:
+    if not isinstance(value, dict):
+        return None, None, None
+    return value.get("path"), value.get("line_start"), value.get("line_end")
+
+
+def validate_claim_lineage(
+    root: Path, session_id: str,
+    inventory_groups: dict[str, dict[str, Any]],
+    claim_index: dict[str, dict[str, Any]], issues: Issues,
+) -> None:
+    """Bind every materialized claim to one selected mismatch observation.
+
+    This is intentionally identity/range validation, not semantic ranking.  It
+    prevents a later agent from replacing a selected scout candidate with a
+    compliant observation, unrelated design range, or different obligation.
+    """
+    requests = _load_jsonl_index(
+        root / "design_lookup_requests.jsonl", "request_id",
+        "LOOKUP_PARSE_ERROR", "LOOKUP_ID_DUPLICATE", issues,
+    )
+    observations = _load_jsonl_index(
+        root / "risk_observations.jsonl", "observation_id",
+        "RISK_PARSE_ERROR", "RISK_ID_DUPLICATE", issues,
+    )
+    sections = _inventory_section_index(inventory_groups)
+
+    claims_by_request: dict[str, str] = {}
+    claims_by_candidate: dict[str, str] = {}
+    for claim_id, claim in claim_index.items():
+        request_id = claim.get("request_id")
+        candidate_id = claim.get("candidate_id")
+        if not isinstance(request_id, str) or not request_id:
+            issues.add("CLAIM_LINEAGE_INVALID", f"claim {claim_id!r}: missing request_id")
+        elif request_id in claims_by_request:
+            issues.add(
+                "CLAIM_LINEAGE_DUPLICATE",
+                f"claims {claims_by_request[request_id]!r} and {claim_id!r} share request_id {request_id!r}",
+            )
+        else:
+            claims_by_request[request_id] = claim_id
+        if not isinstance(candidate_id, str) or not candidate_id:
+            issues.add("CLAIM_LINEAGE_INVALID", f"claim {claim_id!r}: missing candidate_id")
+        elif candidate_id in claims_by_candidate:
+            issues.add(
+                "CLAIM_LINEAGE_DUPLICATE",
+                f"claims {claims_by_candidate[candidate_id]!r} and {claim_id!r} share candidate_id {candidate_id!r}",
+            )
+        else:
+            claims_by_candidate[candidate_id] = claim_id
+
+    missing_requests = sorted(set(claims_by_request) - set(requests))
+    extra_requests = sorted(set(requests) - set(claims_by_request))
+    if missing_requests or extra_requests:
+        issues.add(
+            "CLAIM_LOOKUP_COVERAGE",
+            "design lookup/claim membership is not one-to-one; "
+            f"missing_requests={missing_requests}, unclaimed_requests={extra_requests}",
+        )
+
+    seen_request_candidates: dict[str, str] = {}
+    for request_id, request in requests.items():
+        label = f"design lookup {request_id!r}"
+        _require_fields(
+            request,
+            (
+                "request_id", "candidate_id", "session_id", "origin", "origin_id",
+                "sweep_id", "direction", "document_keys", "section_ids", "question",
+                "required_branch", "mismatch_signal", "code_evidence",
+            ),
+            label, issues,
+        )
+        if request.get("session_id") != session_id:
+            issues.add("SESSION_MISMATCH", f"{label}: session_id does not match current session")
+        candidate_id = request.get("candidate_id")
+        if not isinstance(candidate_id, str) or not candidate_id:
+            issues.add("LOOKUP_LINEAGE_INVALID", f"{label}: candidate_id must be non-empty")
+            continue
+        if candidate_id in seen_request_candidates:
+            issues.add(
+                "LOOKUP_LINEAGE_DUPLICATE",
+                f"lookups {seen_request_candidates[candidate_id]!r} and {request_id!r} share candidate_id {candidate_id!r}",
+            )
+        else:
+            seen_request_candidates[candidate_id] = request_id
+        if request.get("origin") != "semantic_scout" or request.get("origin_id") != candidate_id:
+            issues.add(
+                "LOOKUP_LINEAGE_INVALID",
+                f"{label}: origin must be semantic_scout and origin_id must equal candidate_id",
+            )
+        direction = request.get("direction")
+        if direction not in SCOUT_DIRECTIONS:
+            issues.add("LOOKUP_LINEAGE_INVALID", f"{label}: invalid direction {direction!r}")
+        signal = request.get("mismatch_signal")
+        if signal not in MISMATCH_SIGNALS:
+            issues.add(
+                "MISMATCH_CANDIDATE_INVALID",
+                f"{label}: selected lookup lacks an allowed mismatch_signal",
+            )
+
+        section_ids = _validate_string_list(
+            request.get("section_ids"), f"{label}.section_ids", issues,
+            allow_empty=False,
+        )
+        document_keys = _validate_string_list(
+            request.get("document_keys"), f"{label}.document_keys", issues,
+            allow_empty=False,
+        )
+        known_sections = [sections[value] for value in section_ids if value in sections]
+        unknown_sections = sorted(set(section_ids) - set(sections))
+        if unknown_sections:
+            issues.add(
+                "LOOKUP_SOURCE_SCOPE_INVALID",
+                f"{label}: unknown inventory section IDs {unknown_sections}",
+            )
+        section_documents = {document_key for document_key, _section in known_sections}
+        if section_documents != set(document_keys):
+            issues.add(
+                "LOOKUP_SOURCE_SCOPE_INVALID",
+                f"{label}: document_keys do not match section document groups",
+            )
+
+        observation = observations.get(candidate_id)
+        if observation is None:
+            issues.add(
+                "LOOKUP_LINEAGE_INVALID",
+                f"{label}: candidate observation {candidate_id!r} is missing",
+            )
+            continue
+        for field in ("session_id", "sweep_id", "direction", "mismatch_signal"):
+            if request.get(field) != observation.get(field):
+                issues.add(
+                    "LOOKUP_LINEAGE_INVALID",
+                    f"{label}: {field} does not match candidate observation",
+                )
+        if observation.get("session_id") != session_id:
+            issues.add("SESSION_MISMATCH", f"candidate {candidate_id!r}: session_id mismatch")
+        if observation.get("mismatch_signal") not in MISMATCH_SIGNALS:
+            issues.add(
+                "MISMATCH_CANDIDATE_INVALID",
+                f"candidate {candidate_id!r}: compliance/non-mismatch observation was selected",
+            )
+        if observation.get("direction") not in SCOUT_DIRECTIONS:
+            issues.add(
+                "MISMATCH_CANDIDATE_INVALID",
+                f"candidate {candidate_id!r}: invalid scout direction",
+            )
+        if request.get("section_ids") != observation.get("design_section_ids"):
+            issues.add(
+                "LOOKUP_LINEAGE_INVALID",
+                f"{label}: section_ids do not exactly match candidate observation",
+            )
+        if request.get("question") != observation.get("behavior_question"):
+            issues.add(
+                "LOOKUP_LINEAGE_INVALID",
+                f"{label}: question does not match candidate observation",
+            )
+        code_evidence = observation.get("code_evidence")
+        if not isinstance(code_evidence, list) or not code_evidence:
+            issues.add(
+                "MISMATCH_CANDIDATE_INVALID",
+                f"candidate {candidate_id!r}: selected candidate needs code evidence",
+            )
+        elif request.get("code_evidence") != code_evidence:
+            issues.add(
+                "LOOKUP_LINEAGE_INVALID",
+                f"{label}: code_evidence does not match candidate observation",
+            )
+
+        claim_id = claims_by_request.get(request_id)
+        claim = claim_index.get(claim_id or "")
+        if claim is None:
+            continue
+        if claim.get("candidate_id") != candidate_id or claim.get("request_id") != request_id:
+            issues.add(
+                "CLAIM_LINEAGE_INVALID",
+                f"claim {claim_id!r}: candidate_id/request_id do not match lookup",
+            )
+        requirement = observation.get("design_requirement")
+        if not isinstance(requirement, dict):
+            issues.add(
+                "MISMATCH_CANDIDATE_INVALID",
+                f"candidate {candidate_id!r}: design_requirement must be an object",
+            )
+            continue
+        for field in (
+            "subject", "trigger", "obligation", "observable_result",
+            "normative_strength", "applicability", "exceptions", "ambiguities",
+        ):
+            if claim.get(field) != requirement.get(field):
+                issues.add(
+                    "CLAIM_LINEAGE_INVALID",
+                    f"claim {claim_id!r}: {field} drifted from candidate design_requirement",
+                )
+        if request.get("required_branch") != ac.canonical_claim_branch(claim):
+            issues.add(
+                "CLAIM_LINEAGE_INVALID",
+                f"claim {claim_id!r}: lookup required_branch does not match claim",
+            )
+        claim_range = _source_range(claim.get("source_ref"))
+        if claim_range != _source_range(requirement.get("source_ref")):
+            issues.add(
+                "CLAIM_SOURCE_SCOPE_INVALID",
+                f"claim {claim_id!r}: source_ref does not match candidate design_requirement",
+            )
+        path, start, end = claim_range
+        in_selected_section = any(
+            path == section.get("path")
+            and isinstance(start, int) and isinstance(end, int)
+            and isinstance(section.get("line_start"), int)
+            and isinstance(section.get("line_end"), int)
+            and section["line_start"] <= start <= end <= section["line_end"]
+            for _document_key, section in known_sections
+        )
+        if not in_selected_section:
+            issues.add(
+                "CLAIM_SOURCE_SCOPE_INVALID",
+                f"claim {claim_id!r}: source range escapes lookup inventory sections",
+            )
+        if claim.get("document_key") not in section_documents:
+            issues.add(
+                "CLAIM_SOURCE_SCOPE_INVALID",
+                f"claim {claim_id!r}: document_key does not match lookup sections",
+            )
+
+    missing_candidates = sorted(set(claims_by_candidate) - set(seen_request_candidates))
+    extra_candidates = sorted(set(seen_request_candidates) - set(claims_by_candidate))
+    if missing_candidates or extra_candidates:
+        issues.add(
+            "CLAIM_LOOKUP_COVERAGE",
+            "candidate/claim membership is not one-to-one; "
+            f"missing_candidates={missing_candidates}, unclaimed_candidates={extra_candidates}",
+        )
+
+
 def validate_coverage(
     coverage: dict[str, Any], session_id: str,
     inventory_groups: dict[str, dict[str, Any]],
@@ -691,6 +963,9 @@ def run(args: argparse.Namespace) -> int:
         claim_index = validate_claims(
             claims_path, session_id, design_root, member_groups, issues,
         )
+        validate_claim_lineage(
+            root, session_id, inventory_groups, claim_index, issues,
+        )
         coverage = _load_object(coverage_path, "design_coverage.json", issues)
         coverage_groups = validate_coverage(
             coverage, session_id, inventory_groups, claim_index, member_groups, issues,
@@ -706,6 +981,12 @@ def run(args: argparse.Namespace) -> int:
             "design_claims.jsonl": _safe_digest(claims_path) if mode in {"claims", "all"} else "",
             "design_coverage.json": _safe_digest(coverage_path) if mode in {"claims", "all"} else "",
             "workspace_manifest.json": _safe_digest(root / "workspace_manifest.json"),
+        },
+        "lineage_input_digests": {
+            "design_lookup_requests.jsonl": _safe_digest(root / "design_lookup_requests.jsonl")
+            if mode in {"claims", "all"} else "",
+            "risk_observations.jsonl": _safe_digest(root / "risk_observations.jsonl")
+            if mode in {"claims", "all"} else "",
         },
         "metrics": {
             "claims": len(claim_index),

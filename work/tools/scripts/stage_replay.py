@@ -37,8 +37,8 @@ ITEM_STAGES = {"risk", "investigator", "probe", "critic", "judge"}
 LOCAL_STAGES = {"inventory", "claims", "claim-review", "plan", "coverage", "gate"}
 
 ROLE_SKILLS = {
-    "inventory": REPO_ROOT / "work" / "skills" / "spec-analyst.md",
-    "claims": REPO_ROOT / "work" / "skills" / "spec-analyst.md",
+    "inventory": REPO_ROOT / "work" / "skills" / "orchestrator.md",
+    "claims": REPO_ROOT / "work" / "skills" / "orchestrator.md",
     "claim-review": REPO_ROOT / "work" / "skills" / "spec-critic.md",
     "risk": REPO_ROOT / "work" / "skills" / "risk-explorer.md",
     "plan": REPO_ROOT / "work" / "skills" / "orchestrator.md",
@@ -46,7 +46,7 @@ ROLE_SKILLS = {
     "probe": REPO_ROOT / "work" / "skills" / "code-investigator.md",
     "critic": REPO_ROOT / "work" / "skills" / "evidence-critic.md",
     "judge": REPO_ROOT / "work" / "skills" / "final-judge.md",
-    "coverage": REPO_ROOT / "work" / "skills" / "coverage-critic.md",
+    "coverage": REPO_ROOT / "work" / "skills" / "orchestrator.md",
 }
 
 PROMPTS = {

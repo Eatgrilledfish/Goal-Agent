@@ -32,6 +32,14 @@ TRACE_KINDS = {
     "design_read", "code_search", "code_navigation", "code_read", "reverse_check",
     "test", "config_read", "history_read", "build_read", "analysis",
 }
+SCOUT_DIRECTIONS = {"design_to_code", "code_to_design"}
+MISMATCH_SIGNALS = {
+    "direct_conflict", "capability_absence", "cross_plane_mismatch", "uncertain",
+}
+DESIGN_REQUIREMENT_FIELDS = (
+    "source_ref", "subject", "trigger", "obligation", "observable_result",
+    "normative_strength", "applicability", "exceptions", "ambiguities",
+)
 DEFER_FAILURE_KINDS = {"provider_failure", "tool_failure"}
 FINDING_TEMPLATE_FIELDS = (
     "finding_id", "session_id", "task_id", "claim_id", "claim_branch",
@@ -644,9 +652,9 @@ def validate_artifact(item: dict[str, Any], artifact_type: str, label: str) -> l
     if artifact_type == "risk":
         errors.extend(_require(item, (
             "observation_id", "session_id", "sweep_id", "risk_sweep_plan_sha256",
-            "behavior_question", "observed_code_behavior", "review_lenses",
-            "design_section_ids", "design_alignment", "code_evidence",
-            "false_positive_checks", "design_lookup_questions", "tool_trace",
+            "direction", "behavior_question", "mismatch_signal",
+            "design_requirement", "observed_code_behavior", "review_lenses",
+            "design_section_ids", "code_evidence", "false_positive_checks", "tool_trace",
         ), label))
         scoped_arrays: list[list[Any]] = []
         for field in (
@@ -665,13 +673,16 @@ def validate_artifact(item: dict[str, Any], artifact_type: str, label: str) -> l
                     errors.append(
                         f"{label}: {field}[{index}] must be a concrete non-empty string"
                     )
-        if len(scoped_arrays) == 3 and not any(
-            isinstance(entry, str) and entry.strip()
-            for values in scoped_arrays for entry in values
+        if (
+            item.get("direction") == "code_to_design"
+            and len(scoped_arrays) == 3 and not any(
+                isinstance(entry, str) and entry.strip()
+                for values in scoped_arrays for entry in values
+            )
         ):
             errors.append(
-                f"{label}: architecture_boundaries, implementation_planes, and "
-                "parallel_path_ids must contain at least one entry in total"
+                f"{label}: a code_to_design candidate must identify at least one "
+                "architecture boundary, implementation plane, or parallel path"
             )
         for field in ("sweep_id", "risk_sweep_plan_sha256"):
             value = item.get(field)
@@ -680,6 +691,48 @@ def validate_artifact(item: dict[str, Any], artifact_type: str, label: str) -> l
         lenses = item.get("review_lenses")
         if not isinstance(lenses, list) or not 1 <= len(lenses) <= 3:
             errors.append(f"{label}: review_lenses must contain one to three focused lenses")
+        if item.get("direction") not in SCOUT_DIRECTIONS:
+            errors.append(
+                f"{label}: direction must be one of {sorted(SCOUT_DIRECTIONS)}"
+            )
+        if item.get("mismatch_signal") not in MISMATCH_SIGNALS:
+            errors.append(
+                f"{label}: mismatch_signal must identify a suspected mismatch; "
+                f"expected one of {sorted(MISMATCH_SIGNALS)}"
+            )
+        requirement = item.get("design_requirement")
+        if not isinstance(requirement, dict):
+            errors.append(f"{label}: design_requirement must be an object")
+        else:
+            errors.extend(_require(
+                requirement, DESIGN_REQUIREMENT_FIELDS,
+                f"{label}: design_requirement",
+            ))
+            source_ref = requirement.get("source_ref")
+            if not isinstance(source_ref, dict):
+                errors.append(f"{label}: design_requirement.source_ref must be an object")
+            else:
+                errors.extend(_require(
+                    source_ref, ("path", "line_start", "line_end"),
+                    f"{label}: design_requirement.source_ref",
+                ))
+            for field in (
+                "subject", "trigger", "obligation", "observable_result",
+                "normative_strength", "applicability",
+            ):
+                value = requirement.get(field)
+                if not isinstance(value, str) or not value.strip():
+                    errors.append(
+                        f"{label}: design_requirement.{field} must be a non-empty string"
+                    )
+            for field in ("exceptions", "ambiguities"):
+                value = requirement.get(field)
+                if not isinstance(value, list) or any(
+                    not isinstance(entry, str) for entry in value
+                ):
+                    errors.append(
+                        f"{label}: design_requirement.{field} must be a string array"
+                    )
         checks = item.get("false_positive_checks")
         if not isinstance(checks, list) or len(checks) < 1:
             errors.append(f"{label}: false_positive_checks must contain at least one check")
@@ -692,19 +745,12 @@ def validate_artifact(item: dict[str, Any], artifact_type: str, label: str) -> l
                         check, ("question", "method", "target", "result"),
                         f"{label}: false_positive_checks[{index}]",
                     ))
-        questions = item.get("design_lookup_questions")
-        if not isinstance(questions, list) or not questions or not all(_present(value) for value in questions):
-            errors.append(f"{label}: design_lookup_questions must contain non-empty questions")
         section_ids = item.get("design_section_ids")
         if (
             not isinstance(section_ids, list) or not section_ids
             or any(not isinstance(value, str) or not value for value in section_ids)
         ):
             errors.append(f"{label}: design_section_ids must contain non-empty section IDs")
-        if not isinstance(item.get("design_alignment"), str) or not item.get(
-            "design_alignment", "",
-        ).strip():
-            errors.append(f"{label}: design_alignment must be a non-empty string")
         forbidden = set(item).intersection({
             "claim_id", "design_evidence", "assessment", "recommendation", "status", "confidence",
         })
@@ -1407,13 +1453,15 @@ def _context_errors(
             errors.append(f"{label}: code-to-design task requires risk_observation_ids")
         for risk_id in set(risk_ids).intersection(risks):
             risk = risks[risk_id]
-            if not set(item.get("architecture_boundaries", [])).intersection(
-                risk.get("architecture_boundaries", [])
-            ):
+            risk_boundaries = set(risk.get("architecture_boundaries", []))
+            if risk_boundaries and not set(
+                item.get("architecture_boundaries", [])
+            ).intersection(risk_boundaries):
                 errors.append(f"{label}: risk observation {risk_id} shares no architecture boundary")
-            if not set(item.get("implementation_planes", [])).intersection(
-                risk.get("implementation_planes", [])
-            ):
+            risk_planes = set(risk.get("implementation_planes", []))
+            if risk_planes and not set(
+                item.get("implementation_planes", [])
+            ).intersection(risk_planes):
                 errors.append(f"{label}: risk observation {risk_id} shares no implementation plane")
     errors.extend(validate_task_coverage_binding(item, state_root, label))
     return errors

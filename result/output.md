@@ -1,30 +1,67 @@
 # Goal-Agent 自验证记录
 
-## 运行入口
+## 结论
 
-正式评测只需让运行中的 OpenCode CLI 读取仓库根目录 `INSTRUCTION.md`。主 Agent由当前比赛目录自动识别代码仓与设计资料，随后按入口调用 `work/skill/SKILL.md`、角色定义及 `work/tools` 中的确定性 helper；不需要注册、人工参数、provider 配置或 `opencode.json`。
+本次确认此前“一个正确候选都没有”是流程设计缺陷，不是模型偶然失手，也不是provider额度问题。旧流程在深度调查前已经丢失了召回：
 
-运行开始先建立六小时审计 clock，再读取 catalog 或物化外部设计来源；每个helper受剩余预算约束，评测平台的外部墙钟仍是最终可信硬边界。模型负责文档适用性、设计义务、代码行为、反证和 verdict 等语义判断；helper只负责 source range物化、schema、身份/digest、candidate隔离、lifecycle、证据验真、只读完整性、报告和 final gate。运行链路没有项目名、协议名、关键词/regex、固定答案、评分表或 issue数量 fallback。
+- 先按代码地图裁剪设计section，未分配的规范永远不会进入候选；
+- 按代码slice限制design-to-code证据，导入实现、adapter和未映射路径被挡在搜索外；
+- 强迫每个sweep产出样本，使合规样本占用候选预算；
+- 部分sweep完成后就开始全局选题，形成first-arrival bias；
+- claim/task由模型重复改写，候选的设计分支和代码起点会在handoff中漂移；
+- 局部checkpoint的`complete`曾被错误复制成全局complete；
+- 模型大量时间用于生成inventory和修复大schema，而不是阅读设计与代码。
 
-## 当前实现
+这些问题属于严重架构缺陷，已按根因重构。
 
-1. `prepare` 冻结目标代码、设计 bundle 与 session-local review snapshot。Catalog 分支必须携带 materialization manifest；每个来源location逐token等值绑定真实catalog引文，plan/output/manifest/approval路径不得与supplied source重叠。原 catalog/source 全树、plan 与生成 bundle分别快照，resume和final gate均复扫。
-2. Architecture map与轻量 design inventory并行。Inventory只建立 document group、scope relation、section和behavior-family地图，不预生成全量 claim。
-3. Risk plan依据真实耦合 component划分互斥 slice，全局最多并发两个 Task。每个 code-only explorer独占 candidate目录，按 `sweep_id` 增量合并，失败 peer不进入当前 merge。
-4. 主 Agent用模型语义形成 design section/义务、code risk/capability、boundary/plane与可证伪 hypothesis组成的 evidence pair。只有进入 frontier 的义务才按需生成 claim；quote、heading、canonical path和source hash由 source ref确定性物化。
-5. Fresh Spec Critic按 per-claim digest审查 entailment、strength、atomicity和applicability。无关 claim变化不使已接受 review失效；group gap进入coverage，不阻塞有效 claim。
-6. 每个 task只绑定一个 claim branch、一个 hypothesis与一个 obligation digest。Task plan和lifecycle分离；retained peer的证据、template或上游绑定失效不会阻塞当前有效candidate，但最终 gate仍拒绝未修复 peer。
-7. Investigator、可选 focused probe和Evidence Critic按candidate严格顺序执行。Probe只能在session副本运行，绑定设计oracle、baseline、non-triviality、secondary oracle与reachability。Critic历史由helper专有账本保存；相同evidence不能删除当前ledger后重新投票，只有新claim/finding/probe证据才允许revision。
-8. Coverage在初始frontier后记录未覆盖section、boundary/parallel path、lens、mode、frontier和critic请求，最多产生一次由`source_gap_ids`绑定的supplement。请求由helper-owned历史与ledger事件冻结，不能清空、换题或只修改轮次计数。
-9. 每个risk sweep、investigation、probe和critic均需candidate级rich checkpoint与独立provider session。Helper物化稳定scope ID、输入与模型输出artifact摘要；语义repair必须使用fresh provider，同输入/输出/error第三次只改scope、summary或outcome仍会被gate拒绝。`goal_runner`另行把deterministic validator report路径与digest登记到ledger，避免报告时间戳伪造进展。
-10. Development stage replay覆盖inventory、claims、claim-review、risk、plan、investigator、probe、critic、judge、coverage与gate。Catalog型gate replay会把原source/plan复制并重写到隔离replay中；带动态probe的coverage和完整gate也可真实本地回放。
+## 当前运行架构
 
-## 自验证命令与结果
+正式评测只需让运行中的OpenCode CLI读取仓库根目录`INSTRUCTION.md`。入口固定使用：
+
+```text
+/app/code/judge-assets/01_03_ai_implementation_design_difference_detection/
+```
+
+不需要注册、人工参数、provider配置或`opencode.json`。目标代码与supplied design只读；运行结果写入`/result`，状态和证据写入`/logs`。
+
+新流程为：
+
+```text
+prepare + 只读快照
+→ 轻量architecture map
+→ 确定性design inventory
+→ 双向semantic scouts
+→ 全部scout receipts完成
+→ 模型只排序candidate IDs
+→ 确定性candidate→claim
+→ fresh spec critic
+→ 确定性claim→task
+→ investigator + fresh evidence critic
+→ 确定性coverage记账
+→ final judge + report + final gate
+```
+
+关键变化：
+
+1. Design-to-code scouts按互斥document groups覆盖全部in-scope设计，并可搜索整个代码仓，不受预先architecture map裁剪。
+2. Code-to-design scouts按不重叠top-level anchors探索，并可从完整design inventory动态检索规范。
+3. Scout只输出疑似差异；合规实现不进入候选，零候选合法。
+4. 每个scout独立写receipt；全部receipt完成前，controller拒绝candidate selection。
+5. Receipt机械核对handoff候选是否全部merge，避免候选静默丢失。
+6. 模型只选择最多12个candidate IDs；requirement、source range、code evidence、direction和mismatch signal由helper逐值投影成claim/task。
+7. Spec critic和investigator只写最小语义输出；identity、digest、设计证据、代码snippet和recommendation由materializer生成。
+8. Coverage只按已有证据记录investigated/gap，不再启动额外coverage LLM或fallback supplement。
+9. 局部checkpoint只能表示局部进展；只有final gate能把全局session置为complete。
+10. `pipeline_controller.py`机械给出唯一下一步，防止跳过breadth、claim review、investigation或critic。
+
+运行链路没有项目名、协议名、固定路径/符号、公开答案、regex检测器、关键词评分表或固定issue数量逻辑。模型仍负责规范理解、代码探索、候选语义、调查、反证和最终判断；helper只负责检索范围分配、schema、provenance、状态机与输出验真。
+
+## 自验证
 
 执行：
 
 ```bash
-python3 -m pytest -q work/tools/tests --tb=short
+python3 -m pytest -q work/tools/tests --disable-warnings
 python3 -m py_compile work/tools/scripts/*.py
 git diff --check
 ```
@@ -32,39 +69,48 @@ git diff --check
 结果：
 
 ```text
-338 passed in 105.79s
-test_stage_replay.py: 42 tests passed
+416 passed in 115.04s
 py_compile: passed
 git diff --check: passed
 ```
 
-回归范围包括：
+测试覆盖：
 
-- raw inventory/claims的确定性quote物化、严格source range和损坏输入；
-- per-claim review、non-blocking group gap与无关claim增量稳定性；
-- 互斥risk slice、增量merge、原子task及plan/lifecycle分离；
-- retained invalid peer、stale template和candidate独立merge；
-- early critic、critic evidence/history、防重复投票与revision绑定；
-- focused probe双oracle、隔离workspace、目标文件副本和finding→probe→critic顺序；
-- coverage provenance、一次supplement请求/任务绑定及历史清空负例；
-- candidate级fresh provider、稳定scope、输入/输出摘要、semantic repair与no-progress限制；
-- deterministic helper report ledger绑定及缺失/陈旧report负例；
-- run clock双副本单点篡改、trace缺失和前置产物后的删除重建负例；
-- direct design与catalog location、materialization source/plan/bundle完整性及supplied source写保护；
-- 普通、catalog及dynamic-probe coverage/gate真实隔离回放；
-- final judge、confirmed-only报告、输出绑定、目标树和review snapshot只读gate。
+- 完整design source物化与确定性auto-inventory；
+- requirement-centric双向scout plan和互斥code anchors；
+- 空/非空scout receipt、stale digest、foreign sweep和候选漏merge拒绝；
+- candidate→lookup→claim→task一对一lineage；
+- 合规observation不能进入frontier；
+- task代码起点、方向、architecture IDs和candidate ID不可漂移；
+- 最小spec review/finding materializer的字段覆盖攻击拒绝；
+- investigator、probe、critic、judge的identity和evidence绑定；
+- 局部complete不能终止全局session；
+- controller从scouts到final的前置条件短路；
+- coverage、报告、只读完整性、clock、trace和final gate；
+- 普通设计与catalog/外部HTTPS设计来源；
+- 完整小型夹具从prepare到confirmed-only报告的端到端gate。
 
-静态检查确认：正式runtime入口、Skill、角色与production scripts中没有F-Stack、公开六项答案、指定RFC/协议名称或固定confirmed配额；仓库不存在`opencode.json`。本地比赛路径 `/app/code/judge-assets/01_03_ai_implementation_design_difference_detection/` 已指向本地题目材料，正式环境使用同一路径无需额外参数。
+使用本地F-Stack材料的确定性breadth smoke结果：
 
-## 尚待完整模型运行验证
+```text
+design document groups: 24
+bounded inventory sections: 75
+inventory size: 65,789 bytes
+design-to-code scouts: 4
+code-to-design scouts: 2
+in-scope document groups owned: 23（剩余catalog为informational）
+risk-plan validation: passed
+```
 
-当前记录证明确定性契约、候选隔离、stage replay与本地回归通过，但不能替代运行中的OpenCode模型评测。后台run `068a4b94-20260711T173121Z` 已启动并成功完成catalog来源物化，但按人工指令在`prepare`前终止（SIGTERM，exit code -15）；它没有进入任何语义阶段，不能提供召回、误报或时长结论。因此以下指标仍必须由下一次独立后台完整验证给出：
+相比旧run中约2.1MB的模型手写inventory，新inventory约65KB；所有实际设计文档均有owner，代码scouts的primary anchors不重叠。
 
-- 已知隐藏正例的最终confirmed召回是否不少于4；
-- 最终误报率是否不高于50%；
-- 首个confirmed、各阶段耗时及总墙钟是否满足目标和六小时上限；
-- OpenCode是否在真实长session中遵循并发、handoff、fresh critic、checkpoint与approval契约；
-- 真实目标代码、设计来源与review snapshot在完整运行前后是否保持不变；
-- 与已保留历史baseline相比的召回、误报、首个confirmed时间和阶段耗时。
+## 仍需由真实完整模型run确认
 
-Risk/Investigator/Probe/Critic/Judge 的development replay会生成冻结的精确输入与prompt envelope，但不会在单元测试中伪装或替代真实LLM调用。纯PDF/DOCX设计资料目前需要平台提供同名UTF-8文本导出以获得稳定行号证据；Markdown、纯文本、RST、AsciiDoc、YAML、JSON、TOML以及catalog提供的HTML/UTF-8 URL可直接进入当前链路。
+单元/端到端夹具证明新的状态机和证据链不会再机械丢失候选，但不能代替OpenCode在真实F-Stack上的完整语义运行。下一次后台全量验证仍需实测：
+
+- 隐藏正例最终召回数量；
+- confirmed中的误报率；
+- scout、investigation、critic和总墙钟；
+- 模型在真实长session中是否持续遵循handoff和fresh-session约束。
+
+在未完成新的全量模型run前，不宣称已经实际召回全部隐藏答案；本次交付解决的是导致“零召回”的结构性原因，并已通过确定性breadth与完整回归验证。

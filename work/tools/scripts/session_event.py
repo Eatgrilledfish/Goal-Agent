@@ -227,7 +227,14 @@ def checkpoint_event_errors(
         errors.append(f"{label}: provider_attempt exceeds the two-attempt policy")
     if isinstance(event.get("repair_count"), int) and event["repair_count"] > 1:
         errors.append(f"{label}: repair_count exceeds the one-repair policy")
-    if event.get("status") == "complete" and event.get("output_count") == 0:
+    zero_output_scout = (
+        event.get("phase") == "code_risk_backtracking"
+        and event.get("role") == "risk-explorer"
+    )
+    if (
+        event.get("status") == "complete" and event.get("output_count") == 0
+        and not zero_output_scout
+    ):
         errors.append(f"{label}: complete checkpoint records no output")
     categories = event.get("validation_error_categories")
     if categories is not None:
@@ -329,7 +336,10 @@ def main(argv: list[str] | None = None) -> int:
         metrics = parse_metric(args.metric)
     except ValueError as exc:
         parser.error(str(exc))
-    if args.status == "complete" and args.output_count == 0:
+    zero_output_scout = (
+        args.phase == "code_risk_backtracking" and args.role == "risk-explorer"
+    )
+    if args.status == "complete" and args.output_count == 0 and not zero_output_scout:
         parser.error("complete checkpoint output-count must be greater than zero")
     if args.status == "complete" and not args.artifact:
         parser.error("complete checkpoint requires at least one --artifact")
@@ -337,18 +347,27 @@ def main(argv: list[str] | None = None) -> int:
     state_path = root / "agent_loop_state.json"
     state = ac.load_json(state_path)
     recorded_at = ac.now_iso()
-    state["updated_at"] = recorded_at
-    state["status"] = args.status
-    state["current_phase"] = args.phase
-    completed = state.setdefault("completed_phases", [])
-    for phase in args.completed_phase:
-        if phase not in completed:
-            completed.append(phase)
-    state.setdefault("metrics", {}).update(metrics)
-    if args.next:
-        state["next_actions"] = args.next
-    state["stop_reason"] = args.stop_reason
-    ac.save_json(state_path, state)
+    # A role-local checkpoint is progress evidence, not a terminal decision for
+    # the whole review.  In particular, a completed scout/investigator/critic
+    # must not make an unfinished pipeline look globally complete.  The final
+    # gate is the sole owner of the terminal ``complete`` state.
+    final_gate_complete = (
+        state.get("status") == "complete"
+        and state.get("stop_reason") == "final_gate_passed"
+    )
+    if not final_gate_complete:
+        state["updated_at"] = recorded_at
+        state["status"] = "in_progress" if args.status == "complete" else args.status
+        state["current_phase"] = args.phase
+        completed = state.setdefault("completed_phases", [])
+        for phase in args.completed_phase:
+            if phase not in completed:
+                completed.append(phase)
+        state.setdefault("metrics", {}).update(metrics)
+        if args.next:
+            state["next_actions"] = args.next
+        state["stop_reason"] = args.stop_reason
+        ac.save_json(state_path, state)
     event = {
         "recorded_at": recorded_at,
         "session_id": state.get("session_id", ""),
@@ -385,7 +404,12 @@ def main(argv: list[str] | None = None) -> int:
         event["validation_error_categories"] = error_categories
         event["validation_error_count"] = sum(error_categories.values())
     ac.append_jsonl(root / "agent_run_ledger.jsonl", event)
-    print(json.dumps({"updated": str(state_path), "phase": args.phase, "status": args.status}))
+    print(json.dumps({
+        "updated": str(state_path),
+        "phase": args.phase,
+        "checkpoint_status": args.status,
+        "status": state.get("status"),
+    }))
     return 0
 
 

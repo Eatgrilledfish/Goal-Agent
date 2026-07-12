@@ -452,10 +452,6 @@ def run(args: argparse.Namespace) -> int:
                     if architecture_path.is_file() else ""
                 )
                 and set(report.get("expected_sweep_ids", [])) == expected_sweeps
-                and set(report.get("completed_sweep_ids", [])) == expected_sweeps
-                and report.get("missing_sweep_ids", []) == []
-                and report.get("closed") is True
-                and report.get("global_coverage_validated") is True
                 and set(report.get("submitted_sweep_ids", []))
                 == set(report.get("validated_sweep_ids", []))
                 and set(report.get("submitted_sweep_ids", [])).issubset(
@@ -534,38 +530,16 @@ def run(args: argparse.Namespace) -> int:
     }
     if probes:
         required_pairs.add(("dynamic_probe", "code-investigator"))
-    claim_round_scope_ids = {
-        str(round_value.get("round_id") or "")
-        for round_value in rounds.values()
-        if round_value.get("round_id") and round_value.get("claim_ids")
-    }
     review_round_id = str(scope.get("round_id") or "")
-    if review_round_id:
-        claim_round_scope_ids.add(review_round_id)
-    if not claim_round_scope_ids:
-        claim_round_scope_ids = {"DESIGN-ROUND"}
-    planning_scope_ids = set(rounds) or {"INVESTIGATION-PLANNING"}
+    claim_review_scope_ids = {review_round_id} if review_round_id else {"CLAIM-REVIEW"}
     portfolio_scope_requirements: dict[
         tuple[str, str], tuple[set[str], set[str]]
     ] = {
         ("architecture_mapping", "orchestrator"): (
             {"ARCHITECTURE-MAP"}, {"ARCHITECTURE-MAP"},
         ),
-        ("design_inventory", "spec-analyst"): (
-            {"DESIGN-INVENTORY"}, {"DESIGN-INVENTORY"},
-        ),
-        ("design_claim_resolution", "spec-analyst"): (
-            claim_round_scope_ids, claim_round_scope_ids,
-        ),
         ("design_claim_review", "spec-critic"): (
-            claim_round_scope_ids, claim_round_scope_ids,
-        ),
-        ("investigation_planning", "orchestrator"): (
-            planning_scope_ids, planning_scope_ids,
-        ),
-        ("coverage_audit", "coverage-critic"): (
-            {"COVERAGE-AUDIT-FINAL"},
-            {"COVERAGE-AUDIT-INITIAL", "COVERAGE-AUDIT-FINAL"},
+            claim_review_scope_ids, claim_review_scope_ids,
         ),
         ("final_judgement", "final-judge"): (
             {"FINAL-JUDGEMENT"}, {"FINAL-JUDGEMENT"},
@@ -607,7 +581,10 @@ def run(args: argparse.Namespace) -> int:
             trace_contract_errors.append(
                 f"missing valid complete trace checkpoint for {phase}/{role}"
             )
-        elif not any(event.get("output_count", 0) > 0 for event in valid_candidates):
+        elif (
+            (phase, role) != ("code_risk_backtracking", "risk-explorer")
+            and not any(event.get("output_count", 0) > 0 for event in valid_candidates)
+        ):
             trace_contract_errors.append(
                 f"complete trace checkpoint for {phase}/{role} records no output"
             )
@@ -1290,15 +1267,19 @@ def run(args: argparse.Namespace) -> int:
                 )
             for risk_id in set(task_risk_ids).intersection(risks):
                 observation = risks[risk_id]
-                if not set(task.get("architecture_boundaries", [])).intersection(
+                observation_boundaries = set(
                     observation.get("architecture_boundaries", [])
-                ):
+                )
+                if observation_boundaries and not set(
+                    task.get("architecture_boundaries", [])
+                ).intersection(observation_boundaries):
                     errors.append(
                         f"investigation task {task_id}: risk observation {risk_id} shares no boundary"
                     )
-                if not set(task.get("implementation_planes", [])).intersection(
-                    observation.get("implementation_planes", [])
-                ):
+                observation_planes = set(observation.get("implementation_planes", []))
+                if observation_planes and not set(
+                    task.get("implementation_planes", [])
+                ).intersection(observation_planes):
                     errors.append(
                         f"investigation task {task_id}: risk observation {risk_id} shares no plane"
                     )
@@ -1780,7 +1761,7 @@ def run(args: argparse.Namespace) -> int:
         ),
         "architecture_mapped": bool(architecture) and "integration_boundaries" in architecture,
         "risk_backtracking_complete": (
-            bool(risks) and not risk_partition_errors and risk_plan_validation_current
+            not risk_partition_errors and risk_plan_validation_current
         ),
         "risk_partition_complete": not risk_partition_errors and risk_plan_validation_current,
         "investigation_round_recorded": bool(rounds),

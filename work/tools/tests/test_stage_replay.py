@@ -206,22 +206,34 @@ def replay_source(tmp_path: Path) -> dict[str, Path | str]:
         },
         "slices": [{
             "sweep_id": "RISK-SWEEP-SERVICE",
+            "direction": "code_to_design",
+            "document_keys": [],
             "architecture_boundaries": ["BOUNDARY-SERVICE"],
             "implementation_planes": ["PLANE-SERVICE"],
             "parallel_path_ids": [],
             "anchor_paths": ["service.py"],
             "review_lenses": ["input acceptance"],
-            "design_section_ids": ["contract-main"],
             "scope_rationale": "The service API is an independent execution component.",
         }, {
             "sweep_id": "RISK-SWEEP-AUDIT",
+            "direction": "code_to_design",
+            "document_keys": [],
             "architecture_boundaries": ["BOUNDARY-AUDIT"],
             "implementation_planes": ["PLANE-AUDIT"],
             "parallel_path_ids": [],
             "anchor_paths": ["audit.py"],
             "review_lenses": ["input acceptance"],
-            "design_section_ids": ["contract-main"],
             "scope_rationale": "The audit API is an independent execution component.",
+        }, {
+            "sweep_id": "RISK-SWEEP-CONTRACT",
+            "direction": "design_to_code",
+            "document_keys": ["contract"],
+            "architecture_boundaries": [],
+            "implementation_planes": [],
+            "parallel_path_ids": [],
+            "anchor_paths": [],
+            "review_lenses": ["input acceptance"],
+            "scope_rationale": "The contract is reviewed repository-wide as one design scope.",
         }],
     })
     risk_plan_digest = ac.sha256_file(state / "risk_sweep_plan.json")
@@ -234,7 +246,9 @@ def replay_source(tmp_path: Path) -> dict[str, Path | str]:
             "risk_sweep_plan.json": risk_plan_digest,
             "agent_loop_contract.json": ac.sha256_file(state / "agent_loop_contract.json"),
         },
-        "validated_sweep_ids": ["RISK-SWEEP-AUDIT", "RISK-SWEEP-SERVICE"],
+        "validated_sweep_ids": [
+            "RISK-SWEEP-AUDIT", "RISK-SWEEP-CONTRACT", "RISK-SWEEP-SERVICE",
+        ],
         "errors": [],
     })
     inventory = materializer.materialize_inventory({
@@ -259,36 +273,36 @@ def replay_source(tmp_path: Path) -> dict[str, Path | str]:
         }],
     }, design)
     ac.save_json(state / "design_inventory.json", inventory)
-    _write_jsonl(state / "design_lookup_requests.jsonl", [{
-        "request_id": "LOOKUP-1", "session_id": session_id,
-        "source": "risk_frontier", "question": "Which paths must reject invalid values?",
-    }])
     claim_drafts = []
-    for claim_id, subject, trigger, obligation, family, priority in (
+    for candidate_id, request_id, claim_id, subject, trigger, obligation, family, priority in (
         (
-            "CLAIM-1", "The direct service path", "When it receives an invalid value",
+            "OBS-3", "LOOKUP-1", "CLAIM-1", "The direct service path",
+            "When it receives an invalid value",
             "Reject the invalid value.", "input acceptance", "high",
         ),
         (
-            "CLAIM-2", "The adapter path", "When it receives an invalid value",
+            "OBS-2", "LOOKUP-2", "CLAIM-2", "The adapter path",
+            "When it receives an invalid value",
             "Reject the invalid value on the adapter path.", "adapter acceptance", "medium",
         ),
     ):
         claim_drafts.append({
             "claim_id": claim_id,
+            "candidate_id": candidate_id,
+            "request_id": request_id,
             "session_id": session_id,
             "document_key": "contract",
             "source_ref": {"path": "contract.md", "line_start": 2, "line_end": 2},
             "subject": subject,
             "trigger": trigger,
             "obligation": obligation,
-            "exceptions": [],
+            "exceptions": ["No exception is modeled by this fixture."],
             "observable_result": "The invalid value is rejected.",
             "behavior_family": family,
             "normative_strength": "mandatory",
             "applicability": "The supplied service contract is applicable.",
             "priority": priority,
-            "ambiguities": [],
+            "ambiguities": ["No ambiguity is modeled by this fixture."],
             "probe_oracle": {
                 "testability": "candidate",
                 "preconditions": ["The selected path is callable."],
@@ -378,50 +392,70 @@ def replay_source(tmp_path: Path) -> dict[str, Path | str]:
     assert claim_review_validator.run(review_args) == 0
     tasks = [
         {
-            "task_id": "TASK-1", "session_id": session_id, "claim_id": "CLAIM-1",
+            "task_id": "TASK-1", "candidate_id": "OBS-3", "request_id": "LOOKUP-1",
+            "session_id": session_id, "claim_id": "CLAIM-1",
             "claim_branch": ac.canonical_claim_branch(claims[0]),
             "hypothesis": ac.canonical_claim_hypothesis(claims[0]),
             "obligation_sha256": _canonical_sha256({
                 "claim_id": "CLAIM-1", "obligation": claims[0]["obligation"],
             }),
-            "starting_points": ["service.py:accept"],
+            "starting_points": [{
+                "file": "service.py", "line_start": 1, "line_end": 2,
+            }],
             "supporting_evidence_needed": ["reachable acceptance behavior"],
             "disconfirming_evidence_needed": ["a rejecting guard"],
             "review_lenses": ["input acceptance"],
             "exploration_mode": "design-to-code obligation tracing",
             "architecture_boundaries": ["BOUNDARY-SERVICE"],
             "implementation_planes": ["PLANE-SERVICE"],
-            "parallel_path_ids": [], "risk_observation_ids": [],
+            "parallel_path_ids": [], "risk_observation_ids": ["OBS-3"],
             "status": "pending", "defer_reason": "",
         },
         {
-            "task_id": "TASK-2", "session_id": session_id, "claim_id": "CLAIM-2",
+            "task_id": "TASK-2", "candidate_id": "OBS-2", "request_id": "LOOKUP-2",
+            "session_id": session_id, "claim_id": "CLAIM-2",
             "claim_branch": ac.canonical_claim_branch(claims[1]),
             "hypothesis": ac.canonical_claim_hypothesis(claims[1]),
             "obligation_sha256": _canonical_sha256({
                 "claim_id": "CLAIM-2", "obligation": claims[1]["obligation"],
             }),
-            "starting_points": ["audit.py:record"],
+            "starting_points": [{
+                "file": "audit.py", "line_start": 1, "line_end": 2,
+            }],
             "supporting_evidence_needed": ["reachable adapter behavior"],
             "disconfirming_evidence_needed": ["an adapter validation guard"],
             "review_lenses": ["input acceptance"],
             "exploration_mode": "code-to-design risk backtracking",
-            "architecture_boundaries": ["BOUNDARY-SERVICE", "BOUNDARY-AUDIT"],
-            "implementation_planes": ["PLANE-SERVICE", "PLANE-AUDIT"],
-            "parallel_path_ids": [], "risk_observation_ids": ["OBS-1", "OBS-2"],
+            "architecture_boundaries": ["BOUNDARY-AUDIT"],
+            "implementation_planes": ["PLANE-AUDIT"],
+            "parallel_path_ids": [], "risk_observation_ids": ["OBS-2"],
             "status": "pending", "defer_reason": "",
         },
     ]
     _write_jsonl(state / "investigation_tasks.jsonl", tasks)
-    _write_jsonl(state / "risk_observations.jsonl", [
+    risk_observations = [
         {
             "observation_id": "OBS-1", "session_id": session_id,
             "sweep_id": "RISK-SWEEP-SERVICE",
             "risk_sweep_plan_sha256": risk_plan_digest,
+            "direction": "code_to_design",
             "behavior_question": "What does the public path do with invalid values?",
+            "mismatch_signal": "direct_conflict",
+            "design_requirement": {
+                "source_ref": {
+                    "path": "contract.md", "line_start": 2, "line_end": 2,
+                },
+                "subject": "The direct service path",
+                "trigger": "When it receives an invalid value",
+                "obligation": "Reject the invalid value.",
+                "observable_result": "The invalid value is rejected.",
+                "normative_strength": "mandatory",
+                "applicability": "The supplied service contract is applicable.",
+                "exceptions": ["No exception is modeled by this fixture."],
+                "ambiguities": ["No ambiguity is modeled by this fixture."],
+            },
             "observed_code_behavior": "The public path returns true without a guard.",
             "design_section_ids": ["contract-main"],
-            "design_alignment": "The section defines invalid-input behavior for this public path.",
             "review_lenses": ["input acceptance"],
             "architecture_boundaries": ["BOUNDARY-SERVICE"],
             "implementation_planes": ["PLANE-SERVICE"],
@@ -437,7 +471,6 @@ def replay_source(tmp_path: Path) -> dict[str, Path | str]:
                 "question": "Is another public path authoritative?", "method": "symbol search",
                 "target": "service.py", "result": "No alternate public path exists.",
             }],
-            "design_lookup_questions": ["Must the public path reject invalid values?"],
             "tool_trace": [
                 {
                     "seq": 1, "kind": "design_read", "tool": "read",
@@ -465,10 +498,24 @@ def replay_source(tmp_path: Path) -> dict[str, Path | str]:
             "observation_id": "OBS-2", "session_id": session_id,
             "sweep_id": "RISK-SWEEP-AUDIT",
             "risk_sweep_plan_sha256": risk_plan_digest,
+            "direction": "code_to_design",
             "behavior_question": "What does the adapter do with invalid values?",
+            "mismatch_signal": "cross_plane_mismatch",
+            "design_requirement": {
+                "source_ref": {
+                    "path": "contract.md", "line_start": 2, "line_end": 2,
+                },
+                "subject": "The adapter path",
+                "trigger": "When it receives an invalid value",
+                "obligation": "Reject the invalid value on the adapter path.",
+                "observable_result": "The invalid value is rejected.",
+                "normative_strength": "mandatory",
+                "applicability": "The supplied service contract is applicable.",
+                "exceptions": ["No exception is modeled by this fixture."],
+                "ambiguities": ["No ambiguity is modeled by this fixture."],
+            },
             "observed_code_behavior": "The adapter returns its input without a guard.",
             "design_section_ids": ["contract-main"],
-            "design_alignment": "The section defines invalid-input behavior for this adapter path.",
             "review_lenses": ["input acceptance"],
             "architecture_boundaries": ["BOUNDARY-AUDIT"],
             "implementation_planes": ["PLANE-AUDIT"],
@@ -484,7 +531,6 @@ def replay_source(tmp_path: Path) -> dict[str, Path | str]:
                 "question": "Is the adapter unreachable?", "method": "entrypoint read",
                 "target": "audit.py", "result": "The adapter is directly callable.",
             }],
-            "design_lookup_questions": ["Must the adapter reject invalid values?"],
             "tool_trace": [
                 {
                     "seq": 1, "kind": "design_read", "tool": "read",
@@ -508,7 +554,100 @@ def replay_source(tmp_path: Path) -> dict[str, Path | str]:
                 },
             ],
         },
-    ])
+    ]
+    risk_observations.append({
+        "observation_id": "OBS-3", "session_id": session_id,
+        "sweep_id": "RISK-SWEEP-CONTRACT",
+        "risk_sweep_plan_sha256": risk_plan_digest,
+        "direction": "design_to_code",
+        "behavior_question": "Does the direct service path reject invalid values?",
+        "mismatch_signal": "direct_conflict",
+        "design_requirement": {
+            "source_ref": {
+                "path": "contract.md", "line_start": 2, "line_end": 2,
+            },
+            "subject": "The direct service path",
+            "trigger": "When it receives an invalid value",
+            "obligation": "Reject the invalid value.",
+            "observable_result": "The invalid value is rejected.",
+            "normative_strength": "mandatory",
+            "applicability": "The supplied service contract is applicable.",
+            "exceptions": ["No exception is modeled by this fixture."],
+            "ambiguities": ["No ambiguity is modeled by this fixture."],
+        },
+        "observed_code_behavior": "The public path returns true without a guard.",
+        "design_section_ids": ["contract-main"],
+        "review_lenses": ["input acceptance"],
+        "architecture_boundaries": ["BOUNDARY-SERVICE"],
+        "implementation_planes": ["PLANE-SERVICE"],
+        "parallel_path_ids": [],
+        "code_evidence": [{
+            "file": "service.py", "line_start": 1, "line_end": 2,
+            "symbol": "accept", "snippet": "def accept(value):\n    return True",
+        }],
+        "false_positive_checks": [{
+            "question": "Is a guard called first?", "method": "control-flow read",
+            "target": "accept", "result": "The function returns directly.",
+        }],
+        "tool_trace": [{
+            "seq": 1, "kind": "design_read", "tool": "read",
+            "target": "contract.md:1-2", "purpose": "Read the assigned section.",
+            "result": "The section requires invalid-input rejection.",
+        }, {
+            "seq": 2, "kind": "code_search", "tool": "search",
+            "target": "accept", "purpose": "Locate the direct service path.",
+            "result": "Found service.py:1.",
+        }, {
+            "seq": 3, "kind": "code_read", "tool": "read",
+            "target": "service.py:1-2", "purpose": "Read reachable behavior.",
+            "result": "It returns true directly.",
+        }],
+    })
+    _write_jsonl(state / "risk_observations.jsonl", risk_observations)
+    observations_by_id = {
+        observation["observation_id"]: observation
+        for observation in risk_observations
+    }
+    _write_jsonl(state / "design_lookup_requests.jsonl", [{
+        "request_id": claim["request_id"],
+        "candidate_id": claim["candidate_id"],
+        "session_id": session_id,
+        "origin": "semantic_scout",
+        "origin_id": claim["candidate_id"],
+        "sweep_id": observation["sweep_id"],
+        "direction": observation["direction"],
+        "document_keys": ["contract"],
+        "section_ids": observation["design_section_ids"],
+        "question": observation["behavior_question"],
+        "required_branch": ac.canonical_claim_branch(claim),
+        "mismatch_signal": observation["mismatch_signal"],
+        "code_evidence": observation["code_evidence"],
+    } for claim in claims for observation in [observations_by_id[claim["candidate_id"]]]])
+    _write_jsonl(state / "scout_receipts.jsonl", [{
+        "session_id": session_id,
+        "sweep_id": "RISK-SWEEP-SERVICE",
+        "direction": "code_to_design",
+        "risk_sweep_plan_sha256": risk_plan_digest,
+        "status": "complete",
+        "candidate_count": 1,
+        "candidate_ids": ["OBS-1"],
+    }, {
+        "session_id": session_id,
+        "sweep_id": "RISK-SWEEP-AUDIT",
+        "direction": "code_to_design",
+        "risk_sweep_plan_sha256": risk_plan_digest,
+        "status": "complete",
+        "candidate_count": 1,
+        "candidate_ids": ["OBS-2"],
+    }, {
+        "session_id": session_id,
+        "sweep_id": "RISK-SWEEP-CONTRACT",
+        "direction": "design_to_code",
+        "risk_sweep_plan_sha256": risk_plan_digest,
+        "status": "complete",
+        "candidate_count": 1,
+        "candidate_ids": ["OBS-3"],
+    }])
     findings = [
         {
             "finding_id": "FINDING-1", "session_id": session_id,
@@ -974,12 +1113,13 @@ def test_claim_review_and_risk_replays_enforce_opposite_source_boundaries(
     ]
     assert risk_envelope["selection"] == {
         "sweep_id": "RISK-SWEEP-AUDIT",
+        "direction": "code_to_design",
+        "document_keys": [],
         "architecture_boundaries": ["BOUNDARY-AUDIT"],
         "implementation_planes": ["PLANE-AUDIT"],
         "parallel_path_ids": [],
         "anchor_paths": ["audit.py"],
         "review_lenses": ["input acceptance"],
-        "design_section_ids": ["contract-main"],
         "scope_rationale": "The audit API is an independent execution component.",
         "risk_sweep_plan_sha256": ac.sha256_file(
             risk_plan_path
@@ -1077,7 +1217,7 @@ def test_investigator_replay_copies_only_selected_task_context(replay_source, tm
 
     assert manifest["selection"] == {
         "task_id": "TASK-2", "claim_id": "CLAIM-2",
-        "risk_observation_ids": ["OBS-1", "OBS-2"],
+        "risk_observation_ids": ["OBS-2"],
     }
     assert [item["task_id"] for item in _jsonl(
         replay / "state" / "investigation_tasks.jsonl",
@@ -1087,7 +1227,7 @@ def test_investigator_replay_copies_only_selected_task_context(replay_source, tm
     )] == ["CLAIM-2"]
     assert [item["observation_id"] for item in _jsonl(
         replay / "state" / "risk_observations.jsonl",
-    )] == ["OBS-1", "OBS-2"]
+    )] == ["OBS-2"]
     envelope = ac.load_json(replay / "prompt_envelope.json")
     assert "state/risk_sweep_plan.json" in envelope["inputs"]
     assert not (replay / "state" / "investigation_findings.jsonl").exists()
@@ -1290,6 +1430,15 @@ def test_claims_local_schema_replay_is_isolated(replay_source, tmp_path):
         source_state=replay_source["state"], replay_root=replay,
         stage="claims", run_local=True,
     )
+    # Claims validation consumes the selected semantic-scout observations as
+    # immutable lineage input.  Keep this explicit until the replay bundle
+    # itself owns that copied input.
+    risk_target = replay / "state" / "risk_observations.jsonl"
+    if not risk_target.exists():
+        _write_jsonl(
+            risk_target,
+            _jsonl(replay_source["state"] / "risk_observations.jsonl"),
+        )
 
     raw_path = replay / "state" / "handoffs" / "design" / "claims.raw.jsonl"
     raw_claims = _jsonl(raw_path)

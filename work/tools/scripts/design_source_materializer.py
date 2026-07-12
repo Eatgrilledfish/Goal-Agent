@@ -27,7 +27,8 @@ import agent_common as ac
 
 
 TEXT_SUFFIXES = {".md", ".markdown", ".txt", ".rst", ".adoc", ".asc", ".json", ".yaml", ".yml", ".toml"}
-ARTIFACT_KINDS = {"inventory", "claims"}
+ARTIFACT_KINDS = {"auto-inventory", "inventory", "claims"}
+AUTO_INVENTORY_SECTION_LINES = 800
 
 
 class _VisibleHTML(HTMLParser):
@@ -331,6 +332,155 @@ def materialize_inventory(value: dict[str, Any], design_root: Path) -> dict[str,
     return materialized
 
 
+def _auto_section_id(relative_path: str, line_start: int) -> str:
+    """Return a stable, globally unique ID without interpreting the document."""
+    path_digest = hashlib.sha256(relative_path.encode("utf-8")).hexdigest()[:16]
+    return f"AUTO-{path_digest.upper()}-{line_start:07d}"
+
+
+def _mechanical_retrieval_labels(relative_path: str, heading: str) -> list[str]:
+    """Build lookup labels only from materialized path and nearby source heading."""
+    return list(dict.fromkeys((heading, relative_path)))
+
+
+def _catalog_group(document_key: str, members: list[str]) -> bool:
+    """Recognize the materializer-owned catalog directory without semantic guessing."""
+    if document_key == "catalog" or document_key.startswith("catalog/"):
+        return True
+    return bool(members) and all(
+        Path(member).parts and Path(member).parts[0].lower() == "catalog"
+        for member in members
+    )
+
+
+def materialize_auto_inventory(
+    manifest: dict[str, Any], design_root: Path,
+) -> dict[str, Any]:
+    """Mechanically index every manifest member in bounded contiguous sections.
+
+    The manifest already defines document grouping.  This function deliberately
+    makes no applicability or requirement judgement: materialized catalog files
+    are informational and every other document defaults to ``in_scope``.  Search
+    labels are copied only from the file path and nearest textual heading.
+    """
+    if not isinstance(manifest, dict):
+        raise ValueError("design agent manifest must be an object")
+    session_id = manifest.get("session_id")
+    if not isinstance(session_id, str) or not session_id.strip():
+        raise ValueError("design agent manifest session_id must be a non-empty string")
+    design = manifest.get("design")
+    if not isinstance(design, dict):
+        raise ValueError("design agent manifest design must be an object")
+    raw_documents = design.get("documents")
+    raw_groups = design.get("document_groups")
+    if not isinstance(raw_documents, list):
+        raise ValueError("design agent manifest design.documents must be an array")
+    if not isinstance(raw_groups, list):
+        raise ValueError("design agent manifest design.document_groups must be an array")
+
+    documents: dict[str, dict[str, Any]] = {}
+    for index, raw_document in enumerate(raw_documents, start=1):
+        if not isinstance(raw_document, dict):
+            raise ValueError(f"design.documents[{index}] must be an object")
+        raw_path = raw_document.get("path")
+        source_path, relative_path = _canonical_source_path(design_root, raw_path)
+        if raw_path != relative_path:
+            raise ValueError(
+                f"design.documents[{index}].path must be canonical: {relative_path}"
+            )
+        if relative_path in documents:
+            raise ValueError(f"design.documents[{index}] duplicates path {relative_path!r}")
+        expected_hash = raw_document.get("sha256")
+        actual_hash = ac.sha256_file(source_path)
+        if not isinstance(expected_hash, str) or expected_hash != actual_hash:
+            raise ValueError(
+                f"design.documents[{index}].sha256 does not match {relative_path}"
+            )
+        documents[relative_path] = raw_document
+
+    output_groups: list[dict[str, Any]] = []
+    seen_keys: set[str] = set()
+    seen_members: set[str] = set()
+    for group_index, raw_group in enumerate(raw_groups, start=1):
+        label = f"design.document_groups[{group_index}]"
+        if not isinstance(raw_group, dict):
+            raise ValueError(f"{label} must be an object")
+        document_key = raw_group.get("document_key")
+        if not isinstance(document_key, str) or not document_key.strip():
+            raise ValueError(f"{label}.document_key must be a non-empty string")
+        if document_key in seen_keys:
+            raise ValueError(f"{label} duplicates document_key {document_key!r}")
+        seen_keys.add(document_key)
+        raw_members = raw_group.get("members")
+        if not isinstance(raw_members, list) or not raw_members:
+            raise ValueError(f"{label}.members must be a non-empty array")
+        if any(not isinstance(member, str) or not member for member in raw_members):
+            raise ValueError(f"{label}.members entries must be non-empty strings")
+        members = list(raw_members)
+
+        sections: list[dict[str, Any]] = []
+        for member in members:
+            source_path, relative_path = _canonical_source_path(design_root, member)
+            if member != relative_path:
+                raise ValueError(f"{label}.members path must be canonical: {relative_path}")
+            if relative_path not in documents:
+                raise ValueError(f"{label}.members path is absent from design.documents: {relative_path}")
+            if relative_path in seen_members:
+                raise ValueError(f"design member belongs to multiple groups: {relative_path!r}")
+            seen_members.add(relative_path)
+            try:
+                source_text = source_path.read_text(encoding="utf-8", errors="strict")
+            except UnicodeDecodeError as exc:
+                raise ValueError(f"design member is not valid UTF-8: {relative_path}") from exc
+            if "\x00" in source_text:
+                raise ValueError(f"design member contains binary NUL bytes: {relative_path}")
+            lines = source_text.splitlines()
+            if not lines:
+                raise ValueError(f"design member is empty and cannot be line-indexed: {relative_path}")
+            for line_start in range(1, len(lines) + 1, AUTO_INVENTORY_SECTION_LINES):
+                line_end = min(
+                    len(lines), line_start + AUTO_INVENTORY_SECTION_LINES - 1,
+                )
+                heading = _section_heading(lines, line_start, relative_path)
+                sections.append(_materialize_inventory_section({
+                    "section_id": _auto_section_id(relative_path, line_start),
+                    "source_ref": {
+                        "path": relative_path,
+                        "line_start": line_start,
+                        "line_end": line_end,
+                    },
+                    "behavior_families": _mechanical_retrieval_labels(
+                        relative_path, heading,
+                    ),
+                    "ambiguities": [],
+                }, design_root))
+
+        first_member = members[0]
+        scope_evidence = materialize_source_ref({
+            "source_ref": {
+                "path": first_member,
+                "line_start": 1,
+                "line_end": 1,
+            },
+        }, design_root, include_quote=True)
+        group = {
+            "document_key": document_key,
+            "members": members,
+            "scope_relation": (
+                "informational" if _catalog_group(document_key, members) else "in_scope"
+            ),
+            "scope_evidence": scope_evidence,
+            "sections": sections,
+        }
+        group["group_sha256"] = _canonical_json_sha256(group)
+        output_groups.append(group)
+
+    ungrouped = sorted(set(documents) - seen_members)
+    if ungrouped:
+        raise ValueError(f"design documents are absent from document_groups: {ungrouped}")
+    return {"session_id": session_id, "document_groups": output_groups}
+
+
 def _load_claim_input(path: Path) -> list[dict[str, Any]]:
     values, errors = ac.load_jsonl(path)
     if errors:
@@ -363,7 +513,12 @@ def materialize_artifact(args: argparse.Namespace) -> int:
         errors.append("artifact trace must be outside the read-only design root")
     if not errors:
         try:
-            if args.materialize == "inventory":
+            if args.materialize == "auto-inventory":
+                raw = ac.load_json(input_path)
+                output = materialize_auto_inventory(raw, design_root)
+                count = len(output.get("document_groups", []))
+                ac.save_json(output_path, output)
+            elif args.materialize == "inventory":
                 raw = ac.load_json(input_path)
                 output = materialize_inventory(raw, design_root)
                 count = len(output.get("document_groups", []))

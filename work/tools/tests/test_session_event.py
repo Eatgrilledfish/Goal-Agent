@@ -119,7 +119,7 @@ def test_trace_event_records_required_fields_and_real_input_digests(tmp_path: Pa
     state = ac.load_json(root / "agent_loop_state.json")
     events, errors = ac.load_jsonl(root / "agent_run_ledger.jsonl")
     assert errors == []
-    assert state["status"] == "complete"
+    assert state["status"] == "in_progress"
     assert state["metrics"]["reviewed"] == 2
     assert state["completed_phases"] == ["candidate_review"]
     assert state["stop_reason"] == "candidate_evidence_closed"
@@ -166,6 +166,96 @@ def test_trace_event_records_required_fields_and_real_input_digests(tmp_path: Pa
         "CLAIM_GROUP_GAP": 4,
     }
     assert event["validation_error_count"] == 7
+
+
+def test_local_complete_checkpoint_cannot_complete_global_session(tmp_path: Path) -> None:
+    root = _state_root(tmp_path)
+    artifact = _input_file(tmp_path)
+
+    assert session_event.main(_required_args(root, [artifact], status="complete")) == 0
+
+    state = ac.load_json(root / "agent_loop_state.json")
+    assert state["status"] == "in_progress"
+    events, errors = ac.load_jsonl(root / "agent_run_ledger.jsonl")
+    assert errors == []
+    assert events[-1]["status"] == "complete"
+
+
+def test_local_checkpoint_preserves_final_gate_complete_state(tmp_path: Path) -> None:
+    root = _state_root(tmp_path)
+    state = ac.load_json(root / "agent_loop_state.json")
+    state["status"] = "complete"
+    state["current_phase"] = "complete"
+    state["stop_reason"] = "final_gate_passed"
+    ac.save_json(root / "agent_loop_state.json", state)
+    artifact = _input_file(tmp_path)
+
+    assert session_event.main(_required_args(root, [artifact], status="complete")) == 0
+
+    final_state = ac.load_json(root / "agent_loop_state.json")
+    assert final_state["status"] == "complete"
+    assert final_state["current_phase"] == "complete"
+    assert final_state["stop_reason"] == "final_gate_passed"
+
+
+def test_local_checkpoint_repairs_non_gate_complete_state(tmp_path: Path) -> None:
+    root = _state_root(tmp_path)
+    state = ac.load_json(root / "agent_loop_state.json")
+    state["status"] = "complete"
+    state["stop_reason"] = "round_partially_complete"
+    ac.save_json(root / "agent_loop_state.json", state)
+    artifact = _input_file(tmp_path)
+
+    assert session_event.main(_required_args(root, [artifact], status="complete")) == 0
+
+    assert ac.load_json(root / "agent_loop_state.json")["status"] == "in_progress"
+
+
+def test_only_risk_explorer_complete_checkpoint_may_record_zero_outputs(
+    tmp_path: Path,
+) -> None:
+    root = _state_root(tmp_path)
+    artifact = _input_file(tmp_path, "empty-scout.json", "[]\n")
+
+    assert session_event.main(_required_args(
+        root, [artifact], output_artifact=artifact,
+        phase="code_risk_backtracking", role="risk-explorer",
+        output_count="0", outcome="no_mismatch_candidates",
+        stop_reason="scout_completed_with_empty_candidate_set",
+    )) == 0
+
+    events, errors = ac.load_jsonl(root / "agent_run_ledger.jsonl")
+    assert errors == []
+    assert events[-1]["status"] == "complete"
+    assert events[-1]["output_count"] == 0
+    assert session_event.checkpoint_event_errors(
+        events[-1], session_id="session-trace-test",
+        role="risk-explorer", phase="code_risk_backtracking",
+    ) == []
+
+
+@pytest.mark.parametrize(
+    ("phase", "role"),
+    [
+        ("code_risk_backtracking", "orchestrator"),
+        ("candidate_review", "risk-explorer"),
+        ("investigation", "code-investigator"),
+    ],
+)
+def test_other_complete_checkpoints_still_reject_zero_outputs(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], phase: str, role: str,
+) -> None:
+    root = _state_root(tmp_path)
+    artifact = _input_file(tmp_path)
+
+    with pytest.raises(SystemExit) as exc:
+        session_event.main(_required_args(
+            root, [artifact], phase=phase, role=role, output_count="0",
+        ))
+
+    assert exc.value.code == 2
+    assert "complete checkpoint output-count" in capsys.readouterr().err
+    assert not (root / "agent_run_ledger.jsonl").exists()
 
 
 def test_input_digest_is_independent_of_repeated_argument_order(tmp_path: Path) -> None:

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate focused, non-overlapping code-risk sweep slices."""
+"""Validate requirement-centric, bidirectional scout slices."""
 
 from __future__ import annotations
 
@@ -17,10 +17,10 @@ PLAN_NAME = "risk_sweep_plan.json"
 ARCHITECTURE_NAME = "architecture_map.json"
 INVENTORY_NAME = "design_inventory.json"
 CONTRACT_NAME = "agent_loop_contract.json"
+SCOUT_RECEIPTS_NAME = "scout_receipts.jsonl"
 SAFE_SWEEP_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
-MAX_IMPLEMENTATION_PLANES_PER_SLICE = 6
-MAX_DESIGN_SECTIONS_PER_SLICE = 12
 MAX_OBSERVATIONS_PER_SWEEP = 8
+SCOUT_DIRECTIONS = {"design_to_code", "code_to_design"}
 
 
 def plan_input_digests(state_root: Path) -> tuple[dict[str, str], str]:
@@ -79,13 +79,23 @@ def _indexes(architecture: dict[str, Any]) -> tuple[dict[str, dict], dict[str, d
 
 def _design_sections(
     inventory: dict[str, Any],
-) -> tuple[dict[str, dict[str, Any]], set[str]]:
+) -> tuple[
+    dict[str, dict[str, Any]], dict[str, str], dict[str, dict[str, Any]], set[str],
+]:
     sections: dict[str, dict[str, Any]] = {}
-    required: set[str] = set()
+    section_documents: dict[str, str] = {}
+    documents: dict[str, dict[str, Any]] = {}
+    required_documents: set[str] = set()
     for group in inventory.get("document_groups", []):
         if not isinstance(group, dict):
             continue
+        document_key = group.get("document_key")
+        if not isinstance(document_key, str) or not document_key:
+            continue
+        documents[document_key] = group
         relation = group.get("scope_relation")
+        if relation in {"required", "in_scope"}:
+            required_documents.add(document_key)
         for section in group.get("sections", []):
             if not isinstance(section, dict):
                 continue
@@ -93,9 +103,8 @@ def _design_sections(
             if not isinstance(section_id, str) or not section_id:
                 continue
             sections[section_id] = section
-            if relation in {"required", "in_scope"}:
-                required.add(section_id)
-    return sections, required
+            section_documents[section_id] = document_key
+    return sections, section_documents, documents, required_documents
 
 
 def _required_coverage(
@@ -193,7 +202,10 @@ def validate_plan(
         errors.append(f"{PLAN_NAME}: design_inventory_sha256 is stale")
 
     boundaries, planes, parallel_paths = _indexes(architecture)
-    design_sections, required_design_sections = _design_sections(inventory)
+    (
+        design_sections, section_documents, design_documents,
+        required_document_keys,
+    ) = _design_sections(inventory)
     required_boundaries, required_planes, required_paths = _required_coverage(
         boundaries, planes, parallel_paths,
     )
@@ -231,12 +243,13 @@ def validate_plan(
     coverage_by_kind: dict[str, set[str]] = {
         "boundary": set(), "plane": set(), "path": set(),
     }
-    covered_design_sections: set[str] = set()
+    covered_document_keys: set[str] = set()
+    document_owners: dict[str, str] = {}
     anchor_owners: dict[str, str] = {}
     allowed_keys = {
+        "direction", "document_keys",
         "sweep_id", "architecture_boundaries", "implementation_planes",
-        "parallel_path_ids", "anchor_paths", "review_lenses", "design_section_ids",
-        "scope_rationale",
+        "parallel_path_ids", "anchor_paths", "review_lenses", "scope_rationale",
     }
     for index, item in enumerate(raw_slices, start=1):
         label = f"{PLAN_NAME} slices[{index}]"
@@ -259,6 +272,37 @@ def validate_plan(
             errors.append(f"{label}: duplicate sweep_id {sweep_id}")
             continue
         slices[sweep_id] = item
+        direction = item.get("direction")
+        if direction not in SCOUT_DIRECTIONS:
+            errors.append(
+                f"{label}: direction must be one of {sorted(SCOUT_DIRECTIONS)}"
+            )
+        document_keys, document_errors = _strings(
+            item.get("document_keys"), f"{label}.document_keys",
+            allow_empty=direction == "code_to_design",
+        )
+        errors.extend(document_errors)
+        unknown_documents = set(document_keys) - set(design_documents)
+        if unknown_documents:
+            errors.append(
+                f"{label}.document_keys: unknown document groups "
+                f"{sorted(unknown_documents)}"
+            )
+        if direction == "code_to_design" and document_keys:
+            errors.append(
+                f"{label}.document_keys must be empty for code_to_design; "
+                "the scout retrieves relevant sections from the complete inventory"
+            )
+        if direction == "design_to_code":
+            for document_key in document_keys:
+                prior_owner = document_owners.get(document_key)
+                if prior_owner is not None and prior_owner != sweep_id:
+                    errors.append(
+                        f"{label}.document_keys: {document_key!r} is already owned "
+                        f"by {prior_owner}"
+                    )
+                document_owners[document_key] = sweep_id
+            covered_document_keys.update(document_keys)
         values_by_kind: dict[str, list[str]] = {}
         for field, kind, known in (
             ("architecture_boundaries", "boundary", set(boundaries)),
@@ -267,61 +311,48 @@ def validate_plan(
         ):
             values, value_errors = _strings(
                 item.get(field), f"{label}.{field}",
-                allow_empty=kind != "plane",
+                allow_empty=direction == "design_to_code" or kind != "plane",
             )
             errors.extend(value_errors)
             values_by_kind[kind] = values
             unknown = set(values) - known
             if unknown:
                 errors.append(f"{label}.{field}: unknown IDs {sorted(unknown)}")
-            coverage_by_kind[kind].update(values)
-        if len(values_by_kind["plane"]) > MAX_IMPLEMENTATION_PLANES_PER_SLICE:
-            errors.append(
-                f"{label}.implementation_planes must contain at most "
-                f"{MAX_IMPLEMENTATION_PLANES_PER_SLICE} values"
-            )
-        section_values, section_errors = _strings(
-            item.get("design_section_ids"), f"{label}.design_section_ids",
-            allow_empty=False,
-        )
-        errors.extend(section_errors)
-        if len(section_values) > MAX_DESIGN_SECTIONS_PER_SLICE:
-            errors.append(
-                f"{label}.design_section_ids must contain at most "
-                f"{MAX_DESIGN_SECTIONS_PER_SLICE} relevant sections"
-            )
-        unknown_sections = set(section_values) - set(design_sections)
-        if unknown_sections:
-            errors.append(
-                f"{label}.design_section_ids: unknown IDs {sorted(unknown_sections)}"
-            )
-        covered_design_sections.update(section_values)
-        for boundary_id in values_by_kind["boundary"]:
-            linked_planes = set(
-                boundaries.get(boundary_id, {}).get("plane_ids", [])
-            )
-            if boundary_id in boundaries and not linked_planes.intersection(
-                values_by_kind["plane"]
-            ):
-                errors.append(
-                    f"{label}.architecture_boundaries: {boundary_id} has no linked "
-                    "implementation plane in this slice"
+            if direction == "code_to_design":
+                coverage_by_kind[kind].update(values)
+        if direction == "code_to_design":
+            for boundary_id in values_by_kind["boundary"]:
+                linked_planes = set(
+                    boundaries.get(boundary_id, {}).get("plane_ids", [])
                 )
-        for path_id in values_by_kind["path"]:
-            linked_planes = set(
-                parallel_paths.get(path_id, {}).get("plane_ids", [])
-            )
-            if path_id in parallel_paths and not linked_planes.intersection(
-                values_by_kind["plane"]
-            ):
-                errors.append(
-                    f"{label}.parallel_path_ids: {path_id} has no linked "
-                    "implementation plane in this slice"
+                if boundary_id in boundaries and not linked_planes.intersection(
+                    values_by_kind["plane"]
+                ):
+                    errors.append(
+                        f"{label}.architecture_boundaries: {boundary_id} has no linked "
+                        "implementation plane in this slice"
+                    )
+            for path_id in values_by_kind["path"]:
+                linked_planes = set(
+                    parallel_paths.get(path_id, {}).get("plane_ids", [])
                 )
+                if path_id in parallel_paths and not linked_planes.intersection(
+                    values_by_kind["plane"]
+                ):
+                    errors.append(
+                        f"{label}.parallel_path_ids: {path_id} has no linked "
+                        "implementation plane in this slice"
+                    )
         anchors, anchor_errors = _strings(
-            item.get("anchor_paths"), f"{label}.anchor_paths", allow_empty=False,
+            item.get("anchor_paths"), f"{label}.anchor_paths",
+            allow_empty=direction == "design_to_code",
         )
         errors.extend(anchor_errors)
+        if direction == "design_to_code" and anchors:
+            errors.append(
+                f"{label}.anchor_paths must be empty for design_to_code; "
+                "code search is repository-wide"
+            )
         normalized_anchors: set[str] = set()
         for anchor in anchors:
             parsed = PurePosixPath(anchor)
@@ -351,44 +382,46 @@ def validate_plan(
                 for plane_id in values_by_kind["plane"]
             },
         }
-        for scoped_id, scoped_paths in scoped_paths_by_id.items():
-            if not any(
-                _in_scope(path, list(normalized_anchors))
-                or _in_scope(anchor, scoped_paths)
-                for path in scoped_paths for anchor in normalized_anchors
-            ):
-                errors.append(
-                    f"{label}.anchor_paths: {scoped_id} has no local primary scope"
-                )
-        architecture_paths = [
-            path for paths_for_id in scoped_paths_by_id.values()
-            for path in paths_for_id
-        ]
-        for anchor in normalized_anchors:
-            if not any(
-                _in_scope(anchor, [path]) or _in_scope(path, [anchor])
-                for path in architecture_paths
-            ):
-                errors.append(
-                    f"{label}.anchor_paths: {anchor} is unrelated to assigned "
-                    "architecture boundary or plane paths"
-                )
+        if direction == "code_to_design":
+            for scoped_id, scoped_paths in scoped_paths_by_id.items():
+                if not any(
+                    _in_scope(path, list(normalized_anchors))
+                    or _in_scope(anchor, scoped_paths)
+                    for path in scoped_paths for anchor in normalized_anchors
+                ):
+                    errors.append(
+                        f"{label}.anchor_paths: {scoped_id} has no local primary scope"
+                    )
+            architecture_paths = [
+                path for paths_for_id in scoped_paths_by_id.values()
+                for path in paths_for_id
+            ]
+            for anchor in normalized_anchors:
+                if not any(
+                    _in_scope(anchor, [path]) or _in_scope(path, [anchor])
+                    for path in architecture_paths
+                ):
+                    errors.append(
+                        f"{label}.anchor_paths: {anchor} is unrelated to assigned "
+                        "architecture boundary or plane paths"
+                    )
         if review_code_root is not None:
             for anchor in normalized_anchors:
                 scope_error = _scope_path_error(review_code_root, anchor)
                 if scope_error:
                     errors.append(f"{label}.anchor_paths: {scope_error}")
-        for anchor in normalized_anchors:
-            for prior_anchor, prior_sweep in anchor_owners.items():
-                if prior_sweep != sweep_id and (
-                    _in_scope(anchor, [prior_anchor])
-                    or _in_scope(prior_anchor, [anchor])
-                ):
-                    errors.append(
-                        f"{label}.anchor_paths: {anchor} overlaps {prior_anchor} "
-                        f"owned by sweep {prior_sweep}"
-                    )
-            anchor_owners[anchor] = sweep_id
+        if direction == "code_to_design":
+            for anchor in normalized_anchors:
+                for prior_anchor, prior_sweep in anchor_owners.items():
+                    if prior_sweep != sweep_id and (
+                        _in_scope(anchor, [prior_anchor])
+                        or _in_scope(prior_anchor, [anchor])
+                    ):
+                        errors.append(
+                            f"{label}.anchor_paths: {anchor} overlaps {prior_anchor} "
+                            f"owned by sweep {prior_sweep}"
+                        )
+                anchor_owners[anchor] = sweep_id
         lenses, lens_errors = _strings(
             item.get("review_lenses"), f"{label}.review_lenses", allow_empty=False,
         )
@@ -419,6 +452,12 @@ def validate_plan(
                 f"{PLAN_NAME}: {kind} coverage must include all required IDs; "
                 f"missing={sorted(expected - actual)}, extra={sorted(actual - expected)}"
             )
+    missing_documents = required_document_keys - covered_document_keys
+    if missing_documents:
+        errors.append(
+            f"{PLAN_NAME}: design_to_code document coverage is incomplete; "
+            f"missing={sorted(missing_documents)}"
+        )
     return errors, {
         "slices": slices,
         "required_boundaries": required_boundaries,
@@ -429,8 +468,10 @@ def validate_plan(
         "planes": planes,
         "parallel_paths": parallel_paths,
         "design_sections": design_sections,
-        "required_design_sections": required_design_sections,
-        "selected_design_sections": covered_design_sections,
+        "section_documents": section_documents,
+        "design_documents": design_documents,
+        "required_document_keys": required_document_keys,
+        "covered_document_keys": covered_document_keys,
     }
 
 
@@ -525,7 +566,7 @@ def _scope_path_error(review_code_root: Path, relative: str) -> str:
 def validate_observation_against_plan(
     item: dict[str, Any], state_root: Path, label: str,
 ) -> list[str]:
-    plan, index, errors = load_validated_plan(state_root)
+    _plan, index, errors = load_validated_plan(state_root)
     if errors:
         return [f"{label}: {error}" for error in errors]
     plan_path = state_root / PLAN_NAME
@@ -537,17 +578,25 @@ def validate_observation_against_plan(
     if sweep is None:
         errors.append(f"{label}: unknown sweep_id {sweep_id!r}")
         return errors
+    direction = sweep.get("direction")
+    if item.get("direction") not in {None, direction}:
+        errors.append(
+            f"{label}: direction does not match assigned sweep {direction!r}"
+        )
     field_map = {
-        "architecture_boundaries": "architecture_boundaries",
-        "implementation_planes": "implementation_planes",
-        "parallel_path_ids": "parallel_path_ids",
+        "architecture_boundaries": ("architecture_boundaries", index["boundaries"]),
+        "implementation_planes": ("implementation_planes", index["planes"]),
+        "parallel_path_ids": ("parallel_path_ids", index["parallel_paths"]),
     }
-    for field, plan_field in field_map.items():
+    for field, (plan_field, known_index) in field_map.items():
         values = item.get(field)
         if not isinstance(values, list):
             continue
+        unknown = set(values) - set(known_index)
+        if unknown:
+            errors.append(f"{label}: {field} contains unknown IDs: {sorted(unknown)}")
         outside = set(values) - set(sweep.get(plan_field, []))
-        if outside:
+        if direction == "code_to_design" and outside:
             errors.append(f"{label}: {field} escapes assigned sweep: {sorted(outside)}")
     observation_lenses = item.get("review_lenses")
     if isinstance(observation_lenses, list):
@@ -558,14 +607,24 @@ def validate_observation_against_plan(
             )
     observation_sections = item.get("design_section_ids")
     if isinstance(observation_sections, list):
-        outside_sections = set(observation_sections) - set(
-            sweep.get("design_section_ids", [])
-        )
-        if outside_sections:
+        unknown_sections = set(observation_sections) - set(index["design_sections"])
+        if unknown_sections:
             errors.append(
-                f"{label}: design_section_ids escape assigned sweep: "
-                f"{sorted(outside_sections)}"
+                f"{label}: design_section_ids contain unknown IDs: "
+                f"{sorted(unknown_sections)}"
             )
+        if direction == "design_to_code":
+            assigned_documents = set(sweep.get("document_keys", []))
+            escaped_documents = {
+                index["section_documents"].get(section_id, "")
+                for section_id in observation_sections
+                if section_id in index["section_documents"]
+            } - assigned_documents
+            if escaped_documents:
+                errors.append(
+                    f"{label}: design_section_ids escape assigned document groups: "
+                    f"{sorted(escaped_documents)}"
+                )
     observation_planes = {
         str(value) for value in item.get("implementation_planes", [])
         if isinstance(value, str) and value
@@ -609,15 +668,16 @@ def validate_observation_against_plan(
             errors.append(
                 f"{label}: parallel path {path_id} has no linked observation plane"
             )
-    owned_paths = list(sweep.get("anchor_paths", []))
-    for evidence_index, evidence in enumerate(item.get("code_evidence", []), start=1):
-        if not isinstance(evidence, dict):
-            continue
-        file_value = evidence.get("file")
-        if not isinstance(file_value, str) or not _in_scope(file_value, owned_paths):
-            errors.append(
-                f"{label}: code_evidence[{evidence_index}] is outside assigned primary paths"
-            )
+    if direction == "code_to_design":
+        owned_paths = list(sweep.get("anchor_paths", []))
+        for evidence_index, evidence in enumerate(item.get("code_evidence", []), start=1):
+            if not isinstance(evidence, dict):
+                continue
+            file_value = evidence.get("file")
+            if not isinstance(file_value, str) or not _in_scope(file_value, owned_paths):
+                errors.append(
+                    f"{label}: code_evidence[{evidence_index}] is outside assigned primary paths"
+                )
     return errors
 
 
@@ -652,6 +712,46 @@ def validate_sweep_coverage(
     return errors
 
 
+def _completed_scout_receipts(
+    state_root: Path, *, session_id: str, plan_digest: str,
+    slices: dict[str, dict[str, Any]],
+) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    """Load completion receipts independently of whether a scout found candidates."""
+    values, errors = ac.load_jsonl(state_root / SCOUT_RECEIPTS_NAME)
+    completed: dict[str, dict[str, Any]] = {}
+    for index, receipt in enumerate(values, start=1):
+        label = f"{SCOUT_RECEIPTS_NAME}:{index}"
+        sweep_id = receipt.get("sweep_id")
+        if not isinstance(sweep_id, str) or not sweep_id:
+            errors.append(f"{label}: sweep_id must be a non-empty string")
+            continue
+        sweep = slices.get(sweep_id)
+        if sweep is None:
+            errors.append(f"{label}: unknown sweep_id {sweep_id!r}")
+            continue
+        if receipt.get("session_id") != session_id:
+            errors.append(f"{label}: session_id does not match current session")
+            continue
+        if receipt.get("risk_sweep_plan_sha256") != plan_digest:
+            errors.append(f"{label}: risk_sweep_plan_sha256 is stale")
+            continue
+        if receipt.get("direction") not in {None, sweep.get("direction")}:
+            errors.append(f"{label}: direction does not match current plan slice")
+            continue
+        if receipt.get("status") != "complete":
+            continue
+        candidate_count = receipt.get("candidate_count")
+        if candidate_count is not None and (
+            not isinstance(candidate_count, int)
+            or isinstance(candidate_count, bool)
+            or candidate_count < 0
+        ):
+            errors.append(f"{label}: candidate_count must be a non-negative integer")
+            continue
+        completed[sweep_id] = receipt
+    return completed, errors
+
+
 def validate_risk_coverage(
     risks: dict[str, dict[str, Any]], state_root: Path,
 ) -> tuple[list[str], dict[str, Any]]:
@@ -662,7 +762,10 @@ def validate_risk_coverage(
         errors.extend(validate_observation_against_plan(
             item, state_root, f"risk ({observation_id})",
         ))
-    observed_sweeps = {str(item.get("sweep_id") or "") for item in risks.values()}
+    observed_sweeps = {
+        str(item.get("sweep_id") or "") for item in risks.values()
+        if item.get("sweep_id")
+    }
     observed_boundaries = {
         str(value) for item in risks.values()
         for value in item.get("architecture_boundaries", []) if value
@@ -676,13 +779,55 @@ def validate_risk_coverage(
         for value in item.get("parallel_path_ids", []) if value
     }
     expected_sweeps = set(index["slices"])
-    missing_sweeps = expected_sweeps - observed_sweeps
+    state = ac.load_json(state_root / "agent_loop_state.json")
+    plan_digest = ac.sha256_file(state_root / PLAN_NAME)
+    completed_receipts, receipt_errors = _completed_scout_receipts(
+        state_root,
+        session_id=str(state.get("session_id") or ""),
+        plan_digest=plan_digest,
+        slices=index["slices"],
+    )
+    errors.extend(receipt_errors)
+    completed_sweeps = set(completed_receipts)
+    missing_sweeps = expected_sweeps - completed_sweeps
     if missing_sweeps:
         errors.append(
-            f"risk observations do not include completed sweeps: {sorted(missing_sweeps)}"
+            f"scout receipts do not include completed sweeps: {sorted(missing_sweeps)}"
         )
+    unexpected_observation_sweeps = observed_sweeps - completed_sweeps
+    if unexpected_observation_sweeps:
+        errors.append(
+            "risk observations belong to scouts without completion receipts: "
+            f"{sorted(unexpected_observation_sweeps)}"
+        )
+    for sweep_id, receipt in completed_receipts.items():
+        candidate_ids = receipt.get("candidate_ids")
+        if not isinstance(candidate_ids, list) or any(
+            not isinstance(value, str) or not value for value in candidate_ids
+        ) or len(set(candidate_ids)) != len(candidate_ids):
+            errors.append(
+                f"scout receipt {sweep_id}: candidate_ids must be unique strings"
+            )
+            continue
+        if receipt.get("candidate_count") != len(candidate_ids):
+            errors.append(
+                f"scout receipt {sweep_id}: candidate_count does not match candidate_ids"
+            )
+        observed_ids = {
+            observation_id for observation_id, item in risks.items()
+            if item.get("sweep_id") == sweep_id
+        }
+        if set(candidate_ids) != observed_ids:
+            errors.append(
+                f"scout receipt {sweep_id}: merged candidates do not match handoff; "
+                f"missing={sorted(set(candidate_ids) - observed_ids)}, "
+                f"extra={sorted(observed_ids - set(candidate_ids))}"
+            )
     return errors, {
         "expected_sweeps": sorted(expected_sweeps),
+        "completed_sweeps": sorted(completed_sweeps),
+        "missing_sweeps": sorted(missing_sweeps),
+        "closed": not missing_sweeps and not receipt_errors,
         "observed_sweeps": sorted(observed_sweeps),
         "required_boundaries": sorted(index["required_boundaries"]),
         "required_planes": sorted(index["required_planes"]),
@@ -727,6 +872,15 @@ def run(args: argparse.Namespace) -> int:
             "required_boundaries": len(index.get("required_boundaries", [])),
             "required_planes": len(index.get("required_planes", [])),
             "required_paths": len(index.get("required_paths", [])),
+            "required_document_groups": len(index.get("required_document_keys", [])),
+            "design_to_code_slices": sum(
+                1 for item in index.get("slices", {}).values()
+                if item.get("direction") == "design_to_code"
+            ),
+            "code_to_design_slices": sum(
+                1 for item in index.get("slices", {}).values()
+                if item.get("direction") == "code_to_design"
+            ),
         },
         "errors": errors,
     }

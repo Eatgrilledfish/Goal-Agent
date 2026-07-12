@@ -129,7 +129,7 @@ def test_task_plan_requires_one_task_for_every_accepted_claim(workspace):
     )
 
 
-def test_code_to_design_task_may_link_related_observations_from_multiple_sweeps(workspace):
+def test_atomic_task_rejects_linking_a_second_scout_candidate(workspace):
     populate_handoffs(workspace)
     _prepare_claim_scope(workspace)
     state = workspace["state"]
@@ -148,7 +148,12 @@ def test_code_to_design_task_may_link_related_observations_from_multiple_sweeps(
 
     proc = _run_stage(workspace, "task-plan-check", check=False)
 
-    assert proc.returncode == 0
+    assert proc.returncode == 1
+    trace = ac.load_json(workspace["logs"] / "trace" / "task_plan_validation.json")
+    assert any(
+        "risk_observation_ids must preserve exactly the selected candidate" in error
+        for error in trace["errors"]
+    )
 
 
 def test_task_check_requires_each_task_in_exactly_one_round(workspace):
@@ -261,16 +266,20 @@ def test_initial_frontier_allows_design_linked_entry_without_sweep_quota(workspa
     assert isinstance(state, Path)
     tasks, errors = ac.load_jsonl(state / "investigation_tasks.jsonl")
     assert errors == []
-    for task in tasks:
-        task["exploration_mode"] = "design-to-code obligation tracing"
-        task["risk_observation_ids"] = []
-    _rewrite_jsonl(state / "investigation_tasks.jsonl", tasks)
+    design_tasks = [
+        task for task in tasks
+        if task["exploration_mode"] == "design-to-code obligation tracing"
+    ]
+    assert len(design_tasks) == 1
+    assert design_tasks[0]["risk_observation_ids"] == [
+        design_tasks[0]["candidate_id"]
+    ]
 
     proc = _run_stage(workspace, "task-plan-check", check=False)
     assert proc.returncode == 0
 
 
-def test_initial_frontier_does_not_require_every_sweep_to_seed_a_task(workspace):
+def test_task_cannot_hide_scout_origin_by_relabeling_mode(workspace):
     populate_handoffs(workspace)
     _prepare_claim_scope(workspace)
     state = workspace["state"]
@@ -288,7 +297,12 @@ def test_initial_frontier_does_not_require_every_sweep_to_seed_a_task(workspace)
 
     proc = _run_stage(workspace, "task-plan-check", check=False)
 
-    assert proc.returncode == 0
+    assert proc.returncode == 1
+    trace = ac.load_json(workspace["logs"] / "trace" / "task_plan_validation.json")
+    assert any(
+        "exploration_mode does not match candidate direction" in error
+        for error in trace["errors"]
+    )
 
 
 def test_initial_frontier_rejects_code_risk_as_its_only_entry(workspace):
@@ -387,7 +401,6 @@ def test_first_round_can_defer_other_parallel_planes_to_coverage(workspace):
     assert errors == []
     tasks[0]["parallel_path_ids"] = ["PATH-SERVICE"]
     tasks[0]["implementation_planes"] = ["PLANE-SERVICE", "PLANE-ADAPTER"]
-    tasks[1]["parallel_path_ids"] = ["PATH-SERVICE"]
     _rewrite_jsonl(state / "investigation_tasks.jsonl", tasks)
 
     proc = _run_stage(workspace, "task-plan-check", check=False)

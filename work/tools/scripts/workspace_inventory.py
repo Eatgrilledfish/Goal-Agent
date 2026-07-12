@@ -20,6 +20,7 @@ import agent_common as ac
 
 
 ARTIFACT_NAMES = {
+    "agent_context": "agent_context.json",
     "architecture_map": "architecture_map.json",
     "risk_sweep_plan": "risk_sweep_plan.json",
     "design_agent_manifest": "design_agent_manifest.json",
@@ -375,7 +376,7 @@ def loop_contract(
     state_root = Path(paths["state_root"])
     artifacts = {name: str(state_root / filename) for name, filename in ARTIFACT_NAMES.items()}
     return {
-        "contract_version": 19,
+        "contract_version": 20,
         "execution_model": "opencode-owned-model-driven-loop",
         "session": {
             "session_id": session_id,
@@ -401,11 +402,11 @@ def loop_contract(
             },
             {
                 "id": "design_inventory",
-                "owner": "spec-analyst",
+                "owner": "deterministic-helper",
                 "output": artifacts["design_inventory"],
                 "done_when": (
-                    "Every manifest document group has an evidence-backed scope relation and a complete bounded section/behavior map; "
-                    "required and in-scope source files have no uncovered spans, while no implementation verdict is produced."
+                    "Every design file is covered by deterministic, bounded source ranges. "
+                    "The inventory is a retrieval index and contains no implementation verdict."
                 ),
             },
             {
@@ -413,22 +414,19 @@ def loop_contract(
                 "owner": "risk-explorer",
                 "output": [artifacts["risk_sweep_plan"], artifacts["risk_observations"]],
                 "done_when": (
-                    "A digest-bound plan covers every required architecture ID through focused, non-overlapping primary code scopes of at most six implementation planes; "
-                    "each scope selects at most twelve semantically relevant inventory sections through both code-to-design and design-to-code retrieval; each scope receives the complete lens portfolio and emits at most eight design-linked semantic leads, "
-                    "and the scheduler runs at most two mutually exclusive tasks at once while design inventory may occupy one slot."
+                    "Requirement-centric design-to-code scouts own every in-scope document group and search the whole repository; "
+                    "non-overlapping code-to-design scouts own the mapped code anchors. Every scout records completion even when it emits zero candidates, and only suspected mismatches enter the candidate ledger."
                 ),
             },
             {
                 "id": "design_claim_resolution",
-                "owner": "spec-analyst",
+                "owner": "deterministic-helper",
                 "output": [
                     artifacts["design_lookup_requests"], artifacts["design_coverage"],
                     artifacts["design_claims"],
                 ],
                 "done_when": (
-                    "The strongest design-code trace candidates are materialized as atomic claims from source_ref spans; "
-                    "the evidence-pair portfolio is capped at 12 without document quotas, "
-                    "and exact quotes/source hashes are derived deterministically."
+                    "The model ranks candidate IDs only. A deterministic projection preserves each selected candidate's requirement, source range, code anchors, and mismatch signal while materializing at most 12 claims."
                 ),
             },
             {
@@ -442,7 +440,7 @@ def loop_contract(
             },
             {
                 "id": "investigation_planning",
-                "owner": "orchestrator",
+                "owner": "deterministic-helper",
                 "output": artifacts["investigation_tasks"],
                 "done_when": (
                     "Every accepted evidence-pair claim is converted into a claim-bound task; branch and hypothesis are deterministic projections of the claim, while code focus comes from its trace candidate."
@@ -474,19 +472,17 @@ def loop_contract(
             },
             {
                 "id": "coverage_audit",
-                "owner": "coverage-critic",
+                "owner": "deterministic-helper",
                 "output": [artifacts["semantic_coverage"], artifacts["coverage_audit"]],
                 "done_when": (
-                    "Every accepted claim has a complete finding/critic or structured defer, then one supplement decision accounts for every "
-                    "applicable design section/behavior family plus architecture boundaries, parallel planes, modes, lenses, "
-                    "unmapped risks, and critic evidence requests."
+                    "Every accepted claim has a complete finding and the current evidence relationships are mechanically projected into investigated coverage or stable recorded gaps; no supplement is created."
                 ),
             },
             {
                 "id": "final_judgement",
                 "owner": "final-judge",
                 "output": artifacts["verdicts"],
-                "done_when": "The frontier and optional single supplement are drained and every finding has one evidence-bound final verdict.",
+                "done_when": "The selected frontier is drained and every finding has one evidence-bound final verdict.",
             },
         ],
         "handoffs": [
@@ -496,15 +492,7 @@ def loop_contract(
                 "read_roots": [paths["review_code_root"]],
             },
             {
-                "from": "orchestrator", "to": "spec-analyst",
-                "inputs": [
-                    artifacts["design_agent_manifest"], artifacts["design_inventory"],
-                    artifacts["design_lookup_requests"],
-                ],
-                "read_roots": [paths["review_design_root"]],
-            },
-            {
-                "from": "spec-analyst", "to": "spec-critic",
+                "from": "deterministic-helper", "to": "spec-critic",
                 "inputs": [
                     artifacts["design_agent_manifest"], artifacts["design_coverage"],
                     artifacts["design_inventory"], artifacts["design_claims"],
@@ -535,20 +523,6 @@ def loop_contract(
                     artifacts["critic_reviews"], artifacts["dynamic_probes"],
                 ],
                 "read_roots": [paths["review_code_root"], paths["review_design_root"]],
-            },
-            {
-                "from": "orchestrator", "to": "coverage-critic",
-                "inputs": [
-                    str(state_root / "workspace_manifest.json"),
-                    str(state_root / "agent_loop_contract.json"),
-                    artifacts["architecture_map"], artifacts["design_inventory"], artifacts["design_coverage"],
-                    artifacts["design_claims"], artifacts["claim_review_scope"],
-                    artifacts["risk_observations"],
-                    artifacts["investigation_tasks"], artifacts["investigation_findings"],
-                    artifacts["dynamic_probes"], artifacts["critic_reviews"],
-                    artifacts["rounds"], artifacts["coverage_supplement_history"],
-                ],
-                "read_roots": [],
             },
             {
                 "from": "final-judge", "to": "helper-validator",
@@ -629,14 +603,10 @@ def loop_contract(
                 ),
                 "required_phase_roles": [
                     {"phase": "architecture_mapping", "role": "orchestrator"},
-                    {"phase": "design_inventory", "role": "spec-analyst"},
                     {"phase": "code_risk_backtracking", "role": "risk-explorer"},
-                    {"phase": "design_claim_resolution", "role": "spec-analyst"},
                     {"phase": "design_claim_review", "role": "spec-critic"},
-                    {"phase": "investigation_planning", "role": "orchestrator"},
                     {"phase": "investigation", "role": "code-investigator"},
                     {"phase": "critic_review", "role": "evidence-critic"},
-                    {"phase": "coverage_audit", "role": "coverage-critic"},
                     {"phase": "final_judgement", "role": "final-judge"},
                 ],
                 "candidate_checkpoint_ids": {
@@ -647,13 +617,7 @@ def loop_contract(
                 },
                 "portfolio_checkpoint_scope_ids": {
                     "architecture_mapping/orchestrator": "ARCHITECTURE-MAP",
-                    "design_inventory/spec-analyst": "DESIGN-INVENTORY",
-                    "design_claim_resolution/spec-analyst": "current ROUND-*",
-                    "design_claim_review/spec-critic": "current ROUND-*",
-                    "investigation_planning/orchestrator": "current ROUND-*",
-                    "coverage_audit/coverage-critic": (
-                        "COVERAGE-AUDIT-INITIAL or COVERAGE-AUDIT-FINAL; final is required"
-                    ),
+                    "design_claim_review/spec-critic": "claim_review_scope.round_id",
                     "final_judgement/final-judge": "FINAL-JUDGEMENT",
                 },
             },
@@ -690,8 +654,8 @@ def loop_contract(
             "lens_rule": (
                 "Every portfolio lens must be marked investigated, inapplicable, or gap_recorded with evidence. An investigated lens must reference "
                 "real task IDs and finding IDs whose artifacts explicitly name that lens. Inapplicable requires referenced design groups "
-                "and architecture boundaries plus a counterfactual explanation. gap_recorded names the missing evidence and may motivate the "
-                "single coverage supplement. Listing a lens only in a round is insufficient."
+                "and architecture boundaries plus a counterfactual explanation. gap_recorded names the missing evidence; "
+                "it does not create a fallback round. Listing a lens only in a round is insufficient."
             ),
             "claim_rule": (
                 "Design inventory is the searchable breadth map. Materialize at most 12 claims from either validated design-linked observations or design sections mapped to concrete architecture planes/capability surfaces, including structured capability-absence evidence; do not allocate claims by document count. "
@@ -734,21 +698,19 @@ def loop_contract(
             "round_artifact": artifacts["rounds"],
             "max_tasks_per_round": 4,
             "maximum_initial_frontier_rounds": 3,
-            "maximum_coverage_supplement_rounds": 1,
+            "maximum_coverage_supplement_rounds": 0,
             "initial_frontier_policy": (
                 "Investigate the at most 12 accepted evidence pairs in at most three rounds of four tasks. Later rounds may be planned in advance but execute only after the earliest open round drains. "
                 "Prioritize direct normative conflicts, externally visible behavior, and concrete absence evidence over document diversity."
             ),
             "coverage_supplement_history": (
-                "prepare and coverage-check exclusively write the history artifact. Agents read it but never create, reset, or edit it; "
-                "the first valid non-empty next-task snapshot is immutable and any different second request is rejected."
+                "The history remains empty in the one-shot competition workflow; no fallback supplement is created."
             ),
             "on_failed_gate": (
-                "If time remains, start another frozen round only from a concrete uncovered design behavior, risk observation, "
-                "architecture boundary, execution plane, or critic evidence request; never choose work from a count target."
+                "Repair only the earliest invalid artifact or candidate; do not create a fallback breadth round."
             ),
             "zero_finding_response": (
-                "Finding counts are not a coverage input. Critique completed candidates promptly, then run coverage after the initial frontier and allow at most one evidence-backed supplement."
+                "Finding counts are not a coverage input. Critique completed candidates promptly, then mechanically record remaining coverage gaps without a fallback round."
             ),
             "minimum_strategy_change": (
                 "A retry must change an exploration mode and at least one of document group, architecture boundary, or portfolio lens."
@@ -762,7 +724,7 @@ def loop_contract(
         },
         "stop_conditions": {
             "success": [
-                "Coverage audit explains remaining gaps after the initial frontier and at most one evidence-driven supplement.",
+                "Coverage materialization explains remaining gaps after the selected frontier.",
                 "Every confirmed finding passed independent critique and source verification.",
                 "The final gate passes within the time budget.",
             ],
@@ -1074,7 +1036,7 @@ def prepare(args: argparse.Namespace) -> int:
         "completed_phases": [],
         "metrics": {"claims": 0, "investigations": 0, "critic_reviews": 0, "confirmed": 0},
         "next_actions": [
-            "Read INSTRUCTION.md, the skill, workspace_manifest.json, and agent_loop_contract.json.",
+            "Read INSTRUCTION.md, the skill, agent_context.json, and agent_loop_contract.json.",
             "Map repository architecture and integration boundaries.",
             "After architecture-check, validate a focused multi-slice risk plan and schedule one design-inventory task alongside disjoint code-risk sweeps under the global concurrency limit of two.",
         ],
@@ -1107,13 +1069,39 @@ def prepare(args: argparse.Namespace) -> int:
         "preflight_problems": list(manifest.get("preflight_problems", [])),
     }
     ac.save_json(state_root / ARTIFACT_NAMES["design_agent_manifest"], design_only_manifest)
+    ac.save_json(state_root / ARTIFACT_NAMES["agent_context"], {
+        "session_id": session_id,
+        "started_at": started_at,
+        "deadline_at": state.get("deadline_at"),
+        "paths": {
+            key: paths[key] for key in (
+                "review_code_root", "review_design_root", "state_root",
+                "result_root", "log_root",
+            )
+        },
+        "code": {
+            "file_count": code.get("file_count", 0),
+            "suffix_counts": code.get("suffix_counts", {}),
+            "top_level_counts": code.get("top_level_counts", {}),
+        },
+        "design": {
+            "document_count": len(design_docs),
+            "document_groups": [
+                {
+                    "document_key": group.get("document_key"),
+                    "members": group.get("members", []),
+                }
+                for group in document_groups
+            ],
+        },
+    })
     ac.save_json(state_root / "agent_loop_contract.json", contract)
     ac.save_json(state_root / ARTIFACT_NAMES["state"], state)
     supplement_history_path = state_root / ARTIFACT_NAMES["coverage_supplement_history"]
     if resumed and not supplement_history_path.is_file():
         problems.append(
             "resumed session is missing coverage_supplement_history.json; "
-            "refusing to reset the one-supplement ledger"
+            "refusing to reset the immutable empty-history guard"
         )
     elif not resumed:
         ac.save_json(supplement_history_path, {

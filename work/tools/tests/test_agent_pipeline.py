@@ -205,6 +205,20 @@ def append(path: Path, value: dict) -> None:
     ac.append_jsonl(path, value)
 
 
+def prepare_replay_with_scout_receipts(
+    *, source_state: Path, replay_root: Path, stage: str,
+) -> None:
+    """Prepare a legacy stage replay plus the contract-20 scout completion ledger."""
+    stage_replay.prepare_replay(
+        source_state=source_state, replay_root=replay_root,
+        stage=stage, run_local=True,
+    )
+    receipts = source_state / "scout_receipts.jsonl"
+    if receipts.is_file():
+        target = replay_root / "state" / "scout_receipts.jsonl"
+        target.write_bytes(receipts.read_bytes())
+
+
 def record_critic_history(state: Path, critic: dict) -> None:
     ac.append_jsonl(state / "critic_review_history.jsonl", {
         "recorded_at": ac.now_iso(),
@@ -363,183 +377,173 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
         "slices": [
             {
                 "sweep_id": "RISK-SWEEP-API",
+                "direction": "code_to_design",
+                "document_keys": [],
                 "architecture_boundaries": ["BOUNDARY-API"],
                 "implementation_planes": ["PLANE-SERVICE"],
                 "parallel_path_ids": [],
                 "anchor_paths": ["service.py"],
                 "review_lenses": lenses,
-                "design_section_ids": ["SECTION-CONTRACT"],
                 "scope_rationale": "Own the public service API component.",
             },
             {
                 "sweep_id": "RISK-SWEEP-AUDIT",
+                "direction": "code_to_design",
+                "document_keys": [],
                 "architecture_boundaries": ["BOUNDARY-AUDIT"],
                 "implementation_planes": ["PLANE-AUDIT"],
                 "parallel_path_ids": [],
                 "anchor_paths": ["audit.py"],
                 "review_lenses": lenses,
-                "design_section_ids": ["SECTION-CONTRACT"],
                 "scope_rationale": "Own the independent audit publishing component.",
+            },
+            {
+                "sweep_id": "RISK-SWEEP-DESIGN",
+                "direction": "design_to_code",
+                "document_keys": ["contract"],
+                "architecture_boundaries": [],
+                "implementation_planes": [],
+                "parallel_path_ids": [],
+                "anchor_paths": [],
+                "review_lenses": lenses,
+                "scope_rationale": "Own the complete required service contract group.",
             },
         ],
     })
     risk_plan_digest = ac.sha256_file(state / "risk_sweep_plan.json")
-    risk = {
-        "observation_id": "RISK-API-001",
-        "session_id": workspace["session_id"],
-        "sweep_id": "RISK-SWEEP-API",
-        "risk_sweep_plan_sha256": risk_plan_digest,
-        "behavior_question": "What behavior is exposed when the public charge entry point is called?",
-        "observed_code_behavior": "The public entry point accepts an amount and returns an accepted result without a guard.",
-        "design_section_ids": ["SECTION-CONTRACT"],
-        "design_alignment": "The section defines the behavior of the same public service entry point.",
-        "review_lenses": lenses[:3],
-        "architecture_boundaries": ["BOUNDARY-API"],
-        "implementation_planes": ["PLANE-SERVICE"],
-        "parallel_path_ids": [],
-        "code_evidence": [{
-            "file": "service.py", "line_start": 1, "line_end": 2,
-            "symbol": "charge", "snippet": 'def charge(amount):\n    return {"accepted": True}',
-        }],
-        "false_positive_checks": [
-            {
-                "question": "Is a guard called before returning?", "method": "control-flow read",
-                "target": "charge", "result": "The function returns directly.",
-            },
-            {
-                "question": "Does another public charge entry point replace this one?", "method": "symbol search",
-                "target": "service.py", "result": "No alternate charge entry point exists.",
-            },
-        ],
-        "design_lookup_questions": [
-            "Does the service contract constrain acceptance behavior for amount inputs?",
-        ],
-        "tool_trace": [
-            {
-                "seq": 1, "kind": "design_read", "tool": "read",
-                "target": "contract.md:1-6", "purpose": "Read the assigned behavior section.",
-                "result": "The section defines externally visible service behavior.",
-            },
-            {
-                "seq": 2, "kind": "code_search", "tool": "search", "target": "charge",
-                "purpose": "Locate the public entry point.", "result": "Found service.py:1.",
-            },
-            {
-                "seq": 3, "kind": "code_read", "tool": "read", "target": "service.py:1-2",
-                "purpose": "Derive the reachable behavior.", "result": "The function returns accepted directly.",
-            },
-            {
-                "seq": 4, "kind": "reverse_check", "tool": "search", "target": "charge callers and alternatives",
-                "purpose": "Check for a compensating path.", "result": "No alternate enforcement path exists.",
-            },
-        ],
-    }
-    audit_risk = {
-        "observation_id": "RISK-AUDIT-001",
-        "session_id": workspace["session_id"],
-        "sweep_id": "RISK-SWEEP-AUDIT",
-        "risk_sweep_plan_sha256": risk_plan_digest,
-        "behavior_question": "What behavior is exposed when an audit event is published?",
-        "observed_code_behavior": "The independent adapter immediately reports the event as published.",
-        "design_section_ids": ["SECTION-CONTRACT"],
-        "design_alignment": "The section defines externally visible service and audit behavior.",
-        "review_lenses": lenses[:3],
-        "architecture_boundaries": ["BOUNDARY-AUDIT"],
-        "implementation_planes": ["PLANE-AUDIT"],
-        "parallel_path_ids": [],
-        "code_evidence": [{
-            "file": "audit.py", "line_start": 1, "line_end": 2,
-            "symbol": "publish_event",
-            "snippet": 'def publish_event(event):\n    return {"published": True, "event": event}',
-        }],
-        "false_positive_checks": [
-            {
-                "question": "Is another publisher called first?", "method": "control-flow read",
-                "target": "publish_event", "result": "The adapter returns directly.",
-            },
-            {
-                "question": "Is this adapter unreachable?", "method": "entry review",
-                "target": "audit.py", "result": "It is a public adapter function.",
-            },
-        ],
-        "design_lookup_questions": [
-            "Does the service contract constrain how audit publication is acknowledged?",
-        ],
-        "tool_trace": [
-            {
-                "seq": 1, "kind": "design_read", "tool": "read",
-                "target": "contract.md:1-6", "purpose": "Read the assigned behavior section.",
-                "result": "The section defines externally visible audit behavior.",
-            },
-            {
-                "seq": 2, "kind": "code_search", "tool": "search",
-                "target": "publish_event", "purpose": "Locate the adapter entry point.",
-                "result": "Found audit.py:1.",
-            },
-            {
-                "seq": 3, "kind": "code_read", "tool": "read",
-                "target": "audit.py:1-2", "purpose": "Derive the adapter behavior.",
-                "result": "The adapter reports publication directly.",
-            },
-            {
-                "seq": 4, "kind": "reverse_check", "tool": "search",
-                "target": "audit publisher alternatives", "purpose": "Check compensation paths.",
-                "result": "No alternate publisher exists.",
-            },
-        ],
-    }
-    risk_observations: list[dict] = []
-    risk_sources: list[tuple[str, dict]] = []
-    if count >= 2:
-        risk_sources.append(("RISK-API", risk))
-    if count >= 3:
-        risk_sources.append(("RISK-AUDIT", audit_risk))
-    for prefix, base in risk_sources:
-        for chunk_index, start in enumerate(range(0, len(lenses), 3), start=1):
-            item = dict(base)
-            item["observation_id"] = f"{prefix}-{chunk_index:03d}"
-            item["review_lenses"] = lenses[start:start + 3]
-            item["behavior_question"] = (
-                f"Under the assigned lens group {chunk_index}, "
-                + str(base["behavior_question"])
-            )
-            risk_observations.append(item)
-            append(state / "risk_observations.jsonl", item)
-    inventory = design_source_materializer.materialize_inventory({
-        "session_id": workspace["session_id"],
-        "document_groups": [{
-            "document_key": "contract",
-            "members": ["contract.md"],
-            "scope_relation": "required",
-            "scope_evidence": {
-                "source_ref": {
-                    "path": "contract.md", "line_start": 1, "line_end": 3,
-                },
-            },
-            "sections": [{
-                "section_id": "SECTION-CONTRACT",
-                "source_ref": {
-                    "path": "contract.md", "line_start": 1, "line_end": 6,
-                },
-                "behavior_families": ["externally visible service contract"],
-                "ambiguities": [],
-            }],
-        }],
-    }, Path(workspace["design"]))
-    ac.save_json(state / "design_inventory.json", inventory)
     specs = [
         (3, "The service must reject negative amounts.", 1, 2, "charge", 'def charge(amount):\n    return {"accepted": True}'),
         (4, "The service must expire sessions after 30 minutes.", 4, 5, "session_expired", "def session_expired(minutes):\n    return minutes > 60"),
         (5, "The service must deny exports for guest users.", 7, 8, "can_export", "def can_export(role):\n    return True"),
         (6, "The service must preserve all submitted audit events.", 10, 11, "record_event", "def record_event(events, event):\n    return events[-9:] + [event]"),
     ]
+    risk_observations: list[dict] = []
+    candidates_by_index: dict[int, dict] = {}
+    for index, (design_line, quote, code_start, code_end, symbol, snippet) in enumerate(
+        specs[:count], start=1,
+    ):
+        direction = "design_to_code" if index == 1 else "code_to_design"
+        audit_scope = index >= 3
+        sweep_id = (
+            "RISK-SWEEP-DESIGN" if index == 1
+            else "RISK-SWEEP-AUDIT" if audit_scope
+            else "RISK-SWEEP-API"
+        )
+        candidate_file = "audit.py" if audit_scope else "service.py"
+        candidate_start = 1 if audit_scope else code_start
+        candidate_end = 2 if audit_scope else code_end
+        candidate_symbol = "publish_event" if audit_scope else symbol
+        candidate_snippet = (
+            'def publish_event(event):\n    return {"published": True, "event": event}'
+            if audit_scope else snippet
+        )
+        task_lenses = (
+            lenses[index - 1::count]
+            if count >= 3 else lenses[(index - 1) * 2:index * 2]
+        )
+        candidate = {
+            "observation_id": f"RISK-API-{index:03d}",
+            "session_id": workspace["session_id"],
+            "sweep_id": sweep_id,
+            "risk_sweep_plan_sha256": risk_plan_digest,
+            "direction": direction,
+            "behavior_question": f"Does {symbol} produce the behavior required by the supplied contract?",
+            "mismatch_signal": "direct_conflict",
+            "design_requirement": {
+                "source_ref": {
+                    "path": "contract.md", "line_start": design_line,
+                    "line_end": design_line,
+                },
+                "subject": "The public service implementation",
+                "trigger": f"A caller invokes {symbol} with an input covered by the contract.",
+                "obligation": quote,
+                "observable_result": quote,
+                "normative_strength": "mandatory",
+                "applicability": "service implementation",
+                "exceptions": ["No exception is declared by the supplied contract."],
+                "ambiguities": ["No ambiguity remains for this fixture requirement."],
+            },
+            "observed_code_behavior": "The reachable implementation returns a result that contradicts the contract.",
+            "design_section_ids": ["SECTION-CONTRACT"],
+            "design_alignment": "The selected contract line governs this public service function.",
+            "review_lenses": task_lenses,
+            "architecture_boundaries": [
+                "BOUNDARY-AUDIT" if audit_scope else "BOUNDARY-API"
+            ],
+            "implementation_planes": [
+                "PLANE-AUDIT" if audit_scope else "PLANE-SERVICE"
+            ],
+            "parallel_path_ids": [],
+            "code_evidence": [{
+                "file": candidate_file, "line_start": candidate_start,
+                "line_end": candidate_end, "symbol": candidate_symbol,
+                "snippet": candidate_snippet,
+            }],
+            "false_positive_checks": [{
+                "question": "Is there an alternate enforcement path?",
+                "method": "call and symbol search", "target": symbol,
+                "result": "No alternate enforcement path exists.",
+            }],
+            "design_lookup_questions": [
+                f"What exact observable behavior does the contract require for {symbol}?",
+            ],
+            "tool_trace": [
+                {
+                    "seq": 1, "kind": "design_read", "tool": "read",
+                    "target": f"contract.md:{design_line}", "purpose": "Read the atomic requirement.",
+                    "result": quote,
+                },
+                {
+                    "seq": 2, "kind": "code_search", "tool": "search", "target": symbol,
+                    "purpose": "Locate the public implementation.", "result": f"Found service.py:{code_start}.",
+                },
+                {
+                    "seq": 3, "kind": "code_read", "tool": "read",
+                    "target": f"{candidate_file}:{candidate_start}-{candidate_end}",
+                    "purpose": "Derive reachable behavior.", "result": "Observed contradictory return.",
+                },
+                {
+                    "seq": 4, "kind": "reverse_check", "tool": "search", "target": symbol,
+                    "purpose": "Check alternate enforcement.", "result": "No alternate path exists.",
+                },
+            ],
+        }
+        candidates_by_index[index] = candidate
+        risk_observations.append(candidate)
+        append(state / "risk_observations.jsonl", candidate)
+
+    candidates_by_sweep = {
+        sweep_id: [
+            item for item in risk_observations if item["sweep_id"] == sweep_id
+        ]
+        for sweep_id in (
+            "RISK-SWEEP-API", "RISK-SWEEP-AUDIT", "RISK-SWEEP-DESIGN",
+        )
+    }
+    for sweep_id, candidates in candidates_by_sweep.items():
+        handoff = state / "handoffs" / "risks" / sweep_id / f"{sweep_id}.json"
+        ac.ensure_dir(handoff.parent)
+        handoff.write_text(json.dumps(candidates, ensure_ascii=False) + "\n", encoding="utf-8")
+        append(state / "scout_receipts.jsonl", {
+            "session_id": workspace["session_id"], "sweep_id": sweep_id,
+            "risk_sweep_plan_sha256": risk_plan_digest,
+            "handoff_sha256": ac.sha256_file(handoff), "status": "complete",
+            "candidate_count": len(candidates),
+            "candidate_ids": [item["observation_id"] for item in candidates],
+            "completed_at": ac.now_iso(),
+        })
     for index, (design_line, quote, code_start, code_end, symbol, snippet) in enumerate(specs[:count], start=1):
         claim_id = f"CLAIM-{index:03d}"
+        candidate = candidates_by_index[index]
+        candidate_id = candidate["observation_id"]
+        request_id = f"LOOKUP-{index:03d}"
         task_id = f"TASK-{index:03d}"
         finding_id = f"FINDING-{task_id}"
         review_id = f"CRITIC-{index:03d}"
         claim = design_source_materializer.materialize_claims([{
             "claim_id": claim_id,
+            "candidate_id": candidate_id,
+            "request_id": request_id,
             "session_id": workspace["session_id"],
             "source_ref": {
                 "path": "contract.md",
@@ -550,13 +554,13 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
             "subject": "The public service implementation",
             "trigger": f"A caller invokes {symbol} with an input covered by the contract.",
             "obligation": quote,
-            "exceptions": [],
+            "exceptions": ["No exception is declared by the supplied contract."],
             "observable_result": quote,
             "behavior_family": "externally visible service contract",
             "normative_strength": "mandatory",
             "applicability": "service implementation",
             "priority": "high",
-            "ambiguities": [],
+            "ambiguities": ["No ambiguity remains for this fixture requirement."],
             "probe_oracle": {
                 "testability": "candidate",
                 "preconditions": ["The public service function is callable."],
@@ -566,47 +570,60 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
             },
         }], Path(workspace["design"]))[0]
         append(state / "design_claims.jsonl", claim)
+        append(state / "design_lookup_requests.jsonl", {
+            "request_id": request_id,
+            "candidate_id": candidate_id,
+            "session_id": workspace["session_id"],
+            "origin": "semantic_scout",
+            "origin_id": candidate_id,
+            "sweep_id": candidate["sweep_id"],
+            "direction": candidate["direction"],
+            "document_keys": ["contract"],
+            "section_ids": candidate["design_section_ids"],
+            "question": candidate["behavior_question"],
+            "required_branch": ac.canonical_claim_branch(claim),
+            "mismatch_signal": candidate["mismatch_signal"],
+            "code_evidence": candidate["code_evidence"],
+            "architecture_boundaries": candidate["architecture_boundaries"],
+            "implementation_planes": candidate["implementation_planes"],
+            "parallel_path_ids": candidate["parallel_path_ids"],
+            "review_lenses": candidate["review_lenses"],
+        })
         task_lenses = (
             lenses[index - 1::count]
             if count >= 3 else lenses[(index - 1) * 2:index * 2]
         )
-        audit_scope = index >= 3
-        task_boundary = "BOUNDARY-AUDIT" if audit_scope else "BOUNDARY-API"
-        task_plane = "PLANE-AUDIT" if audit_scope else "PLANE-SERVICE"
-        task_risk = "RISK-AUDIT-001" if audit_scope else "RISK-API-001"
-        exploration_modes = contract["coverage_contract"]["exploration_modes"]
-        task_mode = [
-            exploration_modes[0], exploration_modes[1],
-            exploration_modes[2], exploration_modes[1],
-        ][index - 1]
-        task_boundaries = [task_boundary]
-        task_planes = [task_plane]
-        task_risk_ids = [task_risk] if (
-            task_mode == "code-to-design risk backtracking"
-        ) else []
-        if count == 3 and index == 3:
-            task_mode = "code-to-design risk backtracking"
-            task_risk_ids = ["RISK-AUDIT-001"]
+        task_mode = (
+            "design-to-code obligation tracing"
+            if candidate["direction"] == "design_to_code"
+            else "code-to-design risk backtracking"
+        )
         hypothesis = ac.canonical_claim_hypothesis(claim)
         obligation_sha256 = stage_artifact_validator.claim_obligation_sha256(claim)
         append(state / "investigation_tasks.jsonl", {
             "task_id": task_id,
+            "candidate_id": candidate_id,
+            "request_id": request_id,
             "session_id": workspace["session_id"],
             "claim_id": claim_id,
             "claim_branch": ac.canonical_claim_branch(claim),
             "hypothesis": hypothesis,
             "obligation_sha256": obligation_sha256,
-            "starting_points": ["public service entry point"],
+            "starting_points": [{
+                "file": evidence["file"],
+                "line_start": evidence["line_start"],
+                "line_end": evidence["line_end"],
+            } for evidence in candidate["code_evidence"]],
             "supporting_evidence_needed": ["reachable implementation"],
             "disconfirming_evidence_needed": ["alternate enforcement path"],
             "status": "complete",
             "defer_reason": "",
-            "review_lenses": task_lenses,
+            "review_lenses": candidate["review_lenses"],
             "exploration_mode": task_mode,
-            "architecture_boundaries": task_boundaries,
-            "implementation_planes": task_planes,
-            "parallel_path_ids": [],
-            "risk_observation_ids": task_risk_ids,
+            "architecture_boundaries": candidate["architecture_boundaries"],
+            "implementation_planes": candidate["implementation_planes"],
+            "parallel_path_ids": candidate["parallel_path_ids"],
+            "risk_observation_ids": [candidate_id],
         })
         finding = {
             "finding_id": finding_id,
@@ -909,10 +926,18 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
     ac.save_json(risk_report, {
         "passed": True, "artifact_type": "risk", "errors": [],
         "validated_ids": [item["observation_id"] for item in risk_observations],
-        "expected_sweep_ids": ["RISK-SWEEP-API", "RISK-SWEEP-AUDIT"],
-        "submitted_sweep_ids": ["RISK-SWEEP-API", "RISK-SWEEP-AUDIT"],
-        "validated_sweep_ids": ["RISK-SWEEP-API", "RISK-SWEEP-AUDIT"],
-        "completed_sweep_ids": ["RISK-SWEEP-API", "RISK-SWEEP-AUDIT"],
+        "expected_sweep_ids": [
+            "RISK-SWEEP-API", "RISK-SWEEP-AUDIT", "RISK-SWEEP-DESIGN",
+        ],
+        "submitted_sweep_ids": [
+            "RISK-SWEEP-API", "RISK-SWEEP-AUDIT", "RISK-SWEEP-DESIGN",
+        ],
+        "validated_sweep_ids": [
+            "RISK-SWEEP-API", "RISK-SWEEP-AUDIT", "RISK-SWEEP-DESIGN",
+        ],
+        "completed_sweep_ids": [
+            "RISK-SWEEP-API", "RISK-SWEEP-AUDIT", "RISK-SWEEP-DESIGN",
+        ],
         "missing_sweep_ids": [],
         "closed": True,
         "global_coverage_validated": True,
@@ -1210,7 +1235,7 @@ def test_prepare_is_semantic_neutral_and_writes_agent_contract(workspace):
     assert "paths" not in design_manifest
     assert "code_root" not in json.dumps(design_manifest)
     assert contract["execution_model"] == "opencode-owned-model-driven-loop"
-    assert contract["contract_version"] == 19
+    assert contract["contract_version"] == 20
     assert contract["handoff_integrity"]["max_concurrent_subagent_tasks"] == 2
     assert contract["tool_protocol"]["agent_event_contract"]["required_fields"] == [
         "event", "role", "phase", "scope_id", "scope",
@@ -1222,11 +1247,21 @@ def test_prepare_is_semantic_neutral_and_writes_agent_contract(workspace):
     ]
     assert len(contract["coverage_contract"]["exploration_modes"]) == 3
     assert "dynamic_probe" in contract["coverage_contract"]
-    assert [phase["owner"] for phase in contract["phases"]][:10] == [
-        "orchestrator", "spec-analyst", "risk-explorer",
-        "spec-analyst", "spec-critic", "orchestrator",
+    assert [phase["owner"] for phase in contract["phases"]] == [
+        "orchestrator", "deterministic-helper", "risk-explorer",
+        "deterministic-helper", "spec-critic", "deterministic-helper",
         "code-investigator", "code-investigator", "evidence-critic",
-        "coverage-critic",
+        "deterministic-helper", "final-judge",
+    ]
+    assert contract["tool_protocol"]["agent_event_contract"][
+        "required_phase_roles"
+    ] == [
+        {"phase": "architecture_mapping", "role": "orchestrator"},
+        {"phase": "code_risk_backtracking", "role": "risk-explorer"},
+        {"phase": "design_claim_review", "role": "spec-critic"},
+        {"phase": "investigation", "role": "code-investigator"},
+        {"phase": "critic_review", "role": "evidence-critic"},
+        {"phase": "final_judgement", "role": "final-judge"},
     ]
     assert (state / "risk_observations.jsonl").is_file()
     assert (state / "dynamic_probes.jsonl").is_file()
@@ -2234,25 +2269,27 @@ def test_finding_self_check_reconstructs_template_instead_of_trusting_the_file(w
 
 def test_instruction_allows_valid_candidate_to_merge_without_waiting_for_its_peer():
     instruction = (ROOT / "INSTRUCTION.md").read_text(encoding="utf-8")
+    orchestrator = (ROOT / "work" / "skills" / "orchestrator.md").read_text(
+        encoding="utf-8"
+    )
     assert "--check-file" in instruction
     assert "--report" in instruction
     assert "handoffs/investigators/${TASK_ID}/${TASK_ID}.json" in instruction
-    assert "--input-dir ${STATE_ROOT}/handoffs/investigators/${TASK_ID}" in instruction
-    assert "不阻塞已验证 candidate" in instruction
-    assert "valid_task_ids" in instruction
+    assert "仅merge该candidate目录" in instruction
+    assert "一个 candidate失败不能阻塞有效 peer" in orchestrator
     assert "全部 handoff self-check 通过后原子 merge" not in instruction
     assert "部分批次不得继续" not in instruction
     assert "${REVIEW_CODE_ROOT}" in instruction
-    assert "goal_runner.py task-lifecycle-check" in instruction
+    assert "Merge会更新task lifecycle" in instruction
 
 
 def test_instruction_requires_risk_plan_gate_before_parallel_risk_tasks():
     instruction = (ROOT / "INSTRUCTION.md").read_text(encoding="utf-8")
     gate_position = instruction.index("goal_runner.py risk-plan-check")
-    launch_position = instruction.index("通过后按plan最多并发两个fresh `risk-explorer`")
+    launch_position = instruction.index("按 plan最多并发两个 fresh `risk-explorer`")
     assert gate_position < launch_position
-    assert "primary code scope" in instruction[:launch_position]
-    assert "互斥primary code scope" in instruction[:launch_position]
+    assert "primary code anchors" in instruction[:launch_position]
+    assert "不重叠 top-level ownership" in instruction[:launch_position]
 
 
 def test_discovery_policy_uses_design_guided_trace_candidates_without_quotas():
@@ -2265,15 +2302,18 @@ def test_discovery_policy_uses_design_guided_trace_candidates_without_quotas():
         encoding="utf-8"
     )
 
-    assert "设计引导" in instruction
-    assert "双入口" in instruction
-    assert "design section" in instruction
-    assert "设计入口可直接产生candidate" in orchestrator
+    assert "双向 Semantic Scouts" in instruction
+    assert "finish_scouts → select_candidates" in instruction
+    assert "design-to-code" in instruction
+    assert "code-to-design" in instruction
+    assert "自身 design groups 或 code anchors" in orchestrator
+    assert "`design_to_code`" in risk
+    assert "`code_to_design`" in risk
+    assert "所有 receipts 完成前禁止 candidate selection" in orchestrator
     assert "design_section_ids" in risk
-    assert "最多12条" in orchestrator
-    assert "不做每文档或每sweep配额" in orchestrator
-    assert "passed=true,closed=true" in orchestrator
-    assert "不得为了填充数量制造 observation" in risk
+    assert "最多 12 个疑似差异 ID" in orchestrator
+    assert "不要为了完成 slice 填充候选" in risk
+    assert "一个 scout 可以合法返回 `[]`" in risk
     assert "supplied design" in instruction
     assert "evidence" in skill.lower()
 
@@ -2319,7 +2359,7 @@ def test_prepare_resume_refuses_to_recreate_deleted_supplement_history(workspace
     assert not history.exists()
     prepared = ac.load_json(workspace["logs"] / "trace" / "session_prepared.json")
     assert any(
-        "refusing to reset the one-supplement ledger" in problem
+            "refusing to reset the immutable empty-history guard" in problem
         for problem in prepared["problems"]
     )
 
@@ -2558,7 +2598,7 @@ def test_coverage_passed_is_not_closed_while_next_round_tasks_exist(workspace):
     contract = ac.load_json(state / "agent_loop_contract.json")
     claims, _ = ac.load_jsonl(state / "design_claims.jsonl")
     coverage = ac.load_json(state / "coverage_audit.json")
-    coverage["remaining_gaps"] = [{
+    coverage["remaining_gaps"] = [*coverage["remaining_gaps"], {
         "gap_id": "GAP-SUPPLEMENT-001",
         "kind": "frontier_claim",
         "ref_id": "CLAIM-001",
@@ -2656,19 +2696,14 @@ def test_new_on_demand_claim_must_join_complete_review_scope(workspace):
     design_coverage = ac.load_json(state / "design_coverage.json")
     design_coverage["document_groups"][0]["claim_ids"].append("CLAIM-INDEX-ONLY")
     ac.save_json(state / "design_coverage.json", design_coverage)
-    run_runner(
-        "design-check", Path(workspace["code"]), Path(workspace["design"]),
-        Path(workspace["result"]), Path(workspace["logs"]),
-    )
     proc = run_runner(
-        "claim-check", Path(workspace["code"]), Path(workspace["design"]),
+        "design-check", Path(workspace["code"]), Path(workspace["design"]),
         Path(workspace["result"]), Path(workspace["logs"]), check=False,
     )
     assert proc.returncode == 1
-    trace = ac.load_json(Path(workspace["logs"]) / "trace" / "claim_review_validation.json")
+    trace = ac.load_json(Path(workspace["logs"]) / "trace" / "design_validation.json")
     assert any(
-        "must include every materialized claim" in error
-        and "CLAIM-INDEX-ONLY" in error
+        "CLAIM-INDEX-ONLY" in error and "missing" in error
         for error in trace["errors"]
     )
     assert review_path.read_bytes() == review_before
@@ -2680,9 +2715,9 @@ def test_complete_session_gate_can_be_replayed_in_isolation(workspace, tmp_path)
     run_runner("report", workspace["code"], workspace["design"], workspace["result"], workspace["logs"])
     run_runner("gate", workspace["code"], workspace["design"], workspace["result"], workspace["logs"])
     replay = tmp_path / "gate-replay"
-    stage_replay.prepare_replay(
+    prepare_replay_with_scout_receipts(
         source_state=Path(workspace["state"]), replay_root=replay,
-        stage="gate", run_local=True,
+        stage="gate",
     )
 
     assert stage_replay.run_local(replay) == 0
@@ -2708,9 +2743,9 @@ def test_materialized_catalog_gate_replay_copies_and_protects_source(workspace, 
         materialized["result"], materialized["logs"],
     )
     replay = tmp_path / "materialized-gate-replay"
-    stage_replay.prepare_replay(
+    prepare_replay_with_scout_receipts(
         source_state=Path(materialized["state"]), replay_root=replay,
-        stage="gate", run_local=True,
+        stage="gate",
     )
     replay_manifest = ac.load_json(replay / "state" / "workspace_manifest.json")
     replay_source = Path(
@@ -2750,24 +2785,24 @@ def test_gate_replay_force_cannot_delete_materialization_source(workspace, tmp_p
     assert marker.read_text(encoding="utf-8") == "must survive\n"
 
 
-def test_complete_coverage_stage_can_be_replayed_in_isolation(workspace, tmp_path):
+def test_complete_coverage_stage_is_deterministic_and_needs_no_agent_replay(workspace):
     populate_handoffs(workspace)
-    replay = tmp_path / "coverage-replay"
-    stage_replay.prepare_replay(
-        source_state=Path(workspace["state"]), replay_root=replay,
-        stage="coverage", run_local=True,
+    contract = ac.load_json(Path(workspace["state"]) / "agent_loop_contract.json")
+    coverage_phase = next(
+        phase for phase in contract["phases"] if phase["id"] == "coverage_audit"
     )
-
-    assert stage_replay.run_local(replay) == 0
-    assert ac.load_json(replay / "logs" / "trace" / "claim_review_validation.json")[
+    assert coverage_phase["owner"] == "deterministic-helper"
+    assert not (ROOT / "work" / "skills" / "coverage-critic.md").exists()
+    run_runner(
+        "coverage-check", workspace["code"], workspace["design"],
+        workspace["result"], workspace["logs"],
+    )
+    assert ac.load_json(Path(workspace["logs"]) / "trace" / "coverage_validation.json")[
         "passed"
     ] is True
-    assert ac.load_json(replay / "logs" / "trace" / "coverage_validation.json")[
-        "passed"
-    ] is True
 
 
-def test_dynamic_probe_session_can_replay_coverage_and_gate(workspace, tmp_path):
+def test_dynamic_probe_session_can_replay_gate(workspace, tmp_path):
     populate_handoffs(workspace)
     attach_dynamic_probe(workspace)
     run_runner(
@@ -2783,23 +2818,17 @@ def test_dynamic_probe_session_can_replay_coverage_and_gate(workspace, tmp_path)
         workspace["result"], workspace["logs"],
     )
 
-    coverage_replay = tmp_path / "dynamic-coverage-replay"
-    stage_replay.prepare_replay(
-        source_state=Path(workspace["state"]), replay_root=coverage_replay,
-        stage="coverage", run_local=True,
-    )
-    replay_probe = ac.load_jsonl(
-        coverage_replay / "state" / "dynamic_probes.jsonl"
+    probe = ac.load_jsonl(
+        Path(workspace["state"]) / "dynamic_probes.jsonl"
     )[0][0]
-    probe_workspace = Path(replay_probe["isolation"]["workspace"])
-    assert probe_workspace.is_relative_to(coverage_replay / "state" / "probes")
+    probe_workspace = Path(probe["isolation"]["workspace"])
+    assert probe_workspace.is_relative_to(Path(workspace["state"]) / "probes")
     assert (probe_workspace / "service.py").is_file()
-    assert stage_replay.run_local(coverage_replay) == 0
 
     gate_replay = tmp_path / "dynamic-gate-replay"
-    stage_replay.prepare_replay(
+    prepare_replay_with_scout_receipts(
         source_state=Path(workspace["state"]), replay_root=gate_replay,
-        stage="gate", run_local=True,
+        stage="gate",
     )
     assert stage_replay.run_local(gate_replay) == 0
     assert ac.load_json(gate_replay / "logs" / "trace" / "final_gate.json")[
@@ -2888,7 +2917,7 @@ def test_gate_rejects_duplicate_non_revision_ledger_ids(workspace):
     assert any("duplicate claim_id" in error for error in gate["errors"])
 
 
-def test_parallel_path_can_be_covered_by_linked_split_plane_tasks(workspace):
+def test_parallel_path_requires_a_new_lineage_bound_candidate(workspace):
     populate_handoffs(workspace)
     state = workspace["state"]
     assert isinstance(state, Path)
@@ -2933,6 +2962,18 @@ def test_parallel_path_can_be_covered_by_linked_split_plane_tasks(workspace):
     (state / "risk_observations.jsonl").write_text(
         "\n".join(json.dumps(item) for item in risks) + "\n", encoding="utf-8"
     )
+    proc = run_runner(
+        "task-check", workspace["code"], workspace["design"],
+        workspace["result"], workspace["logs"], check=False,
+    )
+    assert proc.returncode == 1
+    trace = ac.load_json(Path(workspace["logs"]) / "trace" / "task_plan_validation.json")
+    assert any(
+        "preserve exactly the selected candidate" in error
+        or "does not preserve the selected candidate" in error
+        for error in trace["errors"]
+    )
+    return
     report_path = Path(workspace["logs"]) / "trace" / "task-handoff-merge.json"
     report = ac.load_json(report_path)
     report["ledger_sha256"] = ac.sha256_file(state / "investigation_tasks.jsonl")
@@ -3076,13 +3117,19 @@ def test_gate_rejects_reused_provider_session_across_fresh_semantic_phases(works
     state = Path(workspace["state"])
     ledger, errors = ac.load_jsonl(state / "agent_run_ledger.jsonl")
     assert errors == []
-    inventory_session = next(
+    scout_session = next(
         event["provider_session_id"] for event in ledger
-        if event.get("phase") == "design_inventory"
+        if (
+            event.get("phase") == "code_risk_backtracking"
+            and event.get("role") == "risk-explorer"
+        )
     )
     for event in ledger:
-        if event.get("phase") == "design_claim_resolution":
-            event["provider_session_id"] = inventory_session
+        if (
+            event.get("phase") == "design_claim_review"
+            and event.get("role") == "spec-critic"
+        ):
+            event["provider_session_id"] = scout_session
     (state / "agent_run_ledger.jsonl").write_text(
         "".join(json.dumps(event) + "\n" for event in ledger), encoding="utf-8",
     )
@@ -3105,7 +3152,11 @@ def test_gate_rejects_third_identical_no_progress_checkpoint(workspace):
     ledger, errors = ac.load_jsonl(state / "agent_run_ledger.jsonl")
     assert errors == []
     checkpoint = next(
-        event for event in ledger if event.get("phase") == "design_inventory"
+        event for event in ledger
+        if (
+            event.get("phase") == "design_claim_review"
+            and event.get("role") == "spec-critic"
+        )
     )
     second = dict(
         checkpoint,
@@ -3138,9 +3189,13 @@ def test_gate_rejects_unbound_portfolio_scope_id(workspace):
     ledger, errors = ac.load_jsonl(state / "agent_run_ledger.jsonl")
     assert errors == []
     checkpoint = next(
-        event for event in ledger if event.get("phase") == "design_inventory"
+        event for event in ledger
+        if (
+            event.get("phase") == "architecture_mapping"
+            and event.get("role") == "orchestrator"
+        )
     )
-    checkpoint["scope_id"] = "DESIGN-INVENTORY-RETRY-RENAMED"
+    checkpoint["scope_id"] = "ARCHITECTURE-MAP-RETRY-RENAMED"
     (state / "agent_run_ledger.jsonl").write_text(
         "".join(json.dumps(event) + "\n" for event in ledger), encoding="utf-8",
     )
@@ -3269,21 +3324,15 @@ def test_gate_rejects_task_plan_edited_after_handoff_merge(workspace):
     (state / "investigation_tasks.jsonl").write_text(
         "".join(json.dumps(task) + "\n" for task in tasks), encoding="utf-8",
     )
-    for command in ("task-check", "coverage-check", "review", "report"):
-        run_runner(
-            command, workspace["code"], workspace["design"],
-            workspace["result"], workspace["logs"],
-        )
-
     proc = run_runner(
-        "gate", workspace["code"], workspace["design"],
+        "task-check", workspace["code"], workspace["design"],
         workspace["result"], workspace["logs"], check=False,
     )
 
     assert proc.returncode == 1
-    gate = ac.load_json(workspace["logs"] / "trace" / "final_gate.json")
+    gate = ac.load_json(workspace["logs"] / "trace" / "task_plan_validation.json")
     assert any(
-        "task handoff merge trace does not validate the current ledger" in error
+        "starting_points do not match selected candidate code evidence" in error
         for error in gate["errors"]
     )
 
@@ -3372,23 +3421,42 @@ def test_unselected_inventory_section_does_not_require_synthetic_gap(workspace):
     ac.save_json(state / "design_inventory.json", inventory)
     plan = ac.load_json(state / "risk_sweep_plan.json")
     plan["design_inventory_sha256"] = ac.sha256_file(state / "design_inventory.json")
-    for item in plan["slices"]:
-        item["design_section_ids"] = [
-            "SECTION-CONTRACT-API", "SECTION-CONTRACT-LIFECYCLE",
-            "SECTION-NOT-MATERIALIZED",
-        ]
     ac.save_json(state / "risk_sweep_plan.json", plan)
     plan_digest = ac.sha256_file(state / "risk_sweep_plan.json")
     risks, risk_errors = ac.load_jsonl(state / "risk_observations.jsonl")
     assert risk_errors == []
     for item in risks:
         item["risk_sweep_plan_sha256"] = plan_digest
-        item["design_section_ids"] = ["SECTION-CONTRACT-API"]
+        source_line = item["design_requirement"]["source_ref"]["line_start"]
+        item["design_section_ids"] = [
+            "SECTION-CONTRACT-API"
+            if source_line <= 3 else "SECTION-CONTRACT-LIFECYCLE"
+        ]
     (state / "risk_observations.jsonl").write_text(
         "".join(json.dumps(item) + "\n" for item in risks), encoding="utf-8",
     )
+    sections_by_candidate = {
+        item["observation_id"]: item["design_section_ids"] for item in risks
+    }
+    lookups, lookup_errors = ac.load_jsonl(state / "design_lookup_requests.jsonl")
+    assert lookup_errors == []
+    for lookup in lookups:
+        lookup["section_ids"] = sections_by_candidate[lookup["candidate_id"]]
+    (state / "design_lookup_requests.jsonl").write_text(
+        "".join(json.dumps(item) + "\n" for item in lookups), encoding="utf-8",
+    )
+    receipts, receipt_errors = ac.load_jsonl(state / "scout_receipts.jsonl")
+    assert receipt_errors == []
+    for receipt in receipts:
+        receipt["risk_sweep_plan_sha256"] = plan_digest
+    (state / "scout_receipts.jsonl").write_text(
+        "".join(json.dumps(item) + "\n" for item in receipts), encoding="utf-8",
+    )
     review = ac.load_json(state / "design_claim_review.json")
     review["group_reviews"][0]["group_sha256"] = inventory["document_groups"][0]["group_sha256"]
+    review["input_digests"]["design_inventory.json"] = ac.sha256_file(
+        state / "design_inventory.json"
+    )
     ac.save_json(state / "design_claim_review.json", review)
     for command in ("design-check", "claim-check", "task-check"):
         run_runner(
@@ -3403,7 +3471,12 @@ def test_unselected_inventory_section_does_not_require_synthetic_gap(workspace):
     assert trace["passed"] is True
     assert trace["closed"] is True
     assert trace["metrics"]["claims"] == 4
-    assert trace["metrics"]["remaining_gaps"] == 0
+    coverage = ac.load_json(state / "coverage_audit.json")
+    assert not any(
+        "SECTION-NOT-MATERIALIZED" in json.dumps(gap)
+        for gap in coverage["remaining_gaps"]
+    )
+    assert trace["metrics"]["remaining_gaps"] == len(coverage["remaining_gaps"])
 
 
 def test_gap_recorded_lens_requires_matching_gap_evidence(workspace):
@@ -3503,23 +3576,30 @@ def test_gate_rejects_actionable_uninvestigated_scoped_claim(workspace):
     populate_handoffs(workspace)
     state = workspace["state"]
     assert isinstance(state, Path)
-    claim = design_source_materializer.materialize_claims([{
-        "claim_id": "CLAIM-UNINVESTIGATED",
-        "session_id": workspace["session_id"],
+    candidate_id = "RISK-UNINVESTIGATED"
+    request_id = "LOOKUP-UNINVESTIGATED"
+    requirement = {
         "source_ref": {
             "path": "contract.md", "line_start": 3, "line_end": 3,
         },
-        "document_key": "contract",
         "subject": "The public service implementation",
         "trigger": "A caller supplies a negative amount.",
         "obligation": "The service must reject negative amounts.",
-        "exceptions": [],
+        "exceptions": ["No exception is declared by the supplied contract."],
         "observable_result": "The negative request is rejected.",
-        "behavior_family": "externally visible service contract",
         "normative_strength": "mandatory",
         "applicability": "service implementation",
+        "ambiguities": ["No ambiguity remains for this fixture requirement."],
+    }
+    claim = design_source_materializer.materialize_claims([{
+        "claim_id": "CLAIM-UNINVESTIGATED",
+        "candidate_id": candidate_id,
+        "request_id": request_id,
+        "session_id": workspace["session_id"],
+        "document_key": "contract",
+        **requirement,
+        "behavior_family": "externally visible service contract",
         "priority": "high",
-        "ambiguities": [],
         "probe_oracle": {
             "testability": "candidate",
             "preconditions": ["The service accepts an amount input."],
@@ -3528,6 +3608,46 @@ def test_gate_rejects_actionable_uninvestigated_scoped_claim(workspace):
             "non_testable_reason": "",
         },
     }], Path(workspace["design"]))[0]
+    risks, risk_errors = ac.load_jsonl(state / "risk_observations.jsonl")
+    assert risk_errors == []
+    candidate = {
+        **risks[0],
+        "observation_id": candidate_id,
+        "sweep_id": "RISK-SWEEP-DESIGN",
+        "direction": "design_to_code",
+        "behavior_question": "Does the public service reject a negative amount?",
+        "design_requirement": requirement,
+        "design_section_ids": ["SECTION-CONTRACT"],
+    }
+    append(state / "risk_observations.jsonl", candidate)
+    append(state / "design_lookup_requests.jsonl", {
+        "request_id": request_id,
+        "candidate_id": candidate_id,
+        "session_id": workspace["session_id"],
+        "origin": "semantic_scout",
+        "origin_id": candidate_id,
+        "sweep_id": candidate["sweep_id"],
+        "direction": candidate["direction"],
+        "document_keys": ["contract"],
+        "section_ids": candidate["design_section_ids"],
+        "question": candidate["behavior_question"],
+        "required_branch": ac.canonical_claim_branch(claim),
+        "mismatch_signal": candidate["mismatch_signal"],
+        "code_evidence": candidate["code_evidence"],
+        "architecture_boundaries": candidate["architecture_boundaries"],
+        "implementation_planes": candidate["implementation_planes"],
+        "parallel_path_ids": candidate["parallel_path_ids"],
+        "review_lenses": candidate["review_lenses"],
+    })
+    receipts, receipt_errors = ac.load_jsonl(state / "scout_receipts.jsonl")
+    assert receipt_errors == []
+    for receipt in receipts:
+        if receipt["sweep_id"] == "RISK-SWEEP-DESIGN":
+            receipt["candidate_count"] += 1
+            receipt["candidate_ids"].append(candidate_id)
+    (state / "scout_receipts.jsonl").write_text(
+        "".join(json.dumps(item) + "\n" for item in receipts), encoding="utf-8",
+    )
     append(state / "design_claims.jsonl", claim)
     design_coverage = ac.load_json(state / "design_coverage.json")
     design_coverage["document_groups"][0]["claim_ids"].append("CLAIM-UNINVESTIGATED")
@@ -3866,4 +3986,5 @@ def test_submission_does_not_bundle_opencode_runtime_configuration():
     instruction = (ROOT / "INSTRUCTION.md").read_text(encoding="utf-8")
     assert "不得询问用户" in instruction
     assert "等待人工审批" in instruction
-    assert "修改目标代码与设计资料" in instruction
+    assert "不要修改目标代码" in instruction
+    assert "只读" in instruction

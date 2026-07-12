@@ -26,9 +26,10 @@ def write_jsonl(path: Path, values: list[dict[str, object]]) -> None:
 
 def claim_draft(
     session_id: str, claim_id: str, path: str, line: int, family: str,
-    *, strength: str = "mandatory",
+    *, strength: str = "mandatory", candidate_id: str | None = None,
+    request_id: str | None = None, document_key: str | None = None,
 ) -> dict[str, object]:
-    return {
+    value: dict[str, object] = {
         "claim_id": claim_id,
         "session_id": session_id,
         "source_ref": {"path": path, "line_start": line, "line_end": line},
@@ -42,6 +43,13 @@ def claim_draft(
         "applicability": "The supplied component in the documented operating mode.",
         "ambiguities": [],
     }
+    if candidate_id is not None:
+        value["candidate_id"] = candidate_id
+    if request_id is not None:
+        value["request_id"] = request_id
+    if document_key is not None:
+        value["document_key"] = document_key
+    return value
 
 
 def inventory_draft(session_id: str) -> dict[str, object]:
@@ -143,10 +151,54 @@ def artifacts(tmp_path: Path) -> dict[str, object]:
     ac.save_json(state / "workspace_manifest.json", manifest)
     inventory = materializer.materialize_inventory(inventory_draft(session_id), design)
     ac.save_json(state / "design_inventory.json", inventory)
-    claims = materializer.materialize_claims([
-        claim_draft(session_id, "CLAIM-ALPHA", "alpha.md", 2, "record preservation"),
-    ], design)
+    candidate_id = "OBS-ALPHA"
+    request_id = "LOOKUP-ALPHA"
+    draft = claim_draft(
+        session_id, "CLAIM-ALPHA", "alpha.md", 2, "record preservation",
+        candidate_id=candidate_id, request_id=request_id, document_key="alpha",
+    )
+    claims = materializer.materialize_claims([draft], design)
     write_jsonl(state / "design_claims.jsonl", claims)
+    code_evidence = [{
+        "file": "service.py", "line_start": 1, "line_end": 1,
+        "symbol": "handle", "snippet": "return first_record",
+    }]
+    write_jsonl(state / "risk_observations.jsonl", [{
+        "observation_id": candidate_id,
+        "session_id": session_id,
+        "sweep_id": "SCOUT-ALPHA",
+        "direction": "design_to_code",
+        "mismatch_signal": "direct_conflict",
+        "behavior_question": "Does the implementation preserve every record?",
+        "design_section_ids": ["alpha-contract"],
+        "design_requirement": {
+            "source_ref": {"path": "alpha.md", "line_start": 2, "line_end": 2},
+            "subject": draft["subject"],
+            "trigger": draft["trigger"],
+            "obligation": draft["obligation"],
+            "exceptions": draft["exceptions"],
+            "observable_result": draft["observable_result"],
+            "normative_strength": draft["normative_strength"],
+            "applicability": draft["applicability"],
+            "ambiguities": draft["ambiguities"],
+        },
+        "code_evidence": code_evidence,
+    }])
+    write_jsonl(state / "design_lookup_requests.jsonl", [{
+        "request_id": request_id,
+        "candidate_id": candidate_id,
+        "session_id": session_id,
+        "origin": "semantic_scout",
+        "origin_id": candidate_id,
+        "sweep_id": "SCOUT-ALPHA",
+        "direction": "design_to_code",
+        "document_keys": ["alpha"],
+        "section_ids": ["alpha-contract"],
+        "question": "Does the implementation preserve every record?",
+        "required_branch": ac.canonical_claim_branch(claims[0]),
+        "mismatch_signal": "direct_conflict",
+        "code_evidence": code_evidence,
+    }])
     ac.save_json(state / "design_coverage.json", coverage_fixture(session_id))
     return {
         "code": code, "design": design, "result": result, "logs": logs, "state": state,
@@ -219,6 +271,75 @@ def test_on_demand_claims_do_not_require_full_group_or_oracle_coverage(artifacts
     assert trace["input_digests"]["design_coverage.json"] == ac.sha256_file(
         Path(artifacts["state"]) / "design_coverage.json"
     )
+    assert trace["lineage_input_digests"] == {
+        "design_lookup_requests.jsonl": ac.sha256_file(
+            Path(artifacts["state"]) / "design_lookup_requests.jsonl"
+        ),
+        "risk_observations.jsonl": ac.sha256_file(
+            Path(artifacts["state"]) / "risk_observations.jsonl"
+        ),
+    }
+
+
+def test_claim_lineage_is_one_to_one_across_lookup_and_candidate(artifacts):
+    state = Path(artifacts["state"])
+    lookups, errors = ac.load_jsonl(state / "design_lookup_requests.jsonl")
+    assert errors == []
+    duplicate = dict(lookups[0])
+    duplicate["request_id"] = "LOOKUP-UNCLAIMED"
+    write_jsonl(state / "design_lookup_requests.jsonl", [*lookups, duplicate])
+
+    code, trace = run_validator(artifacts, "claims")
+
+    assert code == 1
+    assert trace["error_count_by_code"]["LOOKUP_LINEAGE_DUPLICATE"] == 1
+    assert trace["error_count_by_code"]["CLAIM_LOOKUP_COVERAGE"] >= 1
+
+
+def test_claim_lineage_rejects_candidate_identity_drift(artifacts):
+    state = Path(artifacts["state"])
+    claims = load_claims(artifacts)
+    claims[0]["candidate_id"] = "OBS-SUBSTITUTED"
+    write_jsonl(state / "design_claims.jsonl", claims)
+
+    code, trace = run_validator(artifacts, "claims")
+
+    assert code == 1
+    assert trace["error_count_by_code"]["CLAIM_LINEAGE_INVALID"] >= 1
+    assert trace["error_count_by_code"]["CLAIM_LOOKUP_COVERAGE"] >= 1
+
+
+def test_claim_lineage_rejects_selected_compliance_observation(artifacts):
+    state = Path(artifacts["state"])
+    observations, errors = ac.load_jsonl(state / "risk_observations.jsonl")
+    assert errors == []
+    observations[0]["mismatch_signal"] = "no_difference"
+    write_jsonl(state / "risk_observations.jsonl", observations)
+    lookups, errors = ac.load_jsonl(state / "design_lookup_requests.jsonl")
+    assert errors == []
+    lookups[0]["mismatch_signal"] = "no_difference"
+    write_jsonl(state / "design_lookup_requests.jsonl", lookups)
+
+    code, trace = run_validator(artifacts, "claims")
+
+    assert code == 1
+    assert trace["error_count_by_code"]["MISMATCH_CANDIDATE_INVALID"] >= 2
+
+
+def test_claim_lineage_rejects_semantic_and_source_range_drift(artifacts):
+    state = Path(artifacts["state"])
+    claims = load_claims(artifacts)
+    claims[0]["obligation"] = "Only preserve the first record."
+    claims[0]["source_ref"]["line_start"] = 1
+    claims[0]["line_start"] = 1
+    claims[0]["quote"] = "# Alpha\nThe component must preserve every record."
+    write_jsonl(state / "design_claims.jsonl", claims)
+
+    code, trace = run_validator(artifacts, "claims")
+
+    assert code == 1
+    assert trace["error_count_by_code"]["CLAIM_LINEAGE_INVALID"] >= 1
+    assert trace["error_count_by_code"]["CLAIM_SOURCE_SCOPE_INVALID"] >= 1
 
 
 def test_claims_mode_requires_design_coverage(artifacts):
@@ -302,6 +423,7 @@ def test_required_or_in_scope_group_has_no_claim_quota(artifacts):
     state = Path(artifacts["state"])
     ac.save_json(state / "design_coverage.json", coverage)
     (state / "design_claims.jsonl").write_text("", encoding="utf-8")
+    (state / "design_lookup_requests.jsonl").write_text("", encoding="utf-8")
 
     code, trace = run_validator(artifacts, "claims")
 
@@ -654,6 +776,130 @@ def test_inventory_materializer_owns_evidence_heading_and_group_digest(artifacts
     assert group["group_sha256"] == validator.canonical_object_sha256(
         group, excluded={"group_sha256"},
     )
+
+
+def test_auto_inventory_mechanically_indexes_complete_manifest(tmp_path):
+    design = tmp_path / "design"
+    state = tmp_path / "state"
+    design.mkdir()
+    state.mkdir()
+    (design / "catalog").mkdir()
+    (design / "sources").mkdir()
+    catalog = design / "catalog" / "benchmark.md"
+    catalog.write_text("# Catalog\nListed specification.\n", encoding="utf-8")
+    lines = [f"line {index}" for index in range(1, 1606)]
+    lines[0] = "# Overview"
+    lines[800] = "# Middle"
+    lines[1600] = "# Tail"
+    spec = design / "sources" / "contract.txt"
+    spec.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    session_id = "session-auto-inventory"
+    groups = [
+        {
+            "document_key": "catalog/benchmark",
+            "members": ["catalog/benchmark.md"],
+            "explicit_entry": False,
+        },
+        {
+            "document_key": "sources/contract",
+            "members": ["sources/contract.txt"],
+            "explicit_entry": False,
+        },
+    ]
+    manifest = {
+        "session_id": session_id,
+        "design": {
+            "documents": [
+                {
+                    "path": "catalog/benchmark.md",
+                    "sha256": ac.sha256_file(catalog),
+                },
+                {
+                    "path": "sources/contract.txt",
+                    "sha256": ac.sha256_file(spec),
+                },
+            ],
+            "document_groups": groups,
+        },
+    }
+    manifest_path = state / "design_agent_manifest.json"
+    output_path = state / "design_inventory.json"
+    trace_path = state / "auto_inventory_trace.json"
+    ac.save_json(manifest_path, manifest)
+
+    assert materializer.main([
+        "--materialize", "auto-inventory",
+        "--design-root", str(design),
+        "--input", str(manifest_path),
+        "--output", str(output_path),
+        "--trace", str(trace_path),
+    ]) == 0
+
+    inventory = ac.load_json(output_path)
+    assert inventory["session_id"] == session_id
+    catalog_group, spec_group = inventory["document_groups"]
+    assert catalog_group["scope_relation"] == "informational"
+    assert spec_group["scope_relation"] == "in_scope"
+    assert spec_group["scope_evidence"]["quote"] == "# Overview"
+    assert [
+        (section["line_start"], section["line_end"])
+        for section in spec_group["sections"]
+    ] == [(1, 800), (801, 1600), (1601, 1605)]
+    assert [
+        section["behavior_families"] for section in spec_group["sections"]
+    ] == [
+        ["Overview", "sources/contract.txt"],
+        ["Middle", "sources/contract.txt"],
+        ["Tail", "sources/contract.txt"],
+    ]
+    assert all("quote" not in section for section in spec_group["sections"])
+    assert all(
+        section["line_end"] - section["line_start"] + 1 <= 800
+        for section in spec_group["sections"]
+    )
+    issues = validator.Issues()
+    validator.validate_inventory(
+        inventory, session_id, design,
+        {group["document_key"]: group for group in groups}, issues,
+    )
+    assert issues.errors == []
+    trace = ac.load_json(trace_path)
+    assert trace["passed"] is True
+    assert trace["artifact_kind"] == "auto-inventory"
+    assert trace["semantic_analysis_performed"] is False
+
+
+def test_auto_inventory_rejects_manifest_source_hash_drift(tmp_path):
+    design = tmp_path / "design"
+    state = tmp_path / "state"
+    design.mkdir()
+    state.mkdir()
+    source = design / "contract.md"
+    source.write_text("# Contract\nRequired behavior.\n", encoding="utf-8")
+    manifest_path = state / "design_agent_manifest.json"
+    output_path = state / "design_inventory.json"
+    trace_path = state / "auto_inventory_trace.json"
+    ac.save_json(manifest_path, {
+        "session_id": "session-auto-inventory",
+        "design": {
+            "documents": [{"path": "contract.md", "sha256": "0" * 64}],
+            "document_groups": [{
+                "document_key": "contract", "members": ["contract.md"],
+            }],
+        },
+    })
+
+    assert materializer.main([
+        "--materialize", "auto-inventory",
+        "--design-root", str(design),
+        "--input", str(manifest_path),
+        "--output", str(output_path),
+        "--trace", str(trace_path),
+    ]) == 1
+    assert not output_path.exists()
+    trace = ac.load_json(trace_path)
+    assert trace["passed"] is False
+    assert any("sha256 does not match" in error for error in trace["errors"])
 
 
 def test_group_digest_detects_post_materialization_change(artifacts):

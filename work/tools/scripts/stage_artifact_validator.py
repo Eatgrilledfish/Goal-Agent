@@ -739,7 +739,8 @@ def _validate_task_finding_lifecycle(
 
 def _task_plan_contract_errors(
     task: dict[str, Any], *, task_id: str, session_id: str, root: Path,
-    claims: dict[str, dict[str, Any]], accepted_claim_ids: set[str],
+    claims: dict[str, dict[str, Any]], risks: dict[str, dict[str, Any]],
+    accepted_claim_ids: set[str],
 ) -> list[str]:
     """Validate one atomic candidate without scoring its semantic quality."""
     label = f"investigation task {task_id}"
@@ -785,6 +786,52 @@ def _task_plan_contract_errors(
             errors.append(
                 f"{label}: hypothesis does not match the linked claim observable result"
             )
+        candidate_id = str(claim.get("candidate_id") or "")
+        if candidate_id:
+            observation = risks.get(candidate_id)
+            if observation is None:
+                errors.append(
+                    f"{label}: linked claim candidate_id {candidate_id!r} is missing"
+                )
+            else:
+                if task.get("candidate_id") != candidate_id:
+                    errors.append(f"{label}: candidate_id does not match the linked claim")
+                if task.get("request_id") != claim.get("request_id"):
+                    errors.append(f"{label}: request_id does not match the linked claim")
+                if task.get("risk_observation_ids") != [candidate_id]:
+                    errors.append(
+                        f"{label}: risk_observation_ids must preserve exactly the selected candidate"
+                    )
+                expected_points = [
+                    {
+                        "file": evidence.get("file"),
+                        "line_start": evidence.get("line_start"),
+                        "line_end": evidence.get("line_end"),
+                    }
+                    for evidence in observation.get("code_evidence", [])
+                    if isinstance(evidence, dict)
+                ]
+                if task.get("starting_points") != expected_points:
+                    errors.append(
+                        f"{label}: starting_points do not match selected candidate code evidence"
+                    )
+                for field in (
+                    "review_lenses", "architecture_boundaries",
+                    "implementation_planes", "parallel_path_ids",
+                ):
+                    if task.get(field) != observation.get(field, []):
+                        errors.append(
+                            f"{label}: {field} does not preserve the selected candidate"
+                        )
+                expected_mode = (
+                    "design-to-code obligation tracing"
+                    if observation.get("direction") == "design_to_code"
+                    else "code-to-design risk backtracking"
+                )
+                if task.get("exploration_mode") != expected_mode:
+                    errors.append(
+                        f"{label}: exploration_mode does not match candidate direction"
+                    )
     return errors
 
 
@@ -902,7 +949,7 @@ def validate_task_plan_stage(
     for task_id, task in tasks.items():
         errors_by_task[task_id].extend(_task_plan_contract_errors(
             task, task_id=task_id, session_id=session_id, root=root,
-            claims=claims, accepted_claim_ids=claim_scope,
+            claims=claims, risks=risks, accepted_claim_ids=claim_scope,
         ))
     represented_claim_ids = {
         str(task.get("claim_id") or "") for task in tasks.values()

@@ -1,500 +1,93 @@
----
-name: design-code-inconsistency
-description: 由运行中的 OpenCode CLI 执行的通用设计文档与代码实现语义不一致检视；使用增量 evidence-pair frontier、候选级验证、独立反证和可审计证据链。
----
+# Goal-Agent 通用设计/实现一致性检视
 
-# 通用设计/代码不一致检视
+本 Skill 由 `INSTRUCTION.md` 驱动。目标是从本次 supplied design 与代码仓中发现语义差异，生成可机器读取的 issue 和证据链；不修改目标代码，不依赖项目名、协议名、固定符号、正则规则或已知答案。
 
-## 1. 任务边界
+## 核心分工
 
-- 设计资料定义应有行为，目标仓及其构建/配置定义实际行为；issue 是二者间可证明、适用于当前输入的语义差异。
-- 这是通用一致性检查，不是漏洞扫描。安全、性能、协议、状态、数据、API、部署、并发等都只是可能的设计维度。
-- OpenCode 模型负责 scope、义务、可达行为、矛盾、反证与置信度；helper 只负责 schema、路径/行号、quote/source hash、digest、session、merge、只读校验和报告。
-- 禁止用预写的项目名、固定文件/符号、协议/RFC 名、关键词/regex、规则表、分数或公开答案决定 candidate/verdict；必须保留并使用从当前设计与代码动态发现的领域术语、组件和行为语义。
-- 所有模型角色只读 session-local review roots；证据写相对路径。helper 对原始输入按相同路径逐行验真。
-- 动态 probe 只增强一个 candidate 的证据，不替代静态设计/代码证据。环境或 baseline 失败一律 inconclusive。
-- `unknown`、`inconclusive`、`rejected` 是正常状态。只发布严格闭环的 confirmed。
+- Orchestrator：发现输入、建轻量 architecture map、调度与调用确定性 helper；不代替专业角色写语义结论。
+- Semantic Scout：以设计文档组或互斥代码 anchors 为入口，读取规范、搜索代码，只输出有差异信号的原子候选。
+- Spec Critic：只读设计，验证候选中的规范引用、强度、原子性和适用性。
+- Code Investigator：沿候选锚点证明实际行为和反证，输出 contradiction/satisfied/uncertain。
+- Evidence Critic：fresh session 独立挑战每个 finding。
+- Final Judge：只将已经闭环的 finding 映射为 confirmed/probable/rejected。
 
-## 2. 执行模型
+并发上限为 2。只有互斥的 design document ownership、互斥 code anchors 或不同 candidate 可以并发；同一 candidate 的 investigation → optional probe → critic 严格串行。
+
+## 不变量
+
+1. 输入语义来自当前 design/code。禁止读取公开答案、旧 result 或以 issue 数量决定候选。
+2. Design-to-code scout 搜索整个代码仓，不能被预先 architecture map 裁剪；code-to-design scout 的 primary anchors 必须互斥。
+3. Scout 只输出疑似不一致，零候选合法；所有 scout receipts 完成前不能全局选择候选。
+4. 候选、claim 和 task 的 requirement、source range、code anchors、direction 与 mismatch signal 由 helper 逐值投影，orchestrator 不得重写。
+5. 搜索无命中、构建失败或环境失败不单独证明能力缺失。能力缺失需检查入口、构建、注册、配置、邻近能力和依赖。
+6. Schema/路径/行号错误在原角色内修；语义 repair 最多一次 fresh session。局部 checkpoint 完成不等于全局完成，只有 final gate 可关闭 session。
+7. 目标代码与 supplied design 只读。写入仅限 `/work` 交付工具自身、`${STATE_ROOT}`、`${LOG_ROOT}` 与 `${RESULT_ROOT}`；比赛运行时不得创建或读取 `opencode.json`。
+
+## Architecture map
+
+Architecture map 是代码导航辅助，不是候选过滤器。保存为 `${STATE_ROOT}/architecture_map.json`：
+
+```json
+{
+  "session_id":"当前 session",
+  "repository_summary":"事实摘要",
+  "languages":["..."],
+  "entrypoints":[{"path":"相对路径","purpose":"...","evidence":"..."}],
+  "subsystems":[{"subsystem_id":"SUBSYSTEM-...","name":"...","paths":["..."],"role":"..."}],
+  "implementation_planes":[{"plane_id":"PLANE-...","kind":"owned|adapter|imported|generated|fast_path|slow_path|other","paths":["..."],"reachable_evidence":"..."}],
+  "integration_boundaries":[{"boundary_id":"BOUNDARY-...","name":"...","paths":["..."],"plane_ids":["PLANE-..."],"risk":"high|medium|low","why":"..."}],
+  "capability_surfaces":[{"surface_id":"CAPABILITY-...","paths":["..."],"declares_or_registers":"..."}],
+  "configuration_surfaces":[],
+  "alternate_execution_paths":[],
+  "test_surfaces":[],
+  "parallel_behavior_paths":[{"path_id":"PARALLEL-...","behavior":"...","plane_ids":["PLANE-...","PLANE-..."],"evidence":"..."}],
+  "probe_capabilities":{"isolated_copy_feasible":true,"available_runtime":[],"constraints":[]}
+}
+```
+
+只写真实存在的路径和关系。Imported、adapter、fast/slow 和 integration layer 不能因不是主实现而遗漏；但地图遗漏不会阻止 design scout 在全仓找到代码。
+
+## Model loop
+
+每次准备下一动作时运行：
+
+```bash
+python3 ${WORK_ROOT}/tools/scripts/pipeline_controller.py status --state-root ${STATE_ROOT}
+```
+
+按唯一 `next_action` 执行，不跳阶段：
 
 ```text
-prepare/read-only snapshot
-  ├─ complete bounded design inventory
-  └─ architecture map
-                 ↓
-design-guided trace sweeps over disjoint code scopes
-  → model-ranked evidence-pair frontier (max 12)
-  → on-demand claim materialization
-  → per-claim/group spec review
-  → atomic task-plan gate
-  → investigator
-  → optional focused probe
-  → fresh evidence critic
-                 ↓
-one coverage decision / at most one supplement
-  → final judge → review → report/final gate
+finish_scouts
+→ select_candidates
+→ review_claims
+→ plan_investigations
+→ finish_investigations
+→ finish_critics
+→ run_final
 ```
 
-全局最多两个并发 Task。互斥广度 slice 与不同 candidate 可并发；同一 candidate 的 investigator/probe/critic 不并发。每个并行 Task 只写自己的 handoff；共享 JSONL 由 deterministic merge 原子更新。结构错误在同一角色 Task 内修；语义 repair 最多一次 fresh 同角色 Task。主 Agent不得补写语义字段。
+确定性 helper 只校验/物化 provenance，不做 semantic ranking 或 verdict。模型只在以下位置做判断：scout 候选、最多 12 个 candidate ID 排序、spec review、代码调查、反证和最终状态映射。
 
-每个语义phase/Task/repair/stop用`session_event.py`写rich checkpoint；每个deterministic validation/merge写digest-bound JSON trace并在ledger登记。Checkpoint记录session ID、稳定`scope_id`、scope描述、实际输入/输出文件摘要、started/ended、attempt、provider session、验证错误分类、repair与输出数量、terminal outcome和stop reason。每段开始先保存UTC时间，结束时传 `--role/--event/--scope-id/--scope`、至少一个可重复的`--input-artifact <本阶段实际读取的普通文件>`、complete时至少一个实际存在的模型阶段`--artifact <输出artifact绝对路径>`、`--started-at/--ended-at/--provider-attempt/--provider-session-id/--output-count/--repair-count/--outcome/--stop-reason`；`goal_runner.py`另行登记validator report路径与digest，避免其时间戳变化伪造模型进展。同一工作及其retry/repair保持scope ID不变，candidate令它等于task ID。helper读取并排序真实文件、记录逐文件摘要并计算组合digest，不接受模型手填摘要；只改自由文本不算进展，语义repair必须使用fresh provider session。Provider最多尝试两次、语义repair最多一次；验证错误用可重复的 `--error-category ERROR_CODE=count` 聚合。读取 review roots、写 state/log/result、session隔离 probe和受限只读 catalog fetch自动批准并写 approval trace；目标树写入、依赖安装/发布、凭据/破坏性或无关外部副作用机械拒绝，比赛中不产生人工等待。
+## Candidate 与调查
 
-主要checkpoint逐字使用：`architecture_mapping/orchestrator`、`design_inventory/spec-analyst`、`code_risk_backtracking/risk-explorer`、`design_claim_resolution/spec-analyst`、`design_claim_review/spec-critic`、`investigation_planning/orchestrator`、`investigation/code-investigator`、`critic_review/evidence-critic`、`coverage_audit/coverage-critic`、`final_judgement/final-judge`；有probe时再加`dynamic_probe/code-investigator`。Complete checkpoint必须`output_count>0`。每个risk sweep用`sweep_id`、每个investigation用`task_id`、每个probe/critic用`finding_id`填写`--task-id`，且每个candidate使用独立fresh provider session。
-
-非candidate scope ID固定为：`ARCHITECTURE-MAP`、`DESIGN-INVENTORY`；claim resolution/review及investigation planning使用当前artifact中的真实`ROUND-*`；coverage只用`COVERAGE-AUDIT-INITIAL|COVERAGE-AUDIT-FINAL`且最终必须有FINAL；Final Judge用`FINAL-JUDGEMENT`。Gate机械绑定这些ID，retry不得换名重置history。
-
-## 3. Canonical artifacts
-
-### 3.1 `architecture_map.json`
+Semantic Scout 严格遵循 `work/skills/risk-explorer.md`。候选全部完成后，orchestrator 只写：
 
 ```json
-{
-  "session_id": "session-...",
-  "repository_summary": "仓库职责与实际执行模型",
-  "languages": ["从当前仓证据识别"],
-  "entrypoints": [{"path":"...","purpose":"...","evidence":"..."}],
-  "subsystems": [{"subsystem_id":"SUBSYSTEM-...","name":"...","paths":["..."],"role":"..."}],
-  "implementation_planes": [{
-    "plane_id":"PLANE-...",
-    "kind":"owned|adapter|imported|generated|fast_path|slow_path|other",
-    "paths":["..."],
-    "reachable_evidence":"真实入口/调用/构建证据"
-  }],
-  "integration_boundaries": [{
-    "boundary_id":"BOUNDARY-...","name":"...","paths":["..."],
-    "plane_ids":["PLANE-..."],"risk":"high|medium|low","why":"..."
-  }],
-  "capability_surfaces": [{"surface_id":"CAPABILITY-...","paths":["..."],"declares_or_registers":"..."}],
-  "configuration_surfaces": [{"path":"...","controls":"..."}],
-  "alternate_execution_paths": [{"name":"...","paths":["..."],"trigger":"..."}],
-  "test_surfaces": [{"path":"...","coverage":"...","available_command":"仓库已有命令或空字符串","evidence":"..."}],
-  "probe_capabilities": {"isolated_copy_feasible":true,"available_runtime":[],"constraints":[]},
-  "parallel_behavior_paths": [{"path_id":"PARALLEL-...","behavior":"同一设计行为","plane_ids":["PLANE-A","PLANE-B"],"evidence":"..."}]
-}
+{"candidate_ids":["按证据强度排序的 observation_id，最多12个"]}
 ```
 
-Plane 是有真实可达入口且可分配调查上下文的行为 facet；不得用仓库父目录把多个独立行为粘为一个 plane，也不得拆开真正耦合路径。Boundary 的 `plane_ids` 非空。Parallel path 至少两个 plane。
+优先直接规范冲突、外部可观察行为、跨 plane 不对称、结构化能力缺失与精确代码位置；不做文档配额，不选择合规样本。`candidate_pipeline.py` 负责生成 lookup/claim/task。
 
-### 3.2 `risk_sweep_plan.json` 与 `risk_observations.jsonl`
+Code Investigator 严格遵循 `work/skills/code-investigator.md`，只写最小语义文件；`finding_materializer.py` 负责复制冻结字段和源码 snippet。每个 finding 都必须由 fresh Evidence Critic 独立复核，不使用投票。
 
-Plan绑定当前architecture与design inventory digests。primary code scopes互斥、每slice最多6个planes；全部architecture IDs被覆盖，每slice通过代码→设计与设计→代码语义检索选择最多12个相关inventory sections，未选sections保留作后续检索而不做无差别深审。每slice使用完整lens，最多输出8条设计链接的trace observations：
+## 输出和 gate
 
-```json
-{
-  "session_id":"session-...",
-  "plan_id":"RISK-PLAN-001",
-  "architecture_map_sha256":"64位小写SHA-256",
-  "design_inventory_sha256":"64位小写SHA-256",
-  "required_coverage":{
-    "boundary_ids":["全部 BOUNDARY-..."],
-    "plane_ids":["全部 reachable PLANE-..."],
-    "parallel_path_ids":["全部 PARALLEL-..."]
-  },
-  "slices":[{
-    "sweep_id":"RISK-SWEEP-01",
-    "architecture_boundaries":["BOUNDARY-..."],
-    "implementation_planes":["PLANE-..."],
-    "parallel_path_ids":["PARALLEL-..."],
-    "anchor_paths":["本slice独占且与所列架构ID有关的主代码路径"],
-    "design_section_ids":["与当前code scope相关的SECTION-..."],
-    "review_lenses":["逐值包含完整 contract lens portfolio"],
-    "scope_rationale":"为什么主代码范围聚焦且不与其他slice重叠"
-  }]
-}
-```
+只有 current traces、coverage、verdict validation 与 final gate 全部通过才写最终结果。必须产生：
 
-Risk observation 是 design-guided 中性 trace candidate：
+- `/result/issues.json`
+- `/result/issues.jsonl`
+- `/result/00-summary.md`
+- `/result/01-*.md` 等单 issue 报告
 
-```json
-{
-  "observation_id":"RISK-...","session_id":"session-...",
-  "sweep_id":"RISK-SWEEP-...","risk_sweep_plan_sha256":"当前plan SHA-256",
-  "behavior_question":"需要设计回答的中性语义问题",
-  "observed_code_behavior":"代码可证明的实际行为",
-  "design_section_ids":["当前slice的SECTION-..."],
-  "design_alignment":"设计行为与代码路径为何语义相同",
-  "review_lenses":["1-3个contract lens"],
-  "architecture_boundaries":["BOUNDARY-..."],
-  "implementation_planes":["PLANE-..."],
-  "parallel_path_ids":["PARALLEL-..."],
-  "code_evidence":[{"file":"相对路径","line_start":1,"line_end":2,"symbol":"...","snippet":"逐字代码"}],
-  "false_positive_checks":[{"question":"...","method":"...","target":"...","result":"..."}],
-  "design_lookup_questions":["不包含代码路径/实现答案的设计问题"],
-  "tool_trace":[{"seq":1,"kind":"code_search|code_navigation|code_read|reverse_check|config_read|build_read|analysis","tool":"...","target":"...","purpose":"...","result":"..."}]
-}
-```
-
-每项至少一项 candidate-specific false-positive check；trace 至少含 search/navigation与code_read，reverse_check在risk阶段可选，且不得有 `design_read`。Risk Explorer必须审阅整个assigned slice，但只输出有具体代码证据、可形成设计问题的高信息量observation；observation无需逐项重复plan中的所有ID/lens，不得用泛化描述填满覆盖配额。Observation 不含 claim、design evidence、assessment、status、recommendation 或 confidence。
-
-每个 slice使用独占`${STATE_ROOT}/handoffs/risks/<sweep_id>/`，通过 self-check后立即只以该目录执行`handoff_merge.py --artifact-type risk`；失败peer目录不得进入本次input。Merge按 `sweep_id` 累计 upsert，当前 sweep只替换自身旧 observation；`submitted_sweep_ids`是本次单独提交项，`completed_sweep_ids`是累计ledger。`closed=false` 时已完成 observation已经可用于 frontier。最终 report必须满足 `completed_sweep_ids=expected_sweep_ids`、无 missing、`closed=true` 且 `global_coverage_validated=true`。
-
-### 3.3 `design_inventory.json`
-
-Spec Analyst 原始输入的每个 source对象必须显式包含 nested `source_ref.path/line_start/line_end`；materializer不接受 top-level path/lines fallback。Materializer生成 canonical top-level path/lines、source hash、quote、heading与group digest。最终格式：
-
-```json
-{
-  "session_id":"session-...",
-  "document_groups":[{
-    "document_key":"manifest中的稳定ID",
-    "members":["与manifest逐值相同的相对路径"],
-    "scope_relation":"required|in_scope|relevant|informational|superseded|ambiguous",
-    "scope_evidence":{
-      "source_ref":{"path":"...","line_start":1,"line_end":2,"source_sha256":"..."},
-      "path":"...","line_start":1,"line_end":2,"section":"materialized heading","quote":"逐字原文"
-    },
-    "sections":[{
-      "section_id":"SECTION-...",
-      "source_ref":{"path":"...","line_start":10,"line_end":80,"source_sha256":"..."},
-      "path":"...","heading":"materialized heading","line_start":10,"line_end":80,
-      "behavior_families":["模型按当前设计语义归纳的行为簇"],
-      "ambiguities":[]
-    }],
-    "group_sha256":"排除本字段后的canonical JSON SHA-256"
-  }]
-}
-```
-
-Inventory覆盖每个manifest group；required/in_scope成员从首行到末行完整分段，单section最多800行。它只是检索地图，不生成完整义务队列或任务配额。
-
-### 3.4 `design_lookup_requests.jsonl`、`design_coverage.json` 与 `design_claims.jsonl`
-
-Lookup request 是 manager 给 design-only Agent 的最小问题：
-
-```json
-{
-  "request_id":"LOOKUP-...","session_id":"session-...",
-  "origin":"risk_observation|design_section|capability_reconciliation|critic_request",
-  "origin_id":"稳定ID","document_keys":["..."],"section_ids":["..."],
-  "question":"只描述待解析的设计语义","required_branch":"一个可证伪分支"
-}
-```
-
-`design_coverage.json` 是 inventory 到已物化 claims 的轻量账本；未物化 section 是可继续检索的入口，不是错误，也不自动成为 gap：
-
-```json
-{
-  "session_id":"session-...",
-  "document_groups":[{
-    "document_key":"...","members":["..."],
-    "disposition":"applicable|inapplicable|superseded|supporting",
-    "evidence":"supplied design scope证据",
-    "claim_ids":["当前已物化CLAIM-..."],
-    "behavior_families":["inventory中已探索/待探索行为簇"]
-  }]
-}
-```
-
-Claim raw handoff 不写 quote/hash/section/path compatibility 字段；materializer 生成后最终每行为：
-
-```json
-{
-  "claim_id":"CLAIM-稳定ID","session_id":"session-...","document_key":"...",
-  "source_ref":{"path":"设计根相对路径","line_start":1,"line_end":3,"source_sha256":"materialized"},
-  "document":"materialized filename","path":"materialized path","section":"materialized heading",
-  "line_start":1,"line_end":3,"quote":"materialized exact lines",
-  "subject":"义务主体","trigger":"单一触发条件","obligation":"单一义务分支",
-  "exceptions":["设计明确例外"],"observable_result":"可观察结果",
-  "normative_strength":"mandatory|recommended|optional|declared_capability|informational",
-  "applicability":"当前组件/版本/场景为何适用",
-  "ambiguities":[],
-  "probe_oracle":{
-    "testability":"candidate|not_suitable|unknown",
-    "preconditions":["仅来自设计"],
-    "stimulus":"candidate/unknown时的最小输入",
-    "expected_observation":"candidate/unknown时的设计结果",
-    "non_testable_reason":"not_suitable时必填"
-  }
-}
-```
-
-每个 claim只表达一个 subject、trigger、obligation branch，不写 `behavior_family`；行为簇只存在于 inventory sections。每个 raw claim必须有 nested `source_ref`，不能用最终 materialized top-level path/lines作为draft输入。`probe_oracle` 只在按需 claim中生成；`candidate|unknown` 的 preconditions至少一项，`not_suitable` 不影响静态调查。
-
-### 3.5 `claim_review_scope.json` 与 `design_claim_review.json`
-
-Scope逐值包含当前bounded portfolio的全部materialized claims；whole-file digest只作审计，每项review仍按claim/source digest独立复用：
-
-```json
-{"session_id":"session-...","round_id":"ROUND-...","claim_ids":["CLAIM-..."]}
-```
-
-Fresh Spec Critic 输出：
-
-```json
-{
-  "session_id":"session-...","summary":"本批设计审查摘要",
-  "input_digests":{
-    "design_claims.jsonl":"审计用","design_coverage.json":"审计用",
-    "design_inventory.json":"审计用","design_agent_manifest.json":"审计用",
-    "claim_review_scope.json":"审计用"
-  },
-  "claim_reviews":[{
-    "claim_id":"CLAIM-...","session_id":"session-...",
-    "claim_sha256":"该claim canonical JSON SHA-256",
-    "source_sha256":"claim.source_ref.source_sha256",
-    "spec_critic_prompt_version":"spec-critic-v2",
-    "quote_entailment":{"assessment":"entailed|not_entailed|ambiguous","rationale":"..."},
-    "normative_strength":{
-      "assessment":"correct|incorrect|ambiguous",
-      "stated_strength":"mandatory|recommended|optional|declared_capability|informational",
-      "recommended_strength":"上述值之一|undetermined","rationale":"..."
-    },
-    "atomicity":{"assessment":"atomic|bundled|ambiguous","obligations":["识别出的义务"],"rationale":"..."},
-    "applicability":{"assessment":"supported|unsupported|ambiguous","rationale":"..."},
-    "decision":"accept|repair","repair_actions":[]
-  }],
-  "group_reviews":[],
-  "decision":"accept|repair"
-}
-```
-
-`group_reviews` 可省略或为空，默认不做全组完整性证明。只有审查当前 scoped claim时发现会影响其语义的具体 group gap，或有原文证据支持一个 coverage expansion，才增加对应对象：
-
-```json
-{
-    "document_key":"...","session_id":"session-...","group_sha256":"inventory group_sha256",
-    "behavior_families":{"assessment":"complete|gaps_found|ambiguous","rationale":"...","missing_items":[]},
-    "roles":{"assessment":"complete|gaps_found|ambiguous","rationale":"...","missing_items":[]},
-    "branches":{"assessment":"complete|gaps_found|ambiguous","rationale":"...","missing_items":[]},
-    "decision":"accept|repair","repair_actions":[]
-}
-```
-
-每个 `missing_items[]`：
-
-```json
-{"description":"...","path":"...","section":"...","line_start":1,"line_end":2,"quote":"...","why_independent":"...","affected_claim_ids":[]}
-```
-
-不得提交三个 dimension都 `complete` 的例行 group review；至少一个 dimension必须有具体 missing item。Group gap默认是 non-blocking expansion signal；`affected_claim_ids=[]` 时 group decision仍 accept。只有 gap改变 scoped claim的适用性、原子性或含义时列出该 claim，并让对应 claim review repair。无关 claim或未审全组的变化不得使已接受 per-claim review失效。
-
-### 3.6 `investigation_tasks.jsonl` 与 `investigation_rounds.jsonl`
-
-一个 task = 一个 accepted claim 的一个 branch + 一个 falsifiable hypothesis：
-
-```json
-{
-  "task_id":"TASK-...","session_id":"session-...","claim_id":"CLAIM-...",
-  "claim_branch":"逐值等于 <claim.subject> | <claim.trigger>",
-  "hypothesis":"逐值等于 The reachable implementation does not produce the required observable result: <claim.observable_result>",
-  "obligation_sha256":"canonical SHA-256({claim_id,obligation})",
-  "starting_points":["真实入口/边界"],
-  "supporting_evidence_needed":["什么会支持假设"],
-  "disconfirming_evidence_needed":["什么会推翻假设"],
-  "review_lenses":["1-3个contract lens"],
-  "exploration_mode":"contract中的完整mode字符串",
-  "architecture_boundaries":["BOUNDARY-..."],
-  "implementation_planes":["PLANE-..."],
-  "parallel_path_ids":["PARALLEL-..."],
-  "risk_observation_ids":["RISK-..."],
-  "status":"pending|in_progress|complete|deferred",
-  "defer_reason":"仅deferred时",
-  "defer_evidence":{"kind":"provider_failure|tool_failure","attempts":[{"attempt_id":"...","outcome":"failed","evidence":"..."}]}
-}
-```
-
-初始task不得写`coverage_request_sha256/source_gap_ids`。唯一supplement的实际task必须使用新ID/new round，逐值匹配history中的`task_specs`，并复制`source_gap_ids`和`coverage_request_sha256=<request_sha256>`；task-plan snapshot包含history，缺失、扩张或篡改绑定会使gate stale/失败。
-
-`obligation_sha256` 是 UTF-8 canonical JSON（sort_keys、无空格）`{"claim_id":...,"obligation":...}` 的小写 SHA-256。旧 `question` 字段被直接拒绝，即使值等于 `hypothesis` 也不能出现。Task plan验证忽略 lifecycle字段；lifecycle单独验证 status/finding。
-
-Round：
-
-```json
-{
-  "round_id":"ROUND-001","session_id":"session-...","strategy":"证据策略",
-  "exploration_modes":["..."],"document_groups":["..."],
-  "architecture_boundaries":["BOUNDARY-..."],"implementation_planes":["PLANE-..."],
-  "lenses":["..."],"claim_ids":["CLAIM-..."],"task_ids":["TASK-..."],
-  "finding_ids":[],"outcome":"","next_strategy":""
-}
-```
-
-每轮最多 4 task；同一 task恰属一轮。Lifecycle 更新只改 `status/defer_*` 及 round 的 `finding_ids/outcome/next_strategy`。
-
-Frontier有两个独立入口：代码入口从validated risk observation反查精确义务；设计入口从inventory behavior family/section正向链接具体architecture plane/capability surface。设计入口不要求伪造risk observation，但必须有可证伪的代码问题与architecture scope。
-
-Claim portfolio最多12条，只从有design section与代码/能力证据的强evidence pairs物化，不做每文档或每sweep配额。只有subject、trigger、规范分支与代码行为完全相同的重复项才合并；同一代码位置上的不同时序、容量、主动副作用或错误结果义务保持独立。全部claims进入review scope；最多三轮、每轮4个task。Task branch/hypothesis由claim确定性绑定，代码焦点来自trace candidate。
-
-Task plan/lifecycle validator允许 candidate-local继续：两份 trace都必须 `global_passed=true`，且目标 task在各自 `valid_task_ids`；另一个 `invalid_task_ids` 不阻塞。每个 investigator使用独立 `${STATE_ROOT}/handoffs/investigators/<TASK_ID>/`，self-check通过后单 candidate原子 merge并只刷新其 lifecycle。并发 peer失败不得形成 batch-global barrier；final gate仍要求所有 task最终合法完成或有两次 provider/tool failure的结构化 deferred证据。
-
-### 3.7 `investigation_findings.jsonl`
-
-```json
-{
-  "finding_id":"FINDING-...","session_id":"session-...","task_id":"TASK-...","claim_id":"CLAIM-...",
-  "hypothesis":"逐值复制task hypothesis","expected_behavior":"从claim逐值生成的模板字段",
-  "observed_behavior":"代码/配置可证明的实际行为",
-  "design_evidence":[{"document":"...","path":"...","section":"...","line_start":1,"line_end":2,"quote":"逐字原文"}],
-  "code_evidence":[{"file":"...","line_start":1,"line_end":2,"symbol":"...","snippet":"逐字代码"}],
-  "supporting_evidence":["支持假设的事实"],"disconfirming_evidence":["反证或限制"],
-  "false_positive_checks":[{"question":"...","method":"...","target":"...","result":"..."}],
-  "tool_trace":[{"seq":1,"kind":"design_read|code_search|code_navigation|code_read|reverse_check|test|config_read|build_read|analysis","tool":"...","target":"...","purpose":"...","result":"..."}],
-  "dynamic_probe_selection":{"disposition":"selected|not_selected|not_suitable|environment_limited","reason":"..."},
-  "assessment":"contradiction_supported|uncertain|design_satisfied",
-  "review_lenses":["task lenses的子集"],
-  "recommendation":"critic_review|probable|reject"
-}
-```
-
-至少两项 candidate-specific false-positive check；trace 至少含 design_read、search/navigation、code_read、reverse_check。缺能力不能只靠全仓无命中，必须对账入口、构建、注册、配置、邻近能力和替代实现。
-
-### 3.8 `dynamic_probes.jsonl`
-
-只为 finding 中 selected 的最小单点 probe 写一行：
-
-```json
-{
-  "probe_id":"PROBE-...","session_id":"session-...","finding_id":"FINDING-...","claim_id":"CLAIM-...",
-  "oracle":{
-    "source":"design_claim","claim_id":"CLAIM-...","claim_sha256":"当前claim canonical SHA-256",
-    "source_sha256":"claim.source_ref.source_sha256",
-    "preconditions":["逐值复制claim.probe_oracle"],
-    "stimulus":"逐值复制claim.probe_oracle","expected_observation":"逐值复制claim.probe_oracle"
-  },
-  "oracle_validation":{
-    "non_triviality":{"status":"passed|failed|not_run","method":"执行时必填","result":"..."},
-    "secondary_oracle":{
-      "kind":"reference_model|minimal_reference|known_good_path|negative_control|not_available",
-      "status":"passed|failed|not_run","command":"可执行时必填","result":"..."
-    },
-    "evidence_role":"corroborating|auxiliary"
-  },
-  "selection_reason":"...",
-  "isolation":{"kind":"session_copy","workspace":"state/probes下路径","command_cwd":"与workspace相同的绝对路径","original_target_unchanged":true},
-  "baseline":{"status":"passed|failed|not_available","command":"执行时必填","result":"..."},
-  "execution":{"status":"completed|environment_failed|not_executed","command":"完成时必填","exit_code":0,"observed":"...","target_reached":true},
-  "interpretation":"supports_contradiction|disconfirms_contradiction|inconclusive",
-  "limitations":[],
-  "tool_trace":[{"seq":1,"kind":"build_read|test|analysis","tool":"...","target":"...","purpose":"...","result":"..."}]
-}
-```
-
-Workspace 必须位于 `${STATE_ROOT}/probes`。Non-triviality 未 passed、baseline 未 passed、execution 未 completed 或 target 未 reached 时只能 inconclusive。可行时 second oracle 必须执行；不可得时 `kind=not_available,status=not_run,evidence_role=auxiliary`，不能让 probe 单独决定 verdict。
-
-### 3.9 `critic_reviews.jsonl`
-
-```json
-{
-  "review_id":"CRITIC-...","session_id":"session-...","finding_id":"FINDING-...","claim_id":"CLAIM-...",
-  "decision":"confirm_contradiction|confirm_optional_gap|reject_issue|needs_more_evidence",
-  "normative_assessment":{
-    "claim_strength":"mandatory|recommended|optional|declared_capability|informational",
-    "applicability":"supported|unsupported|ambiguous",
-    "obligation_status":"binding_required|binding_recommended|declared_capability|optional_adopted|optional_not_adopted|informational",
-    "actual_conflict":"yes|no|uncertain",
-    "rationale":"设计义务为何适用、是否被采用、actual是否直接冲突"
-  },
-  "challenges":["至少两项具体替代解释"],
-  "checks_performed":["至少两项critic实际执行的检查及结果"],
-  "dynamic_probe_review":{
-    "status":"not_run|supports_contradiction|disconfirms_contradiction|inconclusive",
-    "probe_id":"PROBE-...或空字符串","oracle_validity":"...","environment_validity":"...",
-    "reachability":"...","effect_on_decision":"..."
-  },
-  "review_context":"fresh_subagent","resolution":"挑战如何被解决或未解决","remaining_risks":[]
-}
-```
-
-Critic raw handoff只含这些模型字段。Binding/adopted义务的直接冲突用`confirm_contradiction`；有直接scope、邻近实现与缺失证据的未采用optional branch可用`confirm_optional_gap`，明确不是规范违反。Merge写入digests与`evidence-critic-v4`。
-
-`${STATE_ROOT}/critic_review_history.jsonl` 是 prepare/critic merge专有的只读历史账本，任何Agent不得创建、清空、删除或编辑。相同 evidence review key不能因当前critic ledger删除而改投；只有真实的新claim/finding/probe摘要才允许追加revision，resume缺失历史直接失败。
-
-### 3.10 `semantic_coverage.json` 与 `coverage_audit.json`
-
-Coverage 记录组合缺口，不审批已接受 candidate：
-
-```json
-{
-  "session_id":"session-...",
-  "lenses":[{
-    "lens":"contract中的完整lens",
-    "disposition":"investigated|inapplicable|gap_recorded",
-    "evidence":"...","task_ids":["TASK-..."],"finding_ids":["FINDING-..."],
-    "design_group_refs":["document_key"],"boundary_refs":["BOUNDARY-..."],
-    "counterfactual":"inapplicable/gap的判断依据"
-  }]
-}
-```
-
-```json
-{
-  "session_id":"session-...",
-  "design_documents_reviewed":["相对路径"],"claims_total":0,"claims_investigated":0,
-  "rounds_completed":0,"exploration_modes_completed":["实际执行的mode"],
-  "document_groups_total":0,"document_groups_accounted":0,
-  "code_areas_reviewed":["..."],
-  "architecture_boundaries":[{"boundary_id":"...","status":"investigated|gap_recorded","evidence":"..."}],
-  "remaining_scoped_claims":[{"claim_id":"...","reason":"..."}],
-  "deferred_claims":[{"claim_id":"...","task_id":"...","reason":"..."}],
-  "false_positive_samples_rechecked":["FINDING-..."],
-  "supplement_rounds":0,
-  "remaining_gaps":[{
-    "gap_id":"GAP-...",
-    "kind":"inventory|claim_review_expansion|lens|architecture_boundary|parallel_path|exploration_mode|frontier_claim|critic_request|other",
-    "ref_id":"对应稳定ID或相对路径","reason":"具体缺什么证据","evidence":"当前已知的缺口依据"
-  }],
-  "next_round_tasks":[{
-    "claim_id":"CLAIM-...","claim_branch":"...","hypothesis":"...","obligation_sha256":"...",
-    "exploration_mode":"contract mode","review_lenses":["1-3 lens"],
-    "architecture_boundaries":["BOUNDARY-..."],"implementation_planes":["PLANE-..."],
-    "parallel_path_ids":["PARALLEL-..."],"risk_observation_ids":["RISK-..."],
-    "source_gap_ids":["当前remaining_gaps中的GAP-..."],
-    "priority_reason":"该task填补哪个具体gap"
-  }],
-  "stop_reason":"为何补扫一次或为何剩余gap只记录"
-}
-```
-
-Coverage重新执行task-plan门禁；`remaining_scoped_claims`非空时必须失败。`remaining_gaps`只记当前证据暴露的具体缺口，不为每个未选section、被spec critic拒绝的claim或普通未映射risk造账。`supplement_rounds`只能0/1。只有coverage trace同时`passed=true,closed=true`才能进入Final Judge。
-
-Gap `kind/ref_id`逐值绑定真实对象。`investigated` lens只能引用自身声明该lens的task/finding；否则使用不引用task/finding的`gap_recorded`。未调查high-risk boundary或parallel path仍由对应具体gap记账。
-
-### 3.11 `agent_review_verdicts.jsonl`
-
-Confirmed/probable：
-
-```json
-{
-  "finding_id":"FINDING-...","session_id":"session-...","claim_id":"CLAIM-...",
-  "status":"confirmed|probable","title":"事实标题","confidence":0.9,
-  "severity":"critical|high|medium|low",
-  "issue_type":"missing_behavior|contradictory_behavior|partial_implementation|wrong_boundary|invalid_state_transition|data_contract_mismatch|other",
-  "design_evidence":[],"code_evidence":[],
-  "expected_behavior":"逐值复制finding","actual_behavior":"逐值复制finding.observed_behavior",
-  "inconsistency":"设计与实现如何冲突","impact":"触发条件与功能影响",
-  "scope_applicability":"为何当前输入适用",
-  "false_positive_checks":[],
-  "dynamic_validation":{"status":"not_run|supports_contradiction|disconfirms_contradiction|inconclusive","probe_id":"或空","reason":"..."},
-  "critic_review":{"review_id":"CRITIC-...","decision":"...","normative_assessment":{},"challenges":[],"resolution":"...","review_context":"fresh_subagent"},
-  "tool_trace":[],"generalization_rationale":"结论只来自当前输入","agent_notes":"可选"
-}
-```
-
-Rejected 至少为：
-
-```json
-{"finding_id":"FINDING-...","session_id":"session-...","status":"rejected","rejection_reason":"具体原因"}
-```
-
-每个finding在coverage前完成fresh critic。Final Judge逐项映射；`confirm_contradiction|confirm_optional_gap`映射confirmed，optional gap必须明确不是规范违反。最终报告只发布confirmed，且final gate前禁止写空result。
-
-## 4. Evidence-pair 与判断标准
-
-一个 frontier item 必须有：一个设计义务的一个 branch、一个具体 code risk/capability gap、一个 boundary/明确 plane 与一个 falsifiable hypothesis。不得把整个协议、服务、模块或多个状态分支打进一个 task。
-
-Investigator 必须证明实际入口、调用链、配置/构建与可达行为；检查平行实现、dead code、条件编译、feature flag、adapter 和外部依赖。集合/容量要追终止与溢出行为；链/嵌套要追每次推进；时序要区分同步、延迟、重试和主动副作用；能力缺失要对账构建、注册、入口、配置和邻近能力；边界行为要追到最终 consumer。
-
-Fresh Critic 尽力推翻 candidate：检查 design scope/版本、替代实现、配置补偿、可达性、生成/导入代码、probe oracle 和环境。MUST/SHOULD/MAY/声明能力按真实强度表达；可选或推荐差异不能虚构为强制违规。Catalog provenance 不自动成为 capability promise。
-
-Confirmed 必须同时具备：可验证且适用的设计证据、可验证并证明可达行为/能力缺失的代码证据、明确 expected/actual 矛盾、至少两项候选特定反证排除、investigator/critic闭环、全部 identity/digest/session 一致。Probe 可缺省；probe failure 永远不能单独确认。
-
-## 5. Loop 与时间
-
-- 约 15–25 分钟：input/snapshot、inventory、architecture。
-- 约 30–45 分钟：disjoint breadth exploration 与首批 evidence pairs。
-- 约 45–75 分钟：首批 claim/investigator/critic，目标 90 分钟内出现首个闭环 candidate。
-- 约 60–120 分钟：后续 candidates 与最多一次 coverage supplement。
-- 预留 30–45 分钟：final judge、review、report、gate。
-- 5.5 小时停止启动预计无法闭环的新 candidate；硬上限 6 小时。
-
-Coverage 不能因数量目标创建 task。未覆盖 inventory/section/lens/boundary 可以作为 `remaining_gaps` 保留；已完成 candidate 不受无关 gap 阻塞。全文件 digest 只用于审计与最终完整性，不级联否定已接受的 per-claim review 或稳定 task plan。
+每个 issue 至少包含：差异描述、设计证据和章节、代码证据和行号、原因、误报排除、置信度。Confirmed 只来自规范适用、代码可达、实际冲突和反证均闭环的 finding；证据未闭环用 probable，不得为达到数量降低标准。
