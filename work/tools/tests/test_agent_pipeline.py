@@ -3314,9 +3314,15 @@ def test_unselected_inventory_section_does_not_require_synthetic_gap(workspace):
             },
             "sections": [
                 {
-                    "section_id": "SECTION-CONTRACT",
-                    "source_ref": {"path": "contract.md", "line_start": 1, "line_end": 6},
+                    "section_id": "SECTION-CONTRACT-API",
+                    "source_ref": {"path": "contract.md", "line_start": 3, "line_end": 3},
                     "behavior_families": ["externally visible service contract"],
+                    "ambiguities": [],
+                },
+                {
+                    "section_id": "SECTION-CONTRACT-LIFECYCLE",
+                    "source_ref": {"path": "contract.md", "line_start": 4, "line_end": 6},
+                    "behavior_families": ["session lifecycle"],
                     "ambiguities": [],
                 },
                 {
