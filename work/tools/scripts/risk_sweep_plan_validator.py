@@ -15,9 +15,11 @@ import agent_common as ac
 
 PLAN_NAME = "risk_sweep_plan.json"
 ARCHITECTURE_NAME = "architecture_map.json"
+INVENTORY_NAME = "design_inventory.json"
 CONTRACT_NAME = "agent_loop_contract.json"
 SAFE_SWEEP_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 MAX_IMPLEMENTATION_PLANES_PER_SLICE = 6
+MAX_DESIGN_SECTIONS_PER_SLICE = 12
 MAX_OBSERVATIONS_PER_SWEEP = 8
 
 
@@ -25,6 +27,7 @@ def plan_input_digests(state_root: Path) -> tuple[dict[str, str], str]:
     paths = [
         state_root / "workspace_manifest.json",
         state_root / ARCHITECTURE_NAME,
+        state_root / INVENTORY_NAME,
         state_root / PLAN_NAME,
         state_root / CONTRACT_NAME,
     ]
@@ -72,6 +75,27 @@ def _indexes(architecture: dict[str, Any]) -> tuple[dict[str, dict], dict[str, d
         if isinstance(item, dict) and item.get("path_id")
     }
     return boundaries, planes, paths
+
+
+def _design_sections(
+    inventory: dict[str, Any],
+) -> tuple[dict[str, dict[str, Any]], set[str]]:
+    sections: dict[str, dict[str, Any]] = {}
+    required: set[str] = set()
+    for group in inventory.get("document_groups", []):
+        if not isinstance(group, dict):
+            continue
+        relation = group.get("scope_relation")
+        for section in group.get("sections", []):
+            if not isinstance(section, dict):
+                continue
+            section_id = section.get("section_id")
+            if not isinstance(section_id, str) or not section_id:
+                continue
+            sections[section_id] = section
+            if relation in {"required", "in_scope"}:
+                required.add(section_id)
+    return sections, required
 
 
 def _required_coverage(
@@ -151,6 +175,8 @@ def validate_plan(
     architecture: dict[str, Any],
     architecture_digest: str,
     contract: dict[str, Any],
+    inventory: dict[str, Any] | None = None,
+    inventory_digest: str = "",
     review_code_root: Path | None = None,
 ) -> tuple[list[str], dict[str, Any]]:
     errors: list[str] = []
@@ -162,8 +188,12 @@ def validate_plan(
         errors.append(f"{PLAN_NAME}: plan_id must be a non-empty string")
     if plan.get("architecture_map_sha256") != architecture_digest:
         errors.append(f"{PLAN_NAME}: architecture_map_sha256 is stale")
+    inventory = inventory or {}
+    if plan.get("design_inventory_sha256") != inventory_digest:
+        errors.append(f"{PLAN_NAME}: design_inventory_sha256 is stale")
 
     boundaries, planes, parallel_paths = _indexes(architecture)
+    design_sections, required_design_sections = _design_sections(inventory)
     required_boundaries, required_planes, required_paths = _required_coverage(
         boundaries, planes, parallel_paths,
     )
@@ -201,10 +231,12 @@ def validate_plan(
     coverage_by_kind: dict[str, set[str]] = {
         "boundary": set(), "plane": set(), "path": set(),
     }
+    covered_design_sections: set[str] = set()
     anchor_owners: dict[str, str] = {}
     allowed_keys = {
         "sweep_id", "architecture_boundaries", "implementation_planes",
-        "parallel_path_ids", "anchor_paths", "review_lenses", "scope_rationale",
+        "parallel_path_ids", "anchor_paths", "review_lenses", "design_section_ids",
+        "scope_rationale",
     }
     for index, item in enumerate(raw_slices, start=1):
         label = f"{PLAN_NAME} slices[{index}]"
@@ -248,6 +280,22 @@ def validate_plan(
                 f"{label}.implementation_planes must contain at most "
                 f"{MAX_IMPLEMENTATION_PLANES_PER_SLICE} values"
             )
+        section_values, section_errors = _strings(
+            item.get("design_section_ids"), f"{label}.design_section_ids",
+            allow_empty=False,
+        )
+        errors.extend(section_errors)
+        if len(section_values) > MAX_DESIGN_SECTIONS_PER_SLICE:
+            errors.append(
+                f"{label}.design_section_ids must contain at most "
+                f"{MAX_DESIGN_SECTIONS_PER_SLICE} relevant sections"
+            )
+        unknown_sections = set(section_values) - set(design_sections)
+        if unknown_sections:
+            errors.append(
+                f"{label}.design_section_ids: unknown IDs {sorted(unknown_sections)}"
+            )
+        covered_design_sections.update(section_values)
         for boundary_id in values_by_kind["boundary"]:
             linked_planes = set(
                 boundaries.get(boundary_id, {}).get("plane_ids", [])
@@ -380,6 +428,9 @@ def validate_plan(
         "boundaries": boundaries,
         "planes": planes,
         "parallel_paths": parallel_paths,
+        "design_sections": design_sections,
+        "required_design_sections": required_design_sections,
+        "selected_design_sections": covered_design_sections,
     }
 
 
@@ -388,6 +439,7 @@ def load_validated_plan(state_root: Path) -> tuple[dict[str, Any], dict[str, Any
     try:
         state = ac.load_json(state_root / "agent_loop_state.json")
         architecture = ac.load_json(state_root / ARCHITECTURE_NAME)
+        inventory = ac.load_json(state_root / INVENTORY_NAME)
         contract = ac.load_json(state_root / CONTRACT_NAME)
         plan = ac.load_json(state_root / PLAN_NAME)
     except (OSError, json.JSONDecodeError) as exc:
@@ -410,10 +462,13 @@ def load_validated_plan(state_root: Path) -> tuple[dict[str, Any], dict[str, Any
         else:
             review_code_root = Path(review_value)
     architecture_path = state_root / ARCHITECTURE_NAME
+    inventory_path = state_root / INVENTORY_NAME
     digest = ac.sha256_file(architecture_path) if architecture_path.is_file() else ""
+    inventory_digest = ac.sha256_file(inventory_path) if inventory_path.is_file() else ""
     plan_errors, index = validate_plan(
         plan, session_id=session_id, architecture=architecture,
         architecture_digest=digest, contract=contract,
+        inventory=inventory, inventory_digest=inventory_digest,
         review_code_root=review_code_root,
     )
     errors.extend(plan_errors)
@@ -500,6 +555,16 @@ def validate_observation_against_plan(
         if outside_lenses:
             errors.append(
                 f"{label}: review_lenses escape assigned sweep: {sorted(outside_lenses)}"
+            )
+    observation_sections = item.get("design_section_ids")
+    if isinstance(observation_sections, list):
+        outside_sections = set(observation_sections) - set(
+            sweep.get("design_section_ids", [])
+        )
+        if outside_sections:
+            errors.append(
+                f"{label}: design_section_ids escape assigned sweep: "
+                f"{sorted(outside_sections)}"
             )
     observation_planes = {
         str(value) for value in item.get("implementation_planes", [])

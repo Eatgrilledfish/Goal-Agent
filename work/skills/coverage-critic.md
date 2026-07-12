@@ -8,10 +8,10 @@
 
 ## 审计问题
 
-- 哪些 in-scope/ambiguous document group、inventory section或独立behavior family完全未探索；优先级高于继续深挖已有多个candidate的同一域；
+- 哪些未晋级的design-linked observation已有足以改变结论的直接证据；普通未选section不构成gap；
 - 哪些 high/medium-risk architecture boundary、parallel plane、adapter/imported/generated/fast/slow path没有直接证据；
 - 哪些通用 design semantic lens只有标签，没有真实 task/finding；
-- 哪些 risk observation尚未与设计义务配对；
+- 哪些高信号risk observation尚未与原子义务配对；合规或通用质量observation无需task；
 - 哪些 critic `needs_more_evidence` 是具体、可执行、可能改变结论的问题；
 - 当前 pending/in_progress/deferred状态是否诚实；
 - 是否值得在剩余预算内做一次有明确信息增益的 supplement。

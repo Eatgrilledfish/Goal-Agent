@@ -296,92 +296,39 @@ def test_every_materialized_claim_is_indexed_by_coverage(artifacts):
     assert any("not assigned to coverage groups" in error for error in trace["errors"])
 
 
-def test_required_or_in_scope_group_must_materialize_a_claim(artifacts):
+def test_required_or_in_scope_group_has_no_claim_quota(artifacts):
     coverage = load_coverage(artifacts)
     coverage["document_groups"][0]["claim_ids"] = []
-    ac.save_json(Path(artifacts["state"]) / "design_coverage.json", coverage)
+    state = Path(artifacts["state"])
+    ac.save_json(state / "design_coverage.json", coverage)
+    (state / "design_claims.jsonl").write_text("", encoding="utf-8")
 
     code, trace = run_validator(artifacts, "claims")
 
-    assert code == 1
-    assert trace["error_count_by_code"]["COVERAGE_CLAIM_MISSING"] == 1
-    assert any(
-        "must materialize at least 1 breadth-balanced atomic claims" in error
-        for error in trace["errors"]
-    )
+    assert code == 0
+    assert trace["passed"] is True
 
 
-def test_claim_distribution_uses_behavior_breadth_without_domain_names() -> None:
-    groups = {
-        "broad": {
-            "scope_relation": "required",
-            "sections": [{"behavior_families": ["a", "b", "c", "d"]}],
-        },
-        "narrow": {
-            "scope_relation": "in_scope",
-            "sections": [{"behavior_families": ["x"]}],
-        },
-        "supporting": {
-            "scope_relation": "informational",
-            "sections": [{"behavior_families": ["ignored"]}],
-        },
-    }
-
-    assert validator.required_claim_distribution(groups) == {
-        "broad": 4,
-        "narrow": 1,
-    }
-
-
-def test_claim_distribution_caps_large_portfolio_at_twenty_four() -> None:
-    groups = {
-        f"group-{index:02d}": {
-            "scope_relation": "in_scope",
-            "sections": [{
-                "behavior_families": [f"behavior-{offset}" for offset in range(width)],
-            }],
-        }
-        for index, width in enumerate([37, 33, 33, 27, 26, 22, 20, 19, 15, 13, 13, 11, 11, 10, 10])
-    }
-
-    allocation = validator.required_claim_distribution(groups)
-
-    assert sum(allocation.values()) == 24
-    assert max(allocation.values()) >= 3
-    assert min(allocation.values()) == 1
-
-
-def test_breadth_claims_cover_distinct_sections_before_reusing_one() -> None:
+def test_evidence_pair_claim_portfolio_is_capped_at_twelve() -> None:
     inventory_groups = {
         "broad": {
             "document_key": "broad",
             "members": ["broad.md"],
             "scope_relation": "required",
-            "sections": [
-                {
-                    "section_id": "SECTION-A", "path": "broad.md",
-                    "line_start": 1, "line_end": 2,
-                    "behavior_families": ["a"],
-                },
-                {
-                    "section_id": "SECTION-B", "path": "broad.md",
-                    "line_start": 3, "line_end": 4,
-                    "behavior_families": ["b"],
-                },
-            ],
+            "sections": [],
         },
     }
     claims = {
-        "CLAIM-A": {"path": "broad.md", "line_start": 1, "line_end": 1},
-        "CLAIM-B": {"path": "broad.md", "line_start": 2, "line_end": 2},
+        f"CLAIM-{index:02d}": {"path": "broad.md", "line_start": 1, "line_end": 1}
+        for index in range(13)
     }
     coverage = {
         "session_id": "session",
         "document_groups": [{
             "document_key": "broad", "members": ["broad.md"],
             "disposition": "applicable", "evidence": "The group is in scope.",
-            "claim_ids": ["CLAIM-A", "CLAIM-B"],
-            "behavior_families": ["a", "b"],
+            "claim_ids": list(claims),
+            "behavior_families": [],
         }],
     }
     issues = validator.Issues()
@@ -391,10 +338,25 @@ def test_breadth_claims_cover_distinct_sections_before_reusing_one() -> None:
         {"broad.md": "broad"}, issues,
     )
 
-    assert any(
-        "across at least 2 distinct inventory sections; found 1" in error
-        for error in issues.errors
+    assert any("at most 12 evidence-pair candidates" in error for error in issues.errors)
+
+
+def test_required_inventory_rejects_uncovered_source_lines(artifacts):
+    state = Path(artifacts["state"])
+    inventory = ac.load_json(state / "design_inventory.json")
+    section = inventory["document_groups"][0]["sections"][0]
+    section["line_start"] = 2
+    section["source_ref"]["line_start"] = 2
+    group = inventory["document_groups"][0]
+    group["group_sha256"] = validator.canonical_object_sha256(
+        group, excluded={"group_sha256"},
     )
+    ac.save_json(state / "design_inventory.json", inventory)
+
+    code, trace = run_validator(artifacts, "inventory")
+
+    assert code == 1
+    assert trace["error_count_by_code"]["INVENTORY_SECTION_COVERAGE"] >= 1
 
 
 def test_catalog_provenance_does_not_force_declared_capability(artifacts):

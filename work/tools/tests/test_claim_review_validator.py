@@ -384,16 +384,16 @@ def test_scope_claim_ids_must_be_nonempty_unique_and_known(
     assert any(message in error for error in trace["errors"])
 
 
-def test_claim_review_scope_is_capped_at_twenty_four_claims(review_workspace):
+def test_claim_review_scope_is_capped_at_twelve_claims(review_workspace):
     state = Path(review_workspace["state"])
     scope = ac.load_json(state / "claim_review_scope.json")
-    scope["claim_ids"] = [f"CLAIM-{index}" for index in range(1, 26)]
+    scope["claim_ids"] = [f"CLAIM-{index}" for index in range(1, 14)]
     ac.save_json(state / "claim_review_scope.json", scope)
 
     code, trace = run_validator(review_workspace)
 
     assert code == 1
-    assert any("at most 24 claims" in error for error in trace["errors"])
+    assert any("at most 12 evidence-pair claims" in error for error in trace["errors"])
 
 
 def test_scoped_claims_must_belong_to_a_design_coverage_group(review_workspace):

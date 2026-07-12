@@ -43,8 +43,8 @@ def _install_supplement_request(workspace) -> dict:
     }]
     coverage["next_round_tasks"] = [{
         "claim_id": "CLAIM-001",
-        "claim_branch": "CLAIM-001: alternate reachable evidence path",
-        "hypothesis": "Does an independent entry path enforce the same obligation?",
+        "claim_branch": ac.canonical_claim_branch(claims[0]),
+        "hypothesis": ac.canonical_claim_hypothesis(claims[0]),
         "obligation_sha256": stage_artifact_validator.claim_obligation_sha256(claims[0]),
         "exploration_mode": "design-to-code obligation tracing",
         "review_lenses": [contract["coverage_contract"]["portfolio_lenses"][0]],

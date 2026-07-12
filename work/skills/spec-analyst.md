@@ -6,7 +6,7 @@
 
 ## Inventory mode
 
-输入：`design_agent_manifest.json`、catalog provenance、`review_design_root`、指定 raw/output/trace路径。对 manifest 的每个 `document_key`，阅读 scope/目录/章节，生成轻量地图。Catalog link 只证明 provenance；`required/in_scope` 必须由 supplied design 正面 scope文字支持，不能因为链接存在或代码可能相关而推导 capability承诺。
+输入：`design_agent_manifest.json`、catalog provenance、`review_design_root`、指定 raw/output/trace路径。对 manifest 的每个 `document_key` 生成完整检索地图。Catalog link只证明provenance；`required/in_scope`仍必须由supplied design正面scope文字支持。
 
 写 `${STATE_ROOT}/handoffs/design/inventory.raw.json`。Raw schema只写模型选择的 nested source ranges与语义字段，不写 quote、hash、heading、兼容 top-level path/line或group digest。每个 source对象必须显式包含 `source_ref`；materializer不接受 top-level `path/line_start/line_end` fallback：
 
@@ -30,7 +30,7 @@
 }
 ```
 
-每个 group至少一个真实 section；section range必须落在该 group member内。`behavior_families` 是从当前设计原文动态提炼的语义地图，也是后续 design-origin frontier的轻量seed；每个相互独立的触发条件、角色、时序副作用、集合/链遍历、能力承诺或边界行为应可分别定位，但不是固定 taxonomy、关键词分类或任务配额。保留当前输入自己的领域术语，不要为了通用化改写成抽象的“某模块/某检查”。歧义如实记录。
+每个group至少一个真实section。对`required|in_scope`的每个member，sections必须从第1行连续覆盖到末行且单section不超过800行；按真实章节/行为边界拆分，不能用一个超宽section糊住全文。`behavior_families`保留当前输入的角色、trigger、时序、集合/链、能力与边界术语，不是任务配额。
 
 当文档标为superseded时，不得把其中仍约束兼容模式、旧版本输入或迁移行为的section静默丢弃：把它映射到替代文档中的现行义务，或明确记录版本/适用性歧义，确保该行为仍有seed可供coverage对账。
 
@@ -51,7 +51,7 @@ Materializer 生成最终 `scope_evidence.source_ref.source_sha256`、exact quot
 
 ## Claim resolution mode
 
-输入只包括 inventory、当前 `design_lookup_requests.jsonl`、相关 document/section、现有 design claims/coverage（若有）和输出路径。Lookup request只定位设计问题；你必须独立重读原文。生成一个最多24条的单一bounded portfolio：先为每个`required|in_scope` group生成一条代表性原子claim，再逐槽选择`不同behavior_families数量/当前claim数`最高且仍有独立义务分支的group，直到24条或所有seed用尽。同组多个claim先来自不同inventory sections，section用尽后才在同section选择不同trigger/obligation分支；不得让少数risk lookup占满portfolio，也不为每句话生成claim。最终所有materialized claims都必须进入同一claim review scope。
+输入只包括inventory、最多12条已晋级`design_lookup_requests.jsonl`、相关sections、现有claims/coverage和输出路径。逐项重读原文，只为lookup中的design-code evidence pair物化一个原子claim；不做每文档配额，不为未晋级section或合规observation生成claim。若lookup代码行为与section原文不属于同一subject/trigger，拒绝该lookup而不是换一个无关claim。全部materialized claims进入同一review scope。
 
 先写/更新累计 `${STATE_ROOT}/handoffs/design/claims.raw.jsonl`。可原样保留已有已验证 claim的语义与 ID；新增 claim只需要以下模型字段，materializer会覆盖任何 derived字段：
 
@@ -99,7 +99,7 @@ Materializer 生成最终 `scope_evidence.source_ref.source_sha256`、exact quot
 }
 ```
 
-未 materialize 的义务是 coverage gap，不是 design-check failure。代码中没有同名符号不是 `inapplicable` 证据。
+未materialize的义务只是检索地图内容，不自动成为coverage gap。代码中没有同名符号不是`inapplicable`证据。
 
 执行：
 

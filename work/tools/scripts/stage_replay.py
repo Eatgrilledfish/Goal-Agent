@@ -566,7 +566,8 @@ def _prepare_stage_inputs(
 
     if stage == "risk":
         _copy_named(copier, [
-            ("architecture_map.json", True), ("risk_sweep_plan.json", True),
+            ("architecture_map.json", True), ("design_inventory.json", True),
+            ("risk_sweep_plan.json", True),
         ])
         _plan, index, errors = rpv.load_validated_plan(copier.state_root)
         if errors:
@@ -1125,7 +1126,8 @@ def _prompt_inputs(stage: str, records: list[dict[str, Any]]) -> list[str]:
         },
         "risk": {
             "state/agent_loop_contract.json", "state/architecture_map.json",
-            "state/risk_sweep_plan.json", "state/coverage_supplement_history.json",
+            "state/design_inventory.json", "state/risk_sweep_plan.json",
+            "state/coverage_supplement_history.json",
         },
         "plan": {
             "state/agent_loop_contract.json", "state/architecture_map.json",
@@ -1302,7 +1304,7 @@ def prepare_replay(
     read_roots: dict[str, str] = {}
     if stage in {"risk", "investigator", "probe", "critic"} and paths.get("review_code_root"):
         read_roots["code"] = str(paths["review_code_root"])
-    if stage in {"inventory", "claims", "claim-review", "investigator", "critic"} and paths.get(
+    if stage in {"inventory", "claims", "claim-review", "risk", "investigator", "critic"} and paths.get(
         "review_design_root"
     ):
         read_roots["design"] = str(paths["review_design_root"])

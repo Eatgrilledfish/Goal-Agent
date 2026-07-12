@@ -60,8 +60,8 @@ def _check_issue(issue: dict[str, Any], session_id: str, result_root: Path) -> l
     if review.get("session_id") != session_id:
         errors.append(f"{issue_id}: agent_review session does not match current session")
     critic = review.get("critic_review") if isinstance(review.get("critic_review"), dict) else {}
-    if critic.get("decision") != "confirm_contradiction":
-        errors.append(f"{issue_id}: independent critic did not confirm a contradiction")
+    if critic.get("decision") not in {"confirm_contradiction", "confirm_optional_gap"}:
+        errors.append(f"{issue_id}: independent critic did not confirm an inconsistency")
     if not review.get("tool_trace"):
         errors.append(f"{issue_id}: tool trace missing")
     report_path = Path(str(issue.get("report_path") or ""))
@@ -837,8 +837,10 @@ def run(args: argparse.Namespace) -> int:
         finding = findings[finding_id]
         if finding.get("assessment") != "contradiction_supported":
             errors.append(f"{issue.get('issue_id', '?')}: investigator did not assess a supported contradiction")
-        if critiques[finding_id].get("decision") != "confirm_contradiction":
-            errors.append(f"{issue.get('issue_id', '?')}: critic artifact did not confirm a contradiction")
+        if critiques[finding_id].get("decision") not in {
+            "confirm_contradiction", "confirm_optional_gap",
+        }:
+            errors.append(f"{issue.get('issue_id', '?')}: critic artifact did not confirm an inconsistency")
         task_id = str(finding.get("task_id") or "")
         if task_id not in tasks:
             errors.append(f"{issue.get('issue_id', '?')}: finding does not reference an investigation task")

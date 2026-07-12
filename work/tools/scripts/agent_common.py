@@ -97,6 +97,28 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def canonical_claim_branch(claim: dict[str, Any]) -> str:
+    """Return the task branch text bound to one atomic design claim."""
+    subject = claim.get("subject")
+    trigger = claim.get("trigger")
+    if not isinstance(subject, str) or not subject.strip():
+        return ""
+    if not isinstance(trigger, str) or not trigger.strip():
+        return ""
+    return f"{subject.strip()} | {trigger.strip()}"
+
+
+def canonical_claim_hypothesis(claim: dict[str, Any]) -> str:
+    """Return a contradiction hypothesis that cannot drift from the claim oracle."""
+    observable = claim.get("observable_result")
+    if not isinstance(observable, str) or not observable.strip():
+        return ""
+    return (
+        "The reachable implementation does not produce the required observable result: "
+        f"{observable.strip()}"
+    )
+
+
 def slugify(value: str, max_length: int = 72) -> str:
     slug = re.sub(r"[^A-Za-z0-9]+", "-", value).strip("-").lower()
     return (slug or "issue")[:max_length]

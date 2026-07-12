@@ -329,6 +329,24 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
         },
         "parallel_behavior_paths": [],
     })
+    inventory = design_source_materializer.materialize_inventory({
+        "session_id": workspace["session_id"],
+        "document_groups": [{
+            "document_key": "contract",
+            "members": ["contract.md"],
+            "scope_relation": "required",
+            "scope_evidence": {
+                "source_ref": {"path": "contract.md", "line_start": 1, "line_end": 3},
+            },
+            "sections": [{
+                "section_id": "SECTION-CONTRACT",
+                "source_ref": {"path": "contract.md", "line_start": 1, "line_end": 6},
+                "behavior_families": ["externally visible service contract"],
+                "ambiguities": [],
+            }],
+        }],
+    }, Path(workspace["design"]))
+    ac.save_json(state / "design_inventory.json", inventory)
     contract = ac.load_json(state / "agent_loop_contract.json")
     lenses = contract["coverage_contract"]["portfolio_lenses"]
     architecture_digest = ac.sha256_file(state / "architecture_map.json")
@@ -336,6 +354,7 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
         "session_id": workspace["session_id"],
         "plan_id": "RISK-PLAN-001",
         "architecture_map_sha256": architecture_digest,
+        "design_inventory_sha256": ac.sha256_file(state / "design_inventory.json"),
         "required_coverage": {
             "boundary_ids": ["BOUNDARY-API", "BOUNDARY-AUDIT"],
             "plane_ids": ["PLANE-SERVICE", "PLANE-AUDIT"],
@@ -349,6 +368,7 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
                 "parallel_path_ids": [],
                 "anchor_paths": ["service.py"],
                 "review_lenses": lenses,
+                "design_section_ids": ["SECTION-CONTRACT"],
                 "scope_rationale": "Own the public service API component.",
             },
             {
@@ -358,6 +378,7 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
                 "parallel_path_ids": [],
                 "anchor_paths": ["audit.py"],
                 "review_lenses": lenses,
+                "design_section_ids": ["SECTION-CONTRACT"],
                 "scope_rationale": "Own the independent audit publishing component.",
             },
         ],
@@ -370,6 +391,8 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
         "risk_sweep_plan_sha256": risk_plan_digest,
         "behavior_question": "What behavior is exposed when the public charge entry point is called?",
         "observed_code_behavior": "The public entry point accepts an amount and returns an accepted result without a guard.",
+        "design_section_ids": ["SECTION-CONTRACT"],
+        "design_alignment": "The section defines the behavior of the same public service entry point.",
         "review_lenses": lenses[:3],
         "architecture_boundaries": ["BOUNDARY-API"],
         "implementation_planes": ["PLANE-SERVICE"],
@@ -393,15 +416,20 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
         ],
         "tool_trace": [
             {
-                "seq": 1, "kind": "code_search", "tool": "search", "target": "charge",
+                "seq": 1, "kind": "design_read", "tool": "read",
+                "target": "contract.md:1-6", "purpose": "Read the assigned behavior section.",
+                "result": "The section defines externally visible service behavior.",
+            },
+            {
+                "seq": 2, "kind": "code_search", "tool": "search", "target": "charge",
                 "purpose": "Locate the public entry point.", "result": "Found service.py:1.",
             },
             {
-                "seq": 2, "kind": "code_read", "tool": "read", "target": "service.py:1-2",
+                "seq": 3, "kind": "code_read", "tool": "read", "target": "service.py:1-2",
                 "purpose": "Derive the reachable behavior.", "result": "The function returns accepted directly.",
             },
             {
-                "seq": 3, "kind": "reverse_check", "tool": "search", "target": "charge callers and alternatives",
+                "seq": 4, "kind": "reverse_check", "tool": "search", "target": "charge callers and alternatives",
                 "purpose": "Check for a compensating path.", "result": "No alternate enforcement path exists.",
             },
         ],
@@ -413,6 +441,8 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
         "risk_sweep_plan_sha256": risk_plan_digest,
         "behavior_question": "What behavior is exposed when an audit event is published?",
         "observed_code_behavior": "The independent adapter immediately reports the event as published.",
+        "design_section_ids": ["SECTION-CONTRACT"],
+        "design_alignment": "The section defines externally visible service and audit behavior.",
         "review_lenses": lenses[:3],
         "architecture_boundaries": ["BOUNDARY-AUDIT"],
         "implementation_planes": ["PLANE-AUDIT"],
@@ -437,17 +467,22 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
         ],
         "tool_trace": [
             {
-                "seq": 1, "kind": "code_search", "tool": "search",
+                "seq": 1, "kind": "design_read", "tool": "read",
+                "target": "contract.md:1-6", "purpose": "Read the assigned behavior section.",
+                "result": "The section defines externally visible audit behavior.",
+            },
+            {
+                "seq": 2, "kind": "code_search", "tool": "search",
                 "target": "publish_event", "purpose": "Locate the adapter entry point.",
                 "result": "Found audit.py:1.",
             },
             {
-                "seq": 2, "kind": "code_read", "tool": "read",
+                "seq": 3, "kind": "code_read", "tool": "read",
                 "target": "audit.py:1-2", "purpose": "Derive the adapter behavior.",
                 "result": "The adapter reports publication directly.",
             },
             {
-                "seq": 3, "kind": "reverse_check", "tool": "search",
+                "seq": 4, "kind": "reverse_check", "tool": "search",
                 "target": "audit publisher alternatives", "purpose": "Check compensation paths.",
                 "result": "No alternate publisher exists.",
             },
@@ -552,13 +587,13 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
         if count == 3 and index == 3:
             task_mode = "code-to-design risk backtracking"
             task_risk_ids = ["RISK-AUDIT-001"]
-        hypothesis = "Does the reachable implementation enforce this one design obligation?"
+        hypothesis = ac.canonical_claim_hypothesis(claim)
         obligation_sha256 = stage_artifact_validator.claim_obligation_sha256(claim)
         append(state / "investigation_tasks.jsonl", {
             "task_id": task_id,
             "session_id": workspace["session_id"],
             "claim_id": claim_id,
-            "claim_branch": f"{claim_id}: documented observable branch",
+            "claim_branch": ac.canonical_claim_branch(claim),
             "hypothesis": hypothesis,
             "obligation_sha256": obligation_sha256,
             "starting_points": ["public service entry point"],
@@ -578,7 +613,7 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
             "session_id": workspace["session_id"],
             "task_id": task_id,
             "claim_id": claim_id,
-            "claim_branch": f"{claim_id}: documented observable branch",
+            "claim_branch": ac.canonical_claim_branch(claim),
             "obligation_sha256": obligation_sha256,
             "hypothesis": hypothesis,
             "expected_behavior": f"{quote} Observable result: {quote}",
@@ -1175,7 +1210,7 @@ def test_prepare_is_semantic_neutral_and_writes_agent_contract(workspace):
     assert "paths" not in design_manifest
     assert "code_root" not in json.dumps(design_manifest)
     assert contract["execution_model"] == "opencode-owned-model-driven-loop"
-    assert contract["contract_version"] == 18
+    assert contract["contract_version"] == 19
     assert contract["handoff_integrity"]["max_concurrent_subagent_tasks"] == 2
     assert contract["tool_protocol"]["agent_event_contract"]["required_fields"] == [
         "event", "role", "phase", "scope_id", "scope",
@@ -2214,14 +2249,13 @@ def test_instruction_allows_valid_candidate_to_merge_without_waiting_for_its_pee
 def test_instruction_requires_risk_plan_gate_before_parallel_risk_tasks():
     instruction = (ROOT / "INSTRUCTION.md").read_text(encoding="utf-8")
     gate_position = instruction.index("goal_runner.py risk-plan-check")
-    launch_position = instruction.index("按 plan 启动 fresh `risk-explorer`")
+    launch_position = instruction.index("通过后按plan最多并发两个fresh `risk-explorer`")
     assert gate_position < launch_position
-    assert "通过后" in instruction[gate_position:launch_position]
     assert "primary code scope" in instruction[:launch_position]
-    assert "彼此不得相同或父子重叠" in instruction[:launch_position]
+    assert "互斥primary code scope" in instruction[:launch_position]
 
 
-def test_discovery_policy_uses_dual_entry_frontier_without_synthetic_risk_padding():
+def test_discovery_policy_uses_design_guided_trace_candidates_without_quotas():
     instruction = (ROOT / "INSTRUCTION.md").read_text(encoding="utf-8")
     skill = (ROOT / "work" / "skill" / "SKILL.md").read_text(encoding="utf-8")
     orchestrator = (ROOT / "work" / "skills" / "orchestrator.md").read_text(
@@ -2231,16 +2265,17 @@ def test_discovery_policy_uses_dual_entry_frontier_without_synthetic_risk_paddin
         encoding="utf-8"
     )
 
-    assert "design-origin" in instruction
-    assert "design-origin" in skill
-    assert "Risk observation不是唯一入口" in orchestrator
-    assert "最多六轮" in orchestrator
-    assert "每条accepted claim" in orchestrator
+    assert "设计引导" in instruction
+    assert "双入口" in instruction
+    assert "design section" in instruction
+    assert "设计入口可直接产生candidate" in orchestrator
+    assert "design_section_ids" in risk
+    assert "最多12条" in orchestrator
+    assert "不做每文档或每sweep配额" in orchestrator
     assert "passed=true,closed=true" in orchestrator
-    assert "不要求observation并集覆盖整个slice" in risk
-    assert "不得制造 observation" in risk
-    assert "当前 supplied design" in instruction
-    assert "动态发现" in skill
+    assert "不得为了填充数量制造 observation" in risk
+    assert "supplied design" in instruction
+    assert "evidence" in skill.lower()
 
 
 def test_prepare_resumes_same_session_without_erasing_handoffs(workspace):
@@ -3315,7 +3350,7 @@ def test_unselected_inventory_section_does_not_require_synthetic_gap(workspace):
             "sections": [
                 {
                     "section_id": "SECTION-CONTRACT-API",
-                    "source_ref": {"path": "contract.md", "line_start": 3, "line_end": 3},
+                    "source_ref": {"path": "contract.md", "line_start": 1, "line_end": 3},
                     "behavior_families": ["externally visible service contract"],
                     "ambiguities": [],
                 },
@@ -3335,6 +3370,23 @@ def test_unselected_inventory_section_does_not_require_synthetic_gap(workspace):
         }],
     }, Path(workspace["design"]))
     ac.save_json(state / "design_inventory.json", inventory)
+    plan = ac.load_json(state / "risk_sweep_plan.json")
+    plan["design_inventory_sha256"] = ac.sha256_file(state / "design_inventory.json")
+    for item in plan["slices"]:
+        item["design_section_ids"] = [
+            "SECTION-CONTRACT-API", "SECTION-CONTRACT-LIFECYCLE",
+            "SECTION-NOT-MATERIALIZED",
+        ]
+    ac.save_json(state / "risk_sweep_plan.json", plan)
+    plan_digest = ac.sha256_file(state / "risk_sweep_plan.json")
+    risks, risk_errors = ac.load_jsonl(state / "risk_observations.jsonl")
+    assert risk_errors == []
+    for item in risks:
+        item["risk_sweep_plan_sha256"] = plan_digest
+        item["design_section_ids"] = ["SECTION-CONTRACT-API"]
+    (state / "risk_observations.jsonl").write_text(
+        "".join(json.dumps(item) + "\n" for item in risks), encoding="utf-8",
+    )
     review = ac.load_json(state / "design_claim_review.json")
     review["group_reviews"][0]["group_sha256"] = inventory["document_groups"][0]["group_sha256"]
     ac.save_json(state / "design_claim_review.json", review)

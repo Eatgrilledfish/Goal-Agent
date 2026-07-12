@@ -35,6 +35,8 @@ def _risk(
         "risk_sweep_plan_sha256": "plan-sha256",
         "behavior_question": "Can the reachable entry point bypass the expected guard?",
         "observed_code_behavior": "The reachable entry point returns without a guard.",
+        "design_section_ids": ["SECTION-CONTRACT"],
+        "design_alignment": "The section defines the behavior of this reachable entry point.",
         "review_lenses": ["externally visible behavior"],
         "architecture_boundaries": (
             ["BOUNDARY-API"] if boundary_ids is None else boundary_ids
@@ -72,6 +74,14 @@ def _risk(
         "tool_trace": [
             {
                 "seq": 1,
+                "kind": "design_read",
+                "tool": "read",
+                "target": "contract.md:1-6",
+                "purpose": "Read the assigned behavior section.",
+                "result": "The section defines the reachable entry point behavior.",
+            },
+            {
+                "seq": 2,
                 "kind": "code_search",
                 "tool": "search",
                 "target": "charge",
@@ -79,7 +89,7 @@ def _risk(
                 "result": "Found service.py:1.",
             },
             {
-                "seq": 2,
+                "seq": 3,
                 "kind": "code_read",
                 "tool": "read",
                 "target": "service.py:1-2",
@@ -87,7 +97,7 @@ def _risk(
                 "result": "The function returns directly.",
             },
             {
-                "seq": 3,
+                "seq": 4,
                 "kind": "reverse_check",
                 "tool": "search",
                 "target": "charge callers and adapters",
@@ -166,6 +176,18 @@ def test_risk_contract_requires_sweep_provenance_fields(field: str) -> None:
     item.pop(field)
     errors = hm.validate_artifact(item, "risk", "risk (RISK-1)")
     assert any(field in error for error in errors)
+
+
+def test_risk_trace_requires_a_real_design_read() -> None:
+    item = _risk("RISK-1", "session", "SWEEP-CONTROL")
+    item["tool_trace"] = [
+        dict(step, seq=index)
+        for index, step in enumerate(item["tool_trace"][1:], start=1)
+    ]
+
+    errors = hm.validate_artifact(item, "risk", "risk (RISK-1)")
+
+    assert any("tool_trace lacks design_read" in error for error in errors)
 
 
 @pytest.mark.parametrize(

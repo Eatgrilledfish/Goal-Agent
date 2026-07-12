@@ -17,7 +17,22 @@ import risk_sweep_plan_validator as validator  # noqa: E402
 
 SESSION_ID = "session-risk-plan-test"
 ARCHITECTURE_DIGEST = "architecture-digest"
+INVENTORY_DIGEST = "inventory-digest"
 LENSES = ["normative behavior", "alternate execution path"]
+
+
+def _inventory() -> dict:
+    return {
+        "session_id": SESSION_ID,
+        "document_groups": [{
+            "document_key": "design",
+            "scope_relation": "required",
+            "sections": [
+                {"section_id": "SECTION-A"},
+                {"section_id": "SECTION-B"},
+            ],
+        }],
+    }
 
 
 def _architecture(*, distinct_boundary_paths: bool = False) -> dict:
@@ -82,6 +97,7 @@ def _valid_plan(
         "session_id": SESSION_ID,
         "plan_id": "RISK-PLAN-001",
         "architecture_map_sha256": architecture_digest,
+        "design_inventory_sha256": INVENTORY_DIGEST,
         "required_coverage": {
             "boundary_ids": ["BOUNDARY-A", "BOUNDARY-B"],
             "plane_ids": ["PLANE-A", "PLANE-B"],
@@ -97,6 +113,7 @@ def _valid_plan(
                     architecture, "BOUNDARY-A", "PLANE-A",
                 ),
                 "review_lenses": LENSES,
+                "design_section_ids": ["SECTION-A"],
                 "scope_rationale": "Own the independent A component.",
             },
             {
@@ -108,6 +125,7 @@ def _valid_plan(
                     architecture, "BOUNDARY-B", "PLANE-B",
                 ),
                 "review_lenses": LENSES,
+                "design_section_ids": ["SECTION-B"],
                 "scope_rationale": "Own the independent B component.",
             },
         ],
@@ -121,6 +139,7 @@ def _validate(plan: dict, architecture: dict) -> tuple[list[str], dict]:
         architecture=architecture,
         architecture_digest=ARCHITECTURE_DIGEST,
         contract=_contract(),
+        inventory=_inventory(), inventory_digest=INVENTORY_DIGEST,
     )
 
 
@@ -130,7 +149,11 @@ def _write_valid_state(tmp_path: Path) -> tuple[Path, dict]:
     architecture = _architecture()
     ac.save_json(state_root / validator.ARCHITECTURE_NAME, architecture)
     architecture_digest = ac.sha256_file(state_root / validator.ARCHITECTURE_NAME)
+    inventory = _inventory()
+    ac.save_json(state_root / validator.INVENTORY_NAME, inventory)
+    inventory_digest = ac.sha256_file(state_root / validator.INVENTORY_NAME)
     plan = _valid_plan(architecture, architecture_digest)
+    plan["design_inventory_sha256"] = inventory_digest
     ac.save_json(state_root / validator.PLAN_NAME, plan)
     ac.save_json(state_root / validator.CONTRACT_NAME, _contract())
     ac.save_json(
@@ -157,6 +180,7 @@ def _observation(
         "implementation_planes": [plane] if plane else [],
         "parallel_path_ids": [path_id] if path_id else [],
         "review_lenses": [lens],
+        "design_section_ids": ["SECTION-A" if sweep == "SWEEP-A" else "SECTION-B"],
         "code_evidence": [{"file": code_file, "line_start": 1, "line_end": 1}],
     }
 
@@ -169,6 +193,43 @@ def test_accepts_exactly_two_independent_architecture_components() -> None:
     assert set(index["slices"]) == {"SWEEP-A", "SWEEP-B"}
     assert len(index["components"]) == 2
     assert all(len(component) == 3 for component in index["components"])
+
+
+def test_complete_inventory_does_not_force_every_section_into_deep_sweeps() -> None:
+    architecture = _architecture()
+    plan = _valid_plan(architecture)
+    plan["slices"][1]["design_section_ids"] = ["SECTION-A"]
+
+    errors, index = _validate(plan, architecture)
+
+    assert errors == []
+    assert index["required_design_sections"] == {"SECTION-A", "SECTION-B"}
+    assert index["selected_design_sections"] == {"SECTION-A"}
+
+
+def test_rejects_more_than_twelve_design_sections_in_one_slice() -> None:
+    architecture = _architecture()
+    inventory = _inventory()
+    inventory["document_groups"][0]["sections"] = [
+        {"section_id": f"SECTION-{index:02d}"} for index in range(13)
+    ]
+    plan = _valid_plan(architecture)
+    plan["slices"][0]["design_section_ids"] = [
+        f"SECTION-{index:02d}" for index in range(13)
+    ]
+    plan["slices"][1]["design_section_ids"] = ["SECTION-00"]
+
+    errors, _index = validator.validate_plan(
+        plan,
+        session_id=SESSION_ID,
+        architecture=architecture,
+        architecture_digest=ARCHITECTURE_DIGEST,
+        contract=_contract(),
+        inventory=inventory,
+        inventory_digest=INVENTORY_DIGEST,
+    )
+
+    assert any("design_section_ids must contain at most 12" in error for error in errors)
 
 
 def test_rejects_partial_lens_portfolio_in_any_slice() -> None:
@@ -225,6 +286,7 @@ def test_accepts_more_than_two_focused_slices() -> None:
             "parallel_path_ids": [path_id],
             "anchor_paths": [code_path],
             "review_lenses": LENSES,
+            "design_section_ids": ["SECTION-A"],
             "scope_rationale": f"Own focused component {suffix} ({lens}).",
         })
 
@@ -289,6 +351,7 @@ def test_rejects_repository_root_as_an_unfocused_anchor() -> None:
         "parallel_path_ids": ["PATH-A", "PATH-B"],
         "anchor_paths": [".", "entry/a.py", "entry/b.py", "impl/b.py"],
         "review_lenses": LENSES,
+        "design_section_ids": ["SECTION-A", "SECTION-B"],
         "scope_rationale": "Own the single connected repository component.",
     }]
 
@@ -337,6 +400,7 @@ def test_accepts_one_slice_when_parallel_path_couples_all_risk_nodes() -> None:
         "parallel_path_ids": ["PATH-SHARED"],
         "anchor_paths": ["src/a.py", "src/b.py"],
         "review_lenses": LENSES,
+        "design_section_ids": ["SECTION-A", "SECTION-B"],
         "scope_rationale": "The shared parallel path makes this one coupled component.",
     }]
 
@@ -387,6 +451,7 @@ def test_accepts_connected_architecture_split_by_disjoint_primary_code_scope() -
             "parallel_path_ids": ["PATH-SHARED"],
             "anchor_paths": ["entry/a.py", "impl/a.py"],
             "review_lenses": LENSES,
+            "design_section_ids": ["SECTION-A"],
             "scope_rationale": "Inspect one disjoint pair of primary code paths.",
         },
         {
@@ -396,6 +461,7 @@ def test_accepts_connected_architecture_split_by_disjoint_primary_code_scope() -
             "parallel_path_ids": ["PATH-SHARED"],
             "anchor_paths": ["entry/b.py", "impl/b.py"],
             "review_lenses": LENSES,
+            "design_section_ids": ["SECTION-B"],
             "scope_rationale": "Inspect the other disjoint pair of primary code paths.",
         },
     ]
@@ -419,6 +485,7 @@ def test_allows_architecture_ids_to_be_shared_across_disjoint_primary_scopes() -
             "parallel_path_ids": ["PATH-A"],
             "anchor_paths": ["src/a.py"],
             "review_lenses": LENSES,
+            "design_section_ids": ["SECTION-A"],
             "scope_rationale": "Inspect the first disjoint primary path.",
         },
         {
@@ -428,6 +495,7 @@ def test_allows_architecture_ids_to_be_shared_across_disjoint_primary_scopes() -
             "parallel_path_ids": ["PATH-A", "PATH-B"],
             "anchor_paths": ["src/b.py"],
             "review_lenses": LENSES,
+            "design_section_ids": ["SECTION-B"],
             "scope_rationale": "Inspect the second disjoint primary path.",
         },
     ]

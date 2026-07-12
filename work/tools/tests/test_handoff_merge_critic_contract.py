@@ -415,6 +415,27 @@ def test_optional_claim_requires_adoption_to_confirm(critic_state):
     assert result["validated_ids"] == ["FINDING-1"]
 
 
+def test_unadopted_optional_branch_can_be_confirmed_as_explicit_gap(critic_state):
+    state = Path(critic_state["state"])
+    claims, errors = ac.load_jsonl(state / "design_claims.jsonl")
+    assert errors == []
+    claims[0]["normative_strength"] = "optional"
+    _write_jsonl(state / "design_claims.jsonl", claims)
+
+    critic = _critic(str(critic_state["session_id"]))
+    critic["decision"] = "confirm_optional_gap"
+    critic["normative_assessment"].update({
+        "claim_strength": "optional",
+        "applicability": "supported",
+        "actual_conflict": "no",
+        "obligation_status": "optional_not_adopted",
+    })
+
+    result = _merge(critic_state, critic)
+
+    assert result["validated_ids"] == ["FINDING-1"]
+
+
 @pytest.mark.parametrize("remaining_risks", [None, "none", {}])
 def test_remaining_risks_must_be_an_array(critic_state, remaining_risks):
     critic = _critic(str(critic_state["session_id"]))

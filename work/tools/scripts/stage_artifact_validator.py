@@ -679,16 +679,8 @@ def _validate_round_lifecycle(
             continue
         if not earliest_open:
             earliest_open = round_ids[round_index]
-        for later_index in range(round_index + 1, len(ordered_task_ids)):
-            later_round_id = round_ids[later_index]
-            for later_task_id in ordered_task_ids[later_index]:
-                if later_task_id not in tasks:
-                    continue
-                _candidate_error(
-                    errors_by_task, later_task_id,
-                    f"investigation round {later_round_id}: cannot exist while earlier round "
-                    f"{round_ids[round_index]} has open tasks {open_ids}",
-                )
+        # Later rounds may be planned in advance. Execution remains ordered by
+        # handoff_template, which only admits candidates from earliest_open.
     return earliest_open
 
 
@@ -782,6 +774,17 @@ def _task_plan_contract_errors(
         errors.append(
             f"{label}: obligation_sha256 does not match the linked claim obligation"
         )
+    if claim is not None:
+        expected_branch = ac.canonical_claim_branch(claim)
+        expected_hypothesis = ac.canonical_claim_hypothesis(claim)
+        if task.get("claim_branch") != expected_branch:
+            errors.append(
+                f"{label}: claim_branch does not match the linked claim subject/trigger"
+            )
+        if task.get("hypothesis") != expected_hypothesis:
+            errors.append(
+                f"{label}: hypothesis does not match the linked claim observable result"
+            )
     return errors
 
 
@@ -970,13 +973,6 @@ def validate_task_plan_stage(
         for risk_id in tasks[task_id].get("risk_observation_ids", [])
         if risk_id in risks and risks[risk_id].get("sweep_id")
     }
-    missing_risk_sweeps = completed_risk_sweeps - represented_risk_sweeps
-    if missing_risk_sweeps:
-        global_errors.append(
-            "initial evidence-pair frontier must include at least one "
-            "code-to-design task from every completed risk sweep; "
-            f"missing={sorted(missing_risk_sweeps)}"
-        )
     valid_task_ids = sorted(
         task_id for task_id, task_errors in errors_by_task.items() if not task_errors
     )

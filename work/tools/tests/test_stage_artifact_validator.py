@@ -176,7 +176,7 @@ def test_task_check_requires_each_task_in_exactly_one_round(workspace):
     )
 
 
-def test_task_check_freezes_later_round_until_earlier_round_drains(workspace):
+def test_task_check_allows_later_round_planning_while_earlier_round_runs(workspace):
     populate_handoffs(workspace)
     _prepare_claim_scope(workspace)
     state = workspace["state"]
@@ -214,12 +214,10 @@ def test_task_check_freezes_later_round_until_earlier_round_drains(workspace):
     _rewrite_jsonl(state / "investigation_rounds.jsonl", [first, second])
 
     proc = _run_stage(workspace, "task-lifecycle-check", check=False)
-    assert proc.returncode == 1
+    assert proc.returncode == 0
     trace = ac.load_json(workspace["logs"] / "trace" / "task_lifecycle_validation.json")
-    assert any(
-        "ROUND-002: cannot exist while earlier round ROUND-001" in error
-        for error in trace["errors"]
-    )
+    assert trace["passed"] is True
+    assert trace["metrics"]["earliest_open_round"] == "ROUND-001"
 
 
 def test_claim_review_rejects_partial_materialized_claim_scope(workspace):
@@ -256,7 +254,7 @@ def test_claim_review_rejects_partial_materialized_claim_scope(workspace):
     )
 
 
-def test_initial_frontier_rejects_design_only_entry_when_risks_exist(workspace):
+def test_initial_frontier_allows_design_linked_entry_without_sweep_quota(workspace):
     populate_handoffs(workspace)
     _prepare_claim_scope(workspace)
     state = workspace["state"]
@@ -269,15 +267,10 @@ def test_initial_frontier_rejects_design_only_entry_when_risks_exist(workspace):
     _rewrite_jsonl(state / "investigation_tasks.jsonl", tasks)
 
     proc = _run_stage(workspace, "task-plan-check", check=False)
-    assert proc.returncode == 1
-    trace = ac.load_json(workspace["logs"] / "trace" / "task_plan_validation.json")
-    assert any(
-        "code-to-design task from every completed risk sweep" in error
-        for error in trace["errors"]
-    )
+    assert proc.returncode == 0
 
 
-def test_initial_frontier_rejects_an_unrepresented_completed_risk_sweep(workspace):
+def test_initial_frontier_does_not_require_every_sweep_to_seed_a_task(workspace):
     populate_handoffs(workspace)
     _prepare_claim_scope(workspace)
     state = workspace["state"]
@@ -295,11 +288,7 @@ def test_initial_frontier_rejects_an_unrepresented_completed_risk_sweep(workspac
 
     proc = _run_stage(workspace, "task-plan-check", check=False)
 
-    assert proc.returncode == 1
-    trace = ac.load_json(workspace["logs"] / "trace" / "task_plan_validation.json")
-    assert any(
-        "missing=['RISK-SWEEP-AUDIT']" in error for error in trace["errors"]
-    )
+    assert proc.returncode == 0
 
 
 def test_initial_frontier_rejects_code_risk_as_its_only_entry(workspace):

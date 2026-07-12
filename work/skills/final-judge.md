@@ -7,6 +7,7 @@
 ## 状态映射
 
 - Finding `contradiction_supported` + critic `confirm_contradiction`，且 critic `normative_assessment` 为 applicability=supported、actual_conflict=yes、义务属于 mandatory/recommended/declared capability/有正面采用证据的 optional branch，并且可达实际行为、矛盾、反证与identity全部闭环 → `confirmed`。
+- Finding `contradiction_supported` + critic `confirm_optional_gap`，且 applicability=supported、actual_conflict=no、obligation_status=optional_not_adopted并有直接缺失证据 → `confirmed`；title、issue_type和inconsistency必须明确这是optional design gap而非规范违反。
 - Finding `contradiction_supported|uncertain` + critic `needs_more_evidence` → `probable`；其未闭环内容必须事实化表达。
 - Finding `contradiction_supported|uncertain` + critic `reject_issue` → `rejected`。
 - Finding `design_satisfied` + critic `reject_issue` → `rejected`；没有独立critic不能闭环。
@@ -24,7 +25,7 @@
   "title":"只陈述当前设计/实现差异的事实标题",
   "confidence":0.9,
   "severity":"critical|high|medium|low",
-  "issue_type":"missing_behavior|contradictory_behavior|partial_implementation|wrong_boundary|invalid_state_transition|data_contract_mismatch|other",
+  "issue_type":"missing_behavior|optional_design_gap|contradictory_behavior|partial_implementation|wrong_boundary|invalid_state_transition|data_contract_mismatch|other",
   "design_evidence":[{"document":"...","path":"...","section":"...","line_start":1,"line_end":2,"quote":"逐值复制finding"}],
   "code_evidence":[{"file":"...","line_start":1,"line_end":2,"symbol":"...","snippet":"逐值复制finding"}],
   "expected_behavior":"逐值复制finding.expected_behavior",
@@ -55,6 +56,8 @@
 必须逐值复制 finding 的 `design_evidence`、`code_evidence`、`expected_behavior`、`observed_behavior→actual_behavior`、`false_positive_checks`、`tool_trace`。必须逐值复制 critic 的 `review_id/decision/normative_assessment/challenges/resolution/review_context`。不得在 judge阶段润色这些字段；解释性新文本只可写 `title/inconsistency/impact/scope_applicability/generalization_rationale`，且不能引入新事实。
 
 Confidence为0..1数字；severity只用枚举。规范强度按 claim真实表达：recommended/optional/capability差异不能伪称 MUST violation。影响只写可由当前触发/行为证据支持的功能后果。
+
+Coverage或review未通过时不得写`/result`、不得生成空issues文件，也不得把pending task改写成deferred后宣告完成。
 
 若 finding未选择 probe：
 

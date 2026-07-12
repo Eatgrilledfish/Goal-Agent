@@ -479,9 +479,9 @@ def run(args: argparse.Namespace) -> int:
             f"claim_review_scope.json has duplicate claim_ids: {duplicate_scope_claim_ids}"
         )
     scope_claim_ids = set(scope_claim_id_values)
-    if len(scope_claim_ids) > 24:
+    if len(scope_claim_ids) > 12:
         errors.append(
-            "claim_review_scope.json may contain at most 24 claims per full review"
+            "claim_review_scope.json may contain at most 12 evidence-pair claims per full review"
         )
     unknown_scope_claim_ids = sorted(scope_claim_ids - claim_ids)
     if unknown_scope_claim_ids:

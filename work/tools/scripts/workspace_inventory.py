@@ -375,7 +375,7 @@ def loop_contract(
     state_root = Path(paths["state_root"])
     artifacts = {name: str(state_root / filename) for name, filename in ARTIFACT_NAMES.items()}
     return {
-        "contract_version": 18,
+        "contract_version": 19,
         "execution_model": "opencode-owned-model-driven-loop",
         "session": {
             "session_id": session_id,
@@ -404,9 +404,8 @@ def loop_contract(
                 "owner": "spec-analyst",
                 "output": artifacts["design_inventory"],
                 "done_when": (
-                    "Every manifest document group has an evidence-backed scope relation and a light section/behavior map; "
-                    "each independent behavior family remains a design-origin frontier seed, while no full claim portfolio "
-                    "or implementation verdict is produced."
+                    "Every manifest document group has an evidence-backed scope relation and a complete bounded section/behavior map; "
+                    "required and in-scope source files have no uncovered spans, while no implementation verdict is produced."
                 ),
             },
             {
@@ -415,7 +414,7 @@ def loop_contract(
                 "output": [artifacts["risk_sweep_plan"], artifacts["risk_observations"]],
                 "done_when": (
                     "A digest-bound plan covers every required architecture ID through focused, non-overlapping primary code scopes of at most six implementation planes; "
-                    "each scope receives the complete lens portfolio and emits at most eight concrete high-information semantic leads, "
+                    "each scope selects at most twelve semantically relevant inventory sections through both code-to-design and design-to-code retrieval; each scope receives the complete lens portfolio and emits at most eight design-linked semantic leads, "
                     "and the scheduler runs at most two mutually exclusive tasks at once while design inventory may occupy one slot."
                 ),
             },
@@ -427,8 +426,8 @@ def loop_contract(
                     artifacts["design_claims"],
                 ],
                 "done_when": (
-                    "Design-origin and code-origin evidence-pair frontier obligations are materialized as atomic claims from source_ref spans; "
-                    "the breadth-balanced portfolio is capped at 24 with one claim per required/in-scope group before proportional behavior-family allocation, "
+                    "The strongest design-code trace candidates are materialized as atomic claims from source_ref spans; "
+                    "the evidence-pair portfolio is capped at 12 without document quotas, "
                     "and exact quotes/source hashes are derived deterministically."
                 ),
             },
@@ -446,8 +445,7 @@ def loop_contract(
                 "owner": "orchestrator",
                 "output": artifacts["investigation_tasks"],
                 "done_when": (
-                    "Every accepted claim is converted into an evidence question using vocabulary dynamically discovered from the current input; "
-                    "the initial frontier starts from both design behavior seeds and code risk observations."
+                    "Every accepted evidence-pair claim is converted into a claim-bound task; branch and hypothesis are deterministic projections of the claim, while code focus comes from its trace candidate."
                 ),
             },
             {
@@ -562,7 +560,7 @@ def loop_contract(
             "risk_discovery_batch": (
                 "After risk-plan-check, keep at most two tasks active. Start one design-inventory task and one risk sweep; "
                 "as either completes, fill the free slot with the next disjoint risk slice or bounded design-resolution task. "
-                "Every sweep owns a disjoint primary anchor scope, receives the complete lens portfolio, and writes one isolated handoff with at most eight observations; architecture IDs may repeat only when they have local paths in each scope. Observations are sparse semantic leads, "
+                "Every sweep owns a disjoint primary anchor scope, receives assigned design sections plus the complete lens portfolio, and writes one isolated handoff with at most eight design-linked observations; architecture IDs may repeat only when they have local paths in each scope. Observations are trace candidates, "
                 "not an exact restatement of every assigned ID or lens."
             ),
             "parallel_write_rule": "Each risk/investigator/probe/critic task writes one isolated JSON file under state/handoffs; never append to a shared JSONL from parallel tasks.",
@@ -669,7 +667,7 @@ def loop_contract(
             "design": [
                 "Account for every document_key in workspace_manifest.design.document_groups.",
                 "A supplied document is potentially applicable by default. Absence of matching symbols is not evidence of inapplicability; it may indicate a feature gap.",
-                "Every document group needs a source-grounded scope_relation and section map in design_inventory; every required/in_scope group contributes at least one atomic claim, with no more than 24 reviewed claims total.",
+                "Every document group needs a source-grounded scope_relation and section map in design_inventory; required/in_scope files are completely covered by bounded sections. Claims are created only for concrete design-code evidence pairs, with no more than 12 reviewed claims total.",
                 "A catalog link proves provenance, not a product capability commitment. required/in_scope capability claims need positive supplied-design scope evidence.",
                 "Informational/superseded/ambiguous scope relations need supplied-design evidence, not project reputation or missing code symbols.",
                 "A superseded document's compatibility, migration, or legacy-mode behavior must map to a replacement obligation or remain an explicit ambiguity seed; it cannot silently disappear.",
@@ -696,20 +694,19 @@ def loop_contract(
                 "single coverage supplement. Listing a lens only in a round is insufficient."
             ),
             "claim_rule": (
-                "Design inventory is the searchable breadth map. Build one bounded portfolio of at most 24 claims: assign one to every required/in-scope group, then allocate remaining slots by behavior-family breadth divided by current claims. "
-                "Review every materialized claim and create at least one task for every accepted claim. Every completed risk sweep with observations is referenced by at least one code-to-design task. A compliant finding is valid evidence but cannot be published. "
-                "Optional/recommended behavior and completely absent capabilities remain eligible design claims; normative strength affects "
+                "Design inventory is the searchable breadth map. Materialize at most 12 claims from either validated design-linked observations or design sections mapped to concrete architecture planes/capability surfaces, including structured capability-absence evidence; do not allocate claims by document count. "
+                "Review every materialized claim and create one claim-bound task for every accepted claim. A compliant finding is valid evidence but cannot be published. "
+                "Optional/recommended behavior and completely absent capabilities remain eligible; a directly evidenced unadopted optional branch is published only as an optional design gap, never as a violation. Normative strength affects "
                 "classification and severity. Coverage gaps record only concrete evidence limitations exposed by the bounded frontier; they do not enumerate every unselected section, rejected claim, or ordinary unmapped risk."
             ),
             "boundary_rule": (
-                "Code-only risk sweeps account for every high-risk integration boundary. Candidate investigation either links a completed "
+                "Design-guided trace sweeps account for every high-risk integration boundary. Candidate investigation either links a completed "
                 "task/finding or records the concrete unmapped boundary as a coverage gap; a gap does not invalidate an already confirmed candidate."
             ),
             "risk_backtracking_rule": (
-                "Fresh code-only risk explorers inspect every assigned high-risk boundary and plane but emit only concrete, code-evidenced semantic leads; "
-                "observations need not exactly restate every planned ID or lens. "
-                "A code-to-design task must reference at least one validated risk observation sharing a boundary and plane; "
-                "every completed sweep that produced observations must seed at least one such initial task. Writing the exploration-mode label alone is not evidence that the mode ran."
+                "Fresh design-guided trace explorers read their assigned inventory sections and inspect every assigned boundary and plane, emitting only concrete code/design alignment questions. "
+                "Every observation names the design sections whose behavior it traces and explains the semantic alignment. "
+                "A code-to-design task references a validated observation sharing a boundary and plane; irrelevant or compliant observations do not require tasks."
             ),
             "anti_shortcut": "Prior maturity, upstream origin, popularity, and a few compliant samples are not evidence that the supplied implementation is fully consistent.",
             "dynamic_probe": {
@@ -736,11 +733,11 @@ def loop_contract(
         "iteration_policy": {
             "round_artifact": artifacts["rounds"],
             "max_tasks_per_round": 4,
-            "maximum_initial_frontier_rounds": 6,
+            "maximum_initial_frontier_rounds": 3,
             "maximum_coverage_supplement_rounds": 1,
             "initial_frontier_policy": (
-                "Review every accepted claim before coverage, using at most six rounds of four tasks (24 accepted claims total). "
-                "Include design-to-code and capability-absence work where applicable, and diversify document groups before deepening one domain."
+                "Investigate the at most 12 accepted evidence pairs in at most three rounds of four tasks. Later rounds may be planned in advance but execute only after the earliest open round drains. "
+                "Prioritize direct normative conflicts, externally visible behavior, and concrete absence evidence over document diversity."
             ),
             "coverage_supplement_history": (
                 "prepare and coverage-check exclusively write the history artifact. Agents read it but never create, reset, or edit it; "
@@ -769,7 +766,7 @@ def loop_contract(
                 "Every confirmed finding passed independent critique and source verification.",
                 "The final gate passes within the time budget.",
             ],
-            "never": "Do not use a candidate or issue count to select tasks, stop coverage, or lower evidence standards.",
+            "never": "Do not use a target issue count to lower evidence standards. Do not declare completion, rewrite pending tasks as deferred, or write result files before final_gate passes.",
             "failed_gate": "Repair only the earliest invalid candidate/artifact once; do not reopen a drained semantic portfolio merely to satisfy formatting or a count target.",
         },
     }

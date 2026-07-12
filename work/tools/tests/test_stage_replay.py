@@ -116,7 +116,7 @@ def replay_source(tmp_path: Path) -> dict[str, Path | str]:
         "state": str(state / "agent_loop_state.json"),
     }
     ac.save_json(state / "agent_loop_contract.json", {
-        "contract_version": 18,
+        "contract_version": 19,
         "execution_model": "opencode-owned-model-driven-loop",
         "session": {"session_id": session_id, "artifacts": artifacts},
         "coverage_contract": {
@@ -177,10 +177,28 @@ def replay_source(tmp_path: Path) -> dict[str, Path | str]:
         },
         "parallel_behavior_paths": [],
     })
+    inventory = materializer.materialize_inventory({
+        "session_id": session_id,
+        "document_groups": [{
+            "document_key": "contract", "members": ["contract.md"],
+            "scope_relation": "required",
+            "scope_evidence": {"source_ref": {
+                "path": "contract.md", "line_start": 1, "line_end": 2,
+            }},
+            "sections": [{
+                "section_id": "contract-main",
+                "source_ref": {"path": "contract.md", "line_start": 1, "line_end": 2},
+                "behavior_families": ["input acceptance", "adapter acceptance"],
+                "ambiguities": [],
+            }],
+        }],
+    }, design)
+    ac.save_json(state / "design_inventory.json", inventory)
     ac.save_json(state / "risk_sweep_plan.json", {
         "session_id": session_id,
         "plan_id": "RISK-PLAN-001",
         "architecture_map_sha256": ac.sha256_file(state / "architecture_map.json"),
+        "design_inventory_sha256": ac.sha256_file(state / "design_inventory.json"),
         "required_coverage": {
             "boundary_ids": ["BOUNDARY-SERVICE", "BOUNDARY-AUDIT"],
             "plane_ids": ["PLANE-SERVICE", "PLANE-AUDIT"],
@@ -193,6 +211,7 @@ def replay_source(tmp_path: Path) -> dict[str, Path | str]:
             "parallel_path_ids": [],
             "anchor_paths": ["service.py"],
             "review_lenses": ["input acceptance"],
+            "design_section_ids": ["contract-main"],
             "scope_rationale": "The service API is an independent execution component.",
         }, {
             "sweep_id": "RISK-SWEEP-AUDIT",
@@ -201,6 +220,7 @@ def replay_source(tmp_path: Path) -> dict[str, Path | str]:
             "parallel_path_ids": [],
             "anchor_paths": ["audit.py"],
             "review_lenses": ["input acceptance"],
+            "design_section_ids": ["contract-main"],
             "scope_rationale": "The audit API is an independent execution component.",
         }],
     })
@@ -359,8 +379,8 @@ def replay_source(tmp_path: Path) -> dict[str, Path | str]:
     tasks = [
         {
             "task_id": "TASK-1", "session_id": session_id, "claim_id": "CLAIM-1",
-            "claim_branch": "direct service path",
-            "hypothesis": "The direct path accepts an invalid value instead of rejecting it.",
+            "claim_branch": ac.canonical_claim_branch(claims[0]),
+            "hypothesis": ac.canonical_claim_hypothesis(claims[0]),
             "obligation_sha256": _canonical_sha256({
                 "claim_id": "CLAIM-1", "obligation": claims[0]["obligation"],
             }),
@@ -376,8 +396,8 @@ def replay_source(tmp_path: Path) -> dict[str, Path | str]:
         },
         {
             "task_id": "TASK-2", "session_id": session_id, "claim_id": "CLAIM-2",
-            "claim_branch": "adapter path",
-            "hypothesis": "The adapter returns its input instead of rejecting an invalid value.",
+            "claim_branch": ac.canonical_claim_branch(claims[1]),
+            "hypothesis": ac.canonical_claim_hypothesis(claims[1]),
             "obligation_sha256": _canonical_sha256({
                 "claim_id": "CLAIM-2", "obligation": claims[1]["obligation"],
             }),
@@ -400,6 +420,8 @@ def replay_source(tmp_path: Path) -> dict[str, Path | str]:
             "risk_sweep_plan_sha256": risk_plan_digest,
             "behavior_question": "What does the public path do with invalid values?",
             "observed_code_behavior": "The public path returns true without a guard.",
+            "design_section_ids": ["contract-main"],
+            "design_alignment": "The section defines invalid-input behavior for this public path.",
             "review_lenses": ["input acceptance"],
             "architecture_boundaries": ["BOUNDARY-SERVICE"],
             "implementation_planes": ["PLANE-SERVICE"],
@@ -418,17 +440,22 @@ def replay_source(tmp_path: Path) -> dict[str, Path | str]:
             "design_lookup_questions": ["Must the public path reject invalid values?"],
             "tool_trace": [
                 {
-                    "seq": 1, "kind": "code_search", "tool": "search",
+                    "seq": 1, "kind": "design_read", "tool": "read",
+                    "target": "contract.md:1-2", "purpose": "Read the assigned section.",
+                    "result": "The section defines invalid-input behavior.",
+                },
+                {
+                    "seq": 2, "kind": "code_search", "tool": "search",
                     "target": "accept", "purpose": "Locate the public path.",
                     "result": "Found service.py:1.",
                 },
                 {
-                    "seq": 2, "kind": "code_read", "tool": "read",
+                    "seq": 3, "kind": "code_read", "tool": "read",
                     "target": "service.py:1-2", "purpose": "Read reachable behavior.",
                     "result": "It returns true directly.",
                 },
                 {
-                    "seq": 3, "kind": "reverse_check", "tool": "search",
+                    "seq": 4, "kind": "reverse_check", "tool": "search",
                     "target": "validation callers", "purpose": "Find compensating guards.",
                     "result": "No guard is present.",
                 },
@@ -440,6 +467,8 @@ def replay_source(tmp_path: Path) -> dict[str, Path | str]:
             "risk_sweep_plan_sha256": risk_plan_digest,
             "behavior_question": "What does the adapter do with invalid values?",
             "observed_code_behavior": "The adapter returns its input without a guard.",
+            "design_section_ids": ["contract-main"],
+            "design_alignment": "The section defines invalid-input behavior for this adapter path.",
             "review_lenses": ["input acceptance"],
             "architecture_boundaries": ["BOUNDARY-AUDIT"],
             "implementation_planes": ["PLANE-AUDIT"],
@@ -458,17 +487,22 @@ def replay_source(tmp_path: Path) -> dict[str, Path | str]:
             "design_lookup_questions": ["Must the adapter reject invalid values?"],
             "tool_trace": [
                 {
-                    "seq": 1, "kind": "code_search", "tool": "search",
+                    "seq": 1, "kind": "design_read", "tool": "read",
+                    "target": "contract.md:1-2", "purpose": "Read the assigned section.",
+                    "result": "The section defines invalid-input behavior.",
+                },
+                {
+                    "seq": 2, "kind": "code_search", "tool": "search",
                     "target": "record", "purpose": "Locate the adapter path.",
                     "result": "Found audit.py:1.",
                 },
                 {
-                    "seq": 2, "kind": "code_read", "tool": "read",
+                    "seq": 3, "kind": "code_read", "tool": "read",
                     "target": "audit.py:1-2", "purpose": "Read reachable behavior.",
                     "result": "It returns the value directly.",
                 },
                 {
-                    "seq": 3, "kind": "reverse_check", "tool": "search",
+                    "seq": 4, "kind": "reverse_check", "tool": "search",
                     "target": "adapter guards", "purpose": "Find compensating guards.",
                     "result": "No guard is present.",
                 },
@@ -711,7 +745,7 @@ def _prepare_valid_coverage_artifacts(replay_source: dict[str, Path | str]) -> N
                 "finding_sha256": _canonical_sha256(finding),
                 "probe_sha256": "",
             },
-            "evidence_critic_prompt_version": "evidence-critic-v3",
+            "evidence_critic_prompt_version": "evidence-critic-v4",
         })
     _write_jsonl(state / "critic_reviews.jsonl", critics)
     _write_jsonl(state / "critic_review_history.jsonl", [
@@ -800,7 +834,7 @@ def test_claims_prepare_writes_frozen_manifest_and_no_llm(replay_source, tmp_pat
     assert manifest["development_only"] is True
     assert manifest["llm_invoked"] is False
     assert manifest["runtime"] == {"provider": "provider-a", "model": "model-b"}
-    assert manifest["schema"]["contract_version"] == 18
+    assert manifest["schema"]["contract_version"] == 19
     assert len(manifest["source_digest"]) == 64
     assert len(manifest["replay_input_digest"]) == 64
     assert len(manifest["prompt"]["sha256"]) == 64
@@ -931,11 +965,12 @@ def test_claim_review_and_risk_replays_enforce_opposite_source_boundaries(
     )
     risk_envelope = ac.load_json(risk_replay / "prompt_envelope.json")
     assert risk_envelope["read_only_source_roots"] == {
-        "code": str(replay_source["state"] / "review-inputs" / "code")
+        "code": str(replay_source["state"] / "review-inputs" / "code"),
+        "design": str(replay_source["state"] / "review-inputs" / "design"),
     }
     assert risk_envelope["inputs"] == [
         "state/agent_loop_contract.json", "state/architecture_map.json",
-        "state/risk_sweep_plan.json",
+        "state/design_inventory.json", "state/risk_sweep_plan.json",
     ]
     assert risk_envelope["selection"] == {
         "sweep_id": "RISK-SWEEP-AUDIT",
@@ -944,6 +979,7 @@ def test_claim_review_and_risk_replays_enforce_opposite_source_boundaries(
         "parallel_path_ids": [],
         "anchor_paths": ["audit.py"],
         "review_lenses": ["input acceptance"],
+        "design_section_ids": ["contract-main"],
         "scope_rationale": "The audit API is an independent execution component.",
         "risk_sweep_plan_sha256": ac.sha256_file(
             risk_plan_path
@@ -1150,7 +1186,7 @@ def test_finding_replays_slice_claim_task_finding_probe_and_critic(
         (
             "risk", "RISK-SWEEP-AUDIT", {
                 "state/agent_loop_contract.json", "state/architecture_map.json",
-                "state/risk_sweep_plan.json",
+                "state/design_inventory.json", "state/risk_sweep_plan.json",
             },
         ),
         (

@@ -47,7 +47,7 @@ CRITIC_ALLOWED_KEYS = {
 CRITIC_INPUT_DIGEST_KEYS = {
     "claim_sha256", "finding_sha256", "probe_sha256",
 }
-EVIDENCE_CRITIC_PROMPT_VERSION = "evidence-critic-v3"
+EVIDENCE_CRITIC_PROMPT_VERSION = "evidence-critic-v4"
 NORMATIVE_ASSESSMENT_ALLOWED_KEYS = {
     "claim_strength", "applicability", "obligation_status", "actual_conflict",
     "rationale",
@@ -274,8 +274,8 @@ def _validate_trace(item: dict[str, Any], label: str) -> list[str]:
 
 def _validate_risk_trace(item: dict[str, Any], label: str) -> list[str]:
     trace = item.get("tool_trace")
-    if not isinstance(trace, list) or len(trace) < 2:
-        return [f"{label}: code-only tool_trace must contain at least two real steps"]
+    if not isinstance(trace, list) or len(trace) < 3:
+        return [f"{label}: design-guided tool_trace must contain at least three real steps"]
     errors: list[str] = []
     kinds: set[str] = set()
     for index, step in enumerate(trace, start=1):
@@ -289,10 +289,9 @@ def _validate_risk_trace(item: dict[str, Any], label: str) -> list[str]:
         kind = str(step.get("kind") or "")
         if kind not in TRACE_KINDS:
             errors.append(f"{step_label}: unsupported kind {kind!r}")
-        if kind == "design_read":
-            errors.append(f"{step_label}: risk explorer must not read design")
         kinds.add(kind)
     for required, description in (
+        ({"design_read"}, "design_read"),
         ({"code_search", "code_navigation"}, "code_search or code_navigation"),
         ({"code_read"}, "code_read"),
     ):
@@ -646,7 +645,8 @@ def validate_artifact(item: dict[str, Any], artifact_type: str, label: str) -> l
         errors.extend(_require(item, (
             "observation_id", "session_id", "sweep_id", "risk_sweep_plan_sha256",
             "behavior_question", "observed_code_behavior", "review_lenses",
-            "code_evidence", "false_positive_checks", "design_lookup_questions", "tool_trace",
+            "design_section_ids", "design_alignment", "code_evidence",
+            "false_positive_checks", "design_lookup_questions", "tool_trace",
         ), label))
         scoped_arrays: list[list[Any]] = []
         for field in (
@@ -695,11 +695,21 @@ def validate_artifact(item: dict[str, Any], artifact_type: str, label: str) -> l
         questions = item.get("design_lookup_questions")
         if not isinstance(questions, list) or not questions or not all(_present(value) for value in questions):
             errors.append(f"{label}: design_lookup_questions must contain non-empty questions")
+        section_ids = item.get("design_section_ids")
+        if (
+            not isinstance(section_ids, list) or not section_ids
+            or any(not isinstance(value, str) or not value for value in section_ids)
+        ):
+            errors.append(f"{label}: design_section_ids must contain non-empty section IDs")
+        if not isinstance(item.get("design_alignment"), str) or not item.get(
+            "design_alignment", "",
+        ).strip():
+            errors.append(f"{label}: design_alignment must be a non-empty string")
         forbidden = set(item).intersection({
             "claim_id", "design_evidence", "assessment", "recommendation", "status", "confidence",
         })
         if forbidden:
-            errors.append(f"{label}: code-only observation contains verdict/design fields {sorted(forbidden)}")
+            errors.append(f"{label}: trace observation contains verdict/claim fields {sorted(forbidden)}")
         errors.extend(_validate_risk_trace(item, label))
         return errors
 
@@ -788,7 +798,8 @@ def validate_artifact(item: dict[str, Any], artifact_type: str, label: str) -> l
                 f"{EVIDENCE_CRITIC_PROMPT_VERSION!r}"
             )
         if item.get("decision") not in {
-            "confirm_contradiction", "reject_issue", "needs_more_evidence",
+            "confirm_contradiction", "confirm_optional_gap", "reject_issue",
+            "needs_more_evidence",
         }:
             errors.append(f"{label}: invalid decision")
         normative = item.get("normative_assessment")
@@ -826,6 +837,15 @@ def validate_artifact(item: dict[str, Any], artifact_type: str, label: str) -> l
                 errors.append(
                     f"{label}: confirm_contradiction requires supported applicability, "
                     "an actual conflict, and a binding/adopted obligation"
+                )
+            if item.get("decision") == "confirm_optional_gap" and (
+                normative.get("applicability") != "supported"
+                or normative.get("actual_conflict") != "no"
+                or normative.get("obligation_status") != "optional_not_adopted"
+            ):
+                errors.append(
+                    f"{label}: confirm_optional_gap requires supported applicability, "
+                    "no binding conflict, and a directly evidenced unadopted optional branch"
                 )
         # This is a policy declaration in the handoff, not proof of Task identity.
         if item.get("review_context") != "fresh_subagent":
@@ -1218,11 +1238,11 @@ def _context_errors(
             finding_assessment = finding.get("assessment")
             critic_decision = item.get("decision")
             if (
-                critic_decision == "confirm_contradiction"
+                critic_decision in {"confirm_contradiction", "confirm_optional_gap"}
                 and finding_assessment != "contradiction_supported"
             ):
                 errors.append(
-                    f"{label}: confirm_contradiction requires a "
+                    f"{label}: a confirmed inconsistency requires a "
                     "contradiction_supported finding"
                 )
             if (
@@ -1361,6 +1381,15 @@ def _context_errors(
             errors.append(
                 f"{label}: obligation_sha256 does not match the linked claim obligation"
             )
+        if artifact_type in {"task", "finding"}:
+            if item.get("claim_branch") != ac.canonical_claim_branch(claim):
+                errors.append(
+                    f"{label}: claim_branch does not match the linked claim subject/trigger"
+                )
+            if item.get("hypothesis") != ac.canonical_claim_hypothesis(claim):
+                errors.append(
+                    f"{label}: hypothesis does not match the linked claim observable result"
+                )
     mode = str(item.get("exploration_mode") or "")
     if mode not in modes:
         errors.append(f"{label}: unknown exploration_mode {mode!r}")

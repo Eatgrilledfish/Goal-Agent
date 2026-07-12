@@ -245,7 +245,7 @@ def validate_verdict(
 
     critic = verdict.get("critic_review")
     expected_critic_decisions = {
-        "confirmed": {"confirm_contradiction"},
+        "confirmed": {"confirm_contradiction", "confirm_optional_gap"},
         "probable": {"needs_more_evidence"},
     }[status]
     if not isinstance(critic, dict) or critic.get("decision") not in expected_critic_decisions:
@@ -273,15 +273,26 @@ def validate_verdict(
                 errors.append(f"{prefix} critic_review.{field} does not match critic artifact")
     if status == "confirmed" and isinstance(critic_artifact, dict):
         normative = critic_artifact.get("normative_assessment")
-        if not isinstance(normative, dict) or (
-            normative.get("applicability") != "supported"
-            or normative.get("actual_conflict") != "yes"
-            or normative.get("obligation_status")
-            in {"optional_not_adopted", "informational"}
-        ):
+        decision = critic_artifact.get("decision")
+        binding_conflict = (
+            decision == "confirm_contradiction"
+            and isinstance(normative, dict)
+            and normative.get("applicability") == "supported"
+            and normative.get("actual_conflict") == "yes"
+            and normative.get("obligation_status")
+            not in {"optional_not_adopted", "informational"}
+        )
+        optional_gap = (
+            decision == "confirm_optional_gap"
+            and isinstance(normative, dict)
+            and normative.get("applicability") == "supported"
+            and normative.get("actual_conflict") == "no"
+            and normative.get("obligation_status") == "optional_not_adopted"
+        )
+        if not binding_conflict and not optional_gap:
             errors.append(
-                f"{prefix} confirmed verdict requires a supported, binding/adopted "
-                "normative conflict"
+                f"{prefix} confirmed verdict requires either a supported binding "
+                "conflict or a supported, explicitly labeled optional design gap"
             )
     finding = findings.get(finding_id, {})
     selection = finding.get("dynamic_probe_selection") if isinstance(finding.get("dynamic_probe_selection"), dict) else {}

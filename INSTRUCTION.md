@@ -129,9 +129,9 @@ python3 ${WORK_ROOT}/tools/scripts/goal_runner.py architecture-check \
   --result-root ${RESULT_ROOT} --log-root ${LOG_ROOT} --state-root ${STATE_ROOT}
 ```
 
-### 3.2 轻量 design inventory
+### 3.2 完整但轻量的 design inventory
 
-与 architecture mapping 同时启动一个 fresh `spec-analyst` Task。它只读 `REVIEW_DESIGN_ROOT` 和 `design_agent_manifest.json`，为每个 manifest `document_key` 生成 scope relation 与轻量 section/behavior-family 地图；不读代码，不生成 verdict，也不提前生成完整 claim portfolio。每个独立 behavior family 是后续 design-origin frontier 的轻量种子，不只是 coverage 标签；必须保留输入文档中真实出现的领域术语。Superseded 文档若描述当前代码仍可能实现的兼容/旧版本行为，必须在 replacement group 或 ambiguity 中保留该行为种子，不能整组静默丢弃。
+与 architecture mapping 同时启动一个 fresh `spec-analyst` Task。它只读 `REVIEW_DESIGN_ROOT` 和 `design_agent_manifest.json`，为每个 manifest `document_key` 生成 scope relation 与 section/behavior-family 地图；不读代码、不生成 verdict或claim。`required|in_scope`成员必须从首行到末行全部被section覆盖，每个section最多800行且有当前文档术语构成的behavior family；这是便宜的检索地图，不代表每个section都要调查。Superseded文档的兼容行为仍需保留。
 
 Spec Analyst 先写 `${STATE_ROOT}/handoffs/design/inventory.raw.json`。每个 draft source必须显式包含 nested `source_ref.path/line_start/line_end`；materializer不接受 top-level `path/line_start/line_end` fallback。Agent不复制 quote/hash/heading。随后在同一 Task 内执行：
 
@@ -148,9 +148,9 @@ python3 ${WORK_ROOT}/tools/scripts/goal_runner.py inventory-check \
 
 两条命令均返回 0 才完成 inventory；结构错误由该 Task就地修正。`scope_relation` 是模型基于 supplied design 的判断，catalog 中存在链接不能机械升级为 `required` 或 `declared_capability`。
 
-### 3.3 互斥 code-only risk sweeps
+### 3.3 设计引导的互斥 trace sweeps
 
-architecture-check 通过后，主 Agent写 digest-bound `${STATE_ROOT}/risk_sweep_plan.json`。Plan至少包含一个真实非空 focused slice，并按可独立阅读的 primary code scope切分：各 slice的`anchor_paths`必须存在、不得为仓库根`.`、彼此不得相同或父子重叠，每个 slice最多包含6个 implementation planes。Boundary/plane/parallel-path ID是架构关系引用，不是独占锁；三类 required ID必须在plan整体中全部出现，若一个宽架构ID确实横跨多个互斥主代码范围可以重复，但它在每个slice中都必须有本地anchor关系和关联plane。每个slice都必须使用contract完整的8类`review_lenses`，因为同一完整性、时序、链遍历或边界语义可能出现在任意互斥代码范围；重复的是审阅问题，不是代码范围。使用满足这些条件的最少focused slices。每个slice最多输出8条最强、具体、异常或不对称的observation；正确实现和普通入口不输出。slice较多时每批最多并发两个Task。
+architecture-check与inventory-check都通过后，主Agent写digest-bound `${STATE_ROOT}/risk_sweep_plan.json`，同时绑定`architecture_map_sha256`与`design_inventory_sha256`。Plan按互斥primary code scope切分，每slice最多6个implementation planes，并从完整inventory按代码入口、capability/configuration surface、behavior family与同义语义选择最多12个相关`design_section_ids`；完整inventory保留未选section作为后续检索入口，不把它们无差别塞进深度探索。代码→设计的plane/capability检索与设计→代码的外部行为/义务检索都必须参与选择；同一设计行为可能由多个plane实现时可分配给多个slice。每slice使用完整8类lens，但最多输出8条最强trace candidate。Observation必须引用实际读过的design section，解释design/code行为为何属于同一语义，并提供代码锚点或构建/注册/配置层面的能力缺失证据；普通代码质量、测试覆盖率和与supplied design无关的风险不输出。
 
 ```bash
 python3 ${WORK_ROOT}/tools/scripts/goal_runner.py risk-plan-check \
@@ -158,7 +158,7 @@ python3 ${WORK_ROOT}/tools/scripts/goal_runner.py risk-plan-check \
   --result-root ${RESULT_ROOT} --log-root ${LOG_ROOT} --state-root ${STATE_ROOT}
 ```
 
-通过后，在并发槽空闲时按 plan 启动 fresh `risk-explorer`。inventory 尚未完成时它占一个槽，risk sweep 占另一个；任一结束即补下一个互斥 risk slice。每个 explorer 只写 `${STATE_ROOT}/handoffs/risks/<sweep_id>/<sweep_id>.json`，不读设计，不下 verdict，并执行 prompt 中的 self-check。一个 slice通过后，立即只以该 candidate目录原子合并；失败peer目录绝不进入本次input：
+通过后按plan最多并发两个fresh `risk-explorer`。每个explorer读取自己的code slice、分配的inventory sections及其设计原文，只写 `${STATE_ROOT}/handoffs/risks/<sweep_id>/<sweep_id>.json`，不下verdict。一个slice通过后立即独立合并；失败peer不进入本次input：
 
 ```bash
 python3 ${WORK_ROOT}/tools/scripts/handoff_merge.py \
@@ -174,22 +174,22 @@ python3 ${WORK_ROOT}/tools/scripts/handoff_merge.py \
 
 Risk merge按 `sweep_id` 累计 upsert：candidate input directory中的当前 sweep只替换自身旧 observation，不影响 ledger 中其他已完成 sweep；plan digest变化才使旧 plan observations失效。Report 的 `submitted_sweep_ids` 是本次单独提交的 sweep，`completed_sweep_ids` 是累计 ledger，`missing_sweep_ids` 是剩余计划。`closed=false` 时已合并 observation仍可立即进入 frontier。Final gate只接受累计 `completed_sweep_ids=expected_sweep_ids`、`missing_sweep_ids=[]`、`closed=true` 且 `global_coverage_validated=true` 的最终 report。
 
-## 4. 双入口增量 evidence-pair frontier
+## 4. 双入口 Evidence-pair frontier
 
-Inventory通过后立即建立 design-origin breadth frontier；architecture map 与首个有效 risk observation可用后并行加入 code-origin frontier。Risk observation不是 claim materialization 的唯一入口，也无需等待所有 risk slices完成。主 Agent用模型语义在以下证据间建立最小 evidence pair：
+Inventory与trace observations可用后，主Agent从两个入口建立最小evidence pair：代码入口从已验证observation反查精确设计义务；设计入口从inventory的具体behavior family/section正向链接architecture中的入口、plane或capability surface。设计入口不要求先伪造risk observation，但必须给出具体architecture scope和可证伪的代码行为问题，不能只有一段设计文字。
 
 ```text
 一个设计 section/义务分支
-↕ 一个具体 risk observation 或 capability/boundary 对账问题
+↕ 一个具体 risk observation、design-origin architecture映射或capability/boundary对账问题
 ↕ 一个 boundary 与明确 execution plane(s)
 ↕ 一个可被代码证据推翻或支持的 hypothesis
 ```
 
-候选可由 design-to-code、code-to-design 或 capability-absence 三种方向产生。Design-to-code 可直接从 inventory 的独立 section/behavior family 创建 `origin=design_section` lookup，即使尚无 risk observation；capability-absence也可从 supplied design 的正面能力语义创建。选择依据是当前 supplied design 的适用性、规范强度、代码行为是否具体可达、外部可观察性、替代路径与预期信息增益；禁止固定打分或预置领域关键词排序。
+每个候选必须来自一个已验证observation，或来自一个已链接具体architecture plane/capability surface的design section，或来自有入口/构建/注册/配置反查结果的capability-absence trace；只有“设计里有这句话”或“代码里搜不到”都不够。模型按直接规范差异、代码可达性、外部可观察性、证据精度和反证后的信息增益选择，禁止固定领域关键词、项目名或预置答案排序。
 
-首次 claim resolution 使用最多24条的单一bounded portfolio。先给每个`required|in_scope` document group一条原子claim，再按该组inventory中不同`behavior_families`数量相对于当前claim数的比例逐槽分配剩余预算，直到24条或所有behavior-family seed均已分配；同组多个槽先覆盖不同section，再在同section选择不同义务分支。不得让少数风险观察占满portfolio，也不得保留未进入review scope的materialized claim。`claim_review_scope.claim_ids`必须包含当前全部materialized claims。随后最多使用六个round、每轮最多4个task，每条accepted claim至少对应一个task并调查为finding、完成critic后才能coverage。只要存在适用设计，frontier必须有design-to-code或capability-absence路径；每个已完成risk sweep必须至少被一个code-to-design task引用。这里限制的是六小时内的调查预算，不是issue数量目标。
+首次claim resolution最多物化12条最强evidence pairs，不做“每文档至少一条”配额，也不为合规observation生成claim。只有subject、trigger、规范分支和代码行为都相同的语义重复项才合并；同一代码locus上的时序、容量、主动副作用、错误结果等不同义务分支必须分别保留。直接矛盾、强规范、跨实现plane不对称和有结构化缺失证据的能力优先。全部materialized claims进入同一review scope；每条accepted claim建立一个task，最多三轮、每轮四项。未晋级observation保留在risk ledger，不需要伪造task或gap。
 
-主 Agent把 design-origin、risk-origin、capability reconciliation 与 critic request统一写入 `${STATE_ROOT}/design_lookup_requests.jsonl`，只包含设计语义问题、document/section scope 与来源 stable ID，不泄漏代码答案。fresh spec analyst 只为进入 frontier 的义务生成/更新累计 raw claims 与 `design_coverage.json`，然后物化：
+主Agent把晋级candidate写入 `${STATE_ROOT}/design_lookup_requests.jsonl`，逐项使用`origin=risk_observation|design_section|capability_reconciliation`，包含对应稳定ID、design section、代码行为问题和architecture scope。fresh spec analyst只为这些evidence pairs定位精确原子义务并生成raw claims与`design_coverage.json`：
 
 ```bash
 python3 ${WORK_ROOT}/tools/scripts/design_source_materializer.py \
@@ -206,7 +206,7 @@ Claim draft的 nested `source_ref` 是唯一模型填写的引用；不得用 to
 
 ### 4.1 Per-claim spec review
 
-主 Agent写 `${STATE_ROOT}/claim_review_scope.json`。`claim_ids`必须逐值包含当前 bounded portfolio中的全部materialized claims；claim repair后先重跑materializer并重建完整scope，不能留下未经spec critic审查的旁路claim：
+主Agent写 `${STATE_ROOT}/claim_review_scope.json`，逐值包含最多12条materialized evidence-pair claims；claim repair后重建完整scope：
 
 ```json
 {"session_id":"当前session","round_id":"ROUND-...","claim_ids":["累计CLAIM-..."]}
@@ -224,7 +224,7 @@ python3 ${WORK_ROOT}/tools/scripts/goal_runner.py claim-check \
 
 ### 4.2 原子 task 与 plan/lifecycle gate
 
-每个 task 只绑定一个 accepted claim、`claim_branch`、`hypothesis` 和 `obligation_sha256`。对 design-to-code/capability-absence claim，先用 architecture map 找出可能承载同一设计行为的全部可达 plane 与 integration boundary；相关 plane 可在一个 task 内共同核验，需要独立裁决时拆成不同 task，不能只调查最显眼的核心目录。不同义务或状态分支也拆成不同 task；每轮最多 4 项。写独立 plan handoff并合并：
+每个task只绑定一个accepted claim。`claim_branch`必须逐值等于`<claim.subject> | <claim.trigger>`；`hypothesis`必须逐值等于`The reachable implementation does not produce the required observable result: <claim.observable_result>`，validator会机械拒绝漂移。具体搜索焦点放在`starting_points`、关联risk observation和architecture IDs中。相关plane可在一个task共同核验；每轮最多4项，后续round可预先计划但只能按earliest-open顺序执行。
 
 ```bash
 python3 ${WORK_ROOT}/tools/scripts/handoff_merge.py \
@@ -305,7 +305,7 @@ python3 ${WORK_ROOT}/tools/scripts/handoff_merge.py \
 
 ### 5.2 Fresh evidence critic
 
-每个 finding（包括 `design_satisfied`）在完成可选 probe后都立即启动一个 fresh `evidence-critic`，不等待coverage。Critic只读该candidate的claim、finding、相关源片段与可选probe，至少独立执行两项反证检查，先写结构化 `normative_assessment`，再返回 `confirm_contradiction|reject_issue|needs_more_evidence`。只有设计适用、actual与义务直接冲突、且义务为 mandatory/recommended/declared capability或有正面采用证据的optional branch时才能confirm；“技术上合规但不理想”、最佳实践差异、未采用MAY、或单项输出满足设计但聚合行为可疑必须reject/needs_more_evidence。`design_satisfied`只有经critic独立复核为`reject_issue`才闭环。相同 finding/evidence只允许一个当前critic；只有investigator/probe提供新证据才能复审。合并：
+每个finding完成可选probe后立即启动fresh `evidence-critic`。Critic返回`confirm_contradiction|confirm_optional_gap|reject_issue|needs_more_evidence`。Mandatory/recommended/declared capability或已采用optional branch的直接冲突使用`confirm_contradiction`；设计明确允许但未要求的分支，仅在当前产品scope适用、邻近机制与缺失均有直接证据时使用`confirm_optional_gap`，并明确它不是规范违反。最佳实践差异仍reject。
 
 ```bash
 python3 ${WORK_ROOT}/tools/scripts/handoff_merge.py \
@@ -315,7 +315,7 @@ python3 ${WORK_ROOT}/tools/scripts/handoff_merge.py \
   --report ${LOG_ROOT}/trace/critic-merge-${FINDING_ID}.json
 ```
 
-Critic raw handoff不手填 digest。Self-check/merge确定性加入 `input_digests={claim_sha256,finding_sha256,probe_sha256}` 与 `evidence_critic_prompt_version=evidence-critic-v3`；claim/finding/引用probe任一变化会机械判旧 critic stale，必须 fresh复审，不能仅刷新摘要。
+Critic raw handoff不手填digest。Self-check/merge确定性加入`input_digests`与`evidence_critic_prompt_version=evidence-critic-v4`。
 
 `${STATE_ROOT}/critic_review_history.jsonl` 是 critic merge/prepare 专有的只读历史账本；Agent不得创建、清空、删除或编辑。它按 finding、当前 evidence digests 与 prompt version记录已经完成的语义审查，即使当前 critic ledger被删除，相同证据也不能换一个结论重新投票。只有上游 claim/finding/probe证据摘要变化后，merge才可追加新的 review key；resume缺失该历史会直接失败。
 
@@ -323,7 +323,7 @@ Critic raw handoff不手填 digest。Self-check/merge确定性加入 `input_dige
 
 ## 6. 一次 coverage 补扫
 
-只有全部 accepted claims 都已有 complete finding+critic或结构化deferred后，才启动 fresh `coverage-critic`。Coverage会重新执行task-plan门禁，不能绕过缺失claim task或缺失risk sweep task。`remaining_scoped_claims`非空是验证错误，不能通过记录gap绕过调查。Coverage不审批单项finding；它只记录本轮证据实际暴露的具体lens、boundary、parallel path或critic request缺口，并决定是否值得做一次supplement；不要求为每个未选inventory section、已被spec critic拒绝的claim或普通未映射risk制造gap。
+只有全部accepted evidence-pair claims都有complete finding+critic后才启动coverage。Coverage重新执行task-plan门禁，但不要求每个risk sweep或inventory section产生task；它只检查已选择frontier是否闭环，并可从未晋级observation中选择最多一次、最多4项的高价值supplement。
 
 `coverage_audit.json.supplement_rounds`只能是0或1。`remaining_gaps`只写有当前artifact证据支持且可能改变结论的具体缺口，不做逐section完整性台账。`semantic_coverage` lens可为`investigated|inapplicable|gap_recorded`；标为investigated时，只能引用其`review_lenses`逐值包含该lens的task和finding，否则改为gap_recorded。每个`next_round_tasks`必须用非空`source_gap_ids`引用当前gap。`${STATE_ROOT}/coverage_supplement_history.json`是helper-owned只读状态；首次通过验证的非空next task集合由`coverage-check`原子记录，只允许一次supplement。运行：
 
@@ -342,6 +342,7 @@ python3 ${WORK_ROOT}/tools/scripts/goal_runner.py coverage-check \
 Frontier/可选 supplement 排空、coverage validation 通过后，只启动一个 fresh `final-judge`。它为每个 finding 生成恰好一个 current/latest verdict，逐值复制 claim/finding/critic/probe 证据，不引入新证据或改行号；JSONL可保留 evidence-repair前的旧 revision，但同一 finding只能有一个生效的最新 revision：
 
 - `contradiction_supported + confirm_contradiction` 且证据闭环 → `confirmed`；
+- `contradiction_supported + confirm_optional_gap` → `confirmed`，但issue type、标题和原因必须明确是optional design gap而非规范违反；
 - 未闭环但有真实差异证据 → `probable`；
 - `design_satisfied` 或 critic reject → `rejected`。
 
@@ -353,7 +354,7 @@ python3 ${WORK_ROOT}/tools/scripts/goal_runner.py review \
   --result-root ${RESULT_ROOT} --log-root ${LOG_ROOT} --state-root ${STATE_ROOT}
 ```
 
-Final Judge 返回 passed 后：
+Final Judge返回passed后才允许首次写`/result`。任何coverage/review失败、pending task或“预计剩余时间不足”都不得创建空结果或自行把task改成deferred。随后：
 
 ```bash
 python3 ${WORK_ROOT}/tools/scripts/goal_runner.py finalize \

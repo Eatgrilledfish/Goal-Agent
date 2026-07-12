@@ -24,7 +24,8 @@ NORMATIVE_STRENGTHS = {
 PRIORITIES = {"high", "medium", "low"}
 TESTABILITY = {"candidate", "not_suitable", "unknown"}
 COVERAGE_DISPOSITIONS = {"applicable", "inapplicable", "superseded", "supporting"}
-MAX_CLAIM_PORTFOLIO = 24
+MAX_CLAIM_PORTFOLIO = 12
+MAX_INVENTORY_SECTION_LINES = 800
 
 
 class Issues:
@@ -304,6 +305,7 @@ def validate_inventory(
             normalized for member in expected_members
             if (normalized := _relative_design_path(member)) is not None
         }
+        section_intervals: dict[str, list[tuple[int, int]]] = defaultdict(list)
         for section_index, section in enumerate(raw_sections, start=1):
             section_label = f"{label}.sections[{section_index}]"
             if not isinstance(section, dict):
@@ -331,8 +333,59 @@ def validate_inventory(
                     "INVENTORY_MEMBER_MISMATCH",
                     f"{section_label}: path is not a member of document group {document_key!r}",
                 )
-            _validate_string_list(section.get("behavior_families"), f"{section_label}.behavior_families", issues)
+            families = _validate_string_list(
+                section.get("behavior_families"),
+                f"{section_label}.behavior_families", issues,
+                allow_empty=relation not in {"required", "in_scope"},
+            )
             _validate_string_list(section.get("ambiguities"), f"{section_label}.ambiguities", issues)
+            line_start = section.get("line_start")
+            line_end = section.get("line_end")
+            if (
+                section_path is not None
+                and isinstance(line_start, int) and not isinstance(line_start, bool)
+                and isinstance(line_end, int) and not isinstance(line_end, bool)
+                and line_start >= 1 and line_end >= line_start
+            ):
+                section_intervals[section_path].append((line_start, line_end))
+                if (
+                    relation in {"required", "in_scope"}
+                    and line_end - line_start + 1 > MAX_INVENTORY_SECTION_LINES
+                ):
+                    issues.add(
+                        "INVENTORY_SECTION_COVERAGE",
+                        f"{section_label}: required/in_scope section spans more than "
+                        f"{MAX_INVENTORY_SECTION_LINES} lines and is too broad for trace retrieval",
+                    )
+
+        if relation in {"required", "in_scope"}:
+            for member in sorted(expected_member_set):
+                member_path = design_root / member
+                try:
+                    line_count = max(1, len(member_path.read_text(
+                        encoding="utf-8", errors="replace",
+                    ).splitlines()))
+                except OSError as exc:
+                    issues.add(
+                        "INVENTORY_SECTION_COVERAGE",
+                        f"{label}: cannot read required/in_scope member {member!r}: {exc}",
+                    )
+                    continue
+                cursor = 1
+                for line_start, line_end in sorted(section_intervals.get(member, [])):
+                    if line_start > cursor:
+                        issues.add(
+                            "INVENTORY_SECTION_COVERAGE",
+                            f"{label}: required/in_scope member {member!r} has no "
+                            f"inventory section for lines {cursor}-{line_start - 1}",
+                        )
+                    cursor = max(cursor, min(line_end, line_count) + 1)
+                if cursor <= line_count:
+                    issues.add(
+                        "INVENTORY_SECTION_COVERAGE",
+                        f"{label}: required/in_scope member {member!r} has no "
+                        f"inventory section for lines {cursor}-{line_count}",
+                    )
 
         expected_digest = canonical_object_sha256(group, excluded={"group_sha256"})
         if group.get("group_sha256") != expected_digest:
@@ -426,49 +479,6 @@ def validate_claims(
         elif claim_id:
             claim_index[claim_id] = claim
     return claim_index
-
-
-def required_claim_distribution(
-    inventory_groups: dict[str, dict[str, Any]],
-) -> dict[str, int]:
-    """Allocate the bounded claim portfolio by supplied-design breadth.
-
-    Every required/in-scope group receives one claim first. Remaining slots are
-    assigned proportionally to the number of distinct behavior-family seeds so
-    one broad document cannot be reduced to a single arbitrary obligation.
-    Domain names and implementation evidence never participate in this guardrail.
-    """
-    breadth: dict[str, int] = {}
-    for document_key, group in inventory_groups.items():
-        if group.get("scope_relation") not in {"required", "in_scope"}:
-            continue
-        families = {
-            family
-            for section in group.get("sections", [])
-            if isinstance(section, dict)
-            for family in section.get("behavior_families", [])
-            if isinstance(family, str) and family.strip()
-        }
-        breadth[document_key] = max(1, len(families))
-    allocation = {document_key: 1 for document_key in breadth}
-    budget = min(MAX_CLAIM_PORTFOLIO, sum(breadth.values()))
-    while sum(allocation.values()) < budget:
-        candidates = [
-            document_key for document_key in breadth
-            if allocation[document_key] < breadth[document_key]
-        ]
-        if not candidates:
-            break
-        selected = max(
-            candidates,
-            key=lambda document_key: (
-                breadth[document_key] / allocation[document_key],
-                breadth[document_key],
-                document_key,
-            ),
-        )
-        allocation[selected] += 1
-    return allocation
 
 
 def validate_coverage(
@@ -598,57 +608,12 @@ def validate_coverage(
                     f"{claim_group!r}, not {document_key!r}",
                 )
 
-    claim_distribution = required_claim_distribution(inventory_groups)
-    for document_key, required_count in sorted(claim_distribution.items()):
-        group = coverage_groups.get(document_key)
-        group_claim_ids = {
-            claim_id for claim_id in (
-                group.get("claim_ids", []) if isinstance(group, dict) else []
-            )
-            if isinstance(claim_id, str) and claim_id
-        }
-        actual_count = len(group_claim_ids)
-        if actual_count < required_count:
-            issues.add(
-                "COVERAGE_CLAIM_MISSING",
-                "design_coverage.json document group "
-                f"{document_key!r} must materialize at least {required_count} "
-                "breadth-balanced atomic claims; "
-                f"found {actual_count}",
-            )
-        inventory_group = inventory_groups.get(document_key, {})
-        valid_sections = [
-            section for section in inventory_group.get("sections", [])
-            if isinstance(section, dict)
-            and _relative_design_path(section.get("path")) is not None
-            and isinstance(section.get("line_start"), int)
-            and not isinstance(section.get("line_start"), bool)
-            and isinstance(section.get("line_end"), int)
-            and not isinstance(section.get("line_end"), bool)
-        ]
-        required_sections = min(required_count, len(valid_sections))
-        covered_sections = {
-            str(section.get("section_id") or "")
-            for section in valid_sections
-            for claim_id in group_claim_ids
-            for claim in [claim_index.get(claim_id)]
-            if isinstance(claim, dict)
-            and _relative_design_path(claim.get("path"))
-            == _relative_design_path(section.get("path"))
-            and isinstance(claim.get("line_start"), int)
-            and isinstance(claim.get("line_end"), int)
-            and claim["line_start"] <= section["line_end"]
-            and claim["line_end"] >= section["line_start"]
-            and section.get("section_id")
-        }
-        if actual_count >= required_count and len(covered_sections) < required_sections:
-            issues.add(
-                "COVERAGE_CLAIM_MISSING",
-                "design_coverage.json document group "
-                f"{document_key!r} must distribute its breadth-balanced claims "
-                f"across at least {required_sections} distinct inventory sections; "
-                f"found {len(covered_sections)}",
-            )
+    if len(claim_index) > MAX_CLAIM_PORTFOLIO:
+        issues.add(
+            "COVERAGE_CLAIM_LIMIT",
+            f"design claim portfolio may contain at most {MAX_CLAIM_PORTFOLIO} "
+            f"evidence-pair candidates; found {len(claim_index)}",
+        )
 
     missing = sorted(set(inventory_groups) - set(coverage_groups))
     extra = sorted(set(coverage_groups) - set(inventory_groups))
