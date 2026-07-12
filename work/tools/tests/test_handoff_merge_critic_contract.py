@@ -32,6 +32,13 @@ def _critic(
         "finding_id": finding_id,
         "claim_id": claim_id,
         "decision": "confirm_contradiction",
+        "normative_assessment": {
+            "claim_strength": "mandatory",
+            "applicability": "supported",
+            "obligation_status": "binding_required",
+            "actual_conflict": "yes",
+            "rationale": "The applicable mandatory behavior directly conflicts with the reachable implementation behavior.",
+        },
         "challenges": [
             "Could an alternate reachable path enforce the behavior?",
             "Could build or runtime configuration disable the cited path?",
@@ -61,8 +68,8 @@ def critic_state(tmp_path: Path) -> dict[str, object]:
     handoffs.mkdir(parents=True)
     session_id = "session-critic-contract"
     _write_jsonl(state / "design_claims.jsonl", [
-        {"claim_id": "CLAIM-1", "session_id": session_id},
-        {"claim_id": "CLAIM-2", "session_id": session_id},
+        {"claim_id": "CLAIM-1", "session_id": session_id, "normative_strength": "mandatory"},
+        {"claim_id": "CLAIM-2", "session_id": session_id, "normative_strength": "mandatory"},
     ])
     _write_jsonl(state / "investigation_findings.jsonl", [
         {
@@ -123,6 +130,7 @@ def test_valid_critic_is_schema_complete_and_bound_to_current_artifacts(critic_s
         "input_digests": {
             "claim_sha256": hm.canonical_digest({
                 "claim_id": "CLAIM-1", "session_id": critic_state["session_id"],
+                "normative_strength": "mandatory",
             }),
             "finding_sha256": hm.canonical_digest({
                 "finding_id": "FINDING-1", "claim_id": "CLAIM-1",
@@ -331,6 +339,62 @@ def test_critic_requires_two_distinct_concrete_challenges_and_checks(
     critic[field] = value
     errors = _errors(critic_state, critic)
     assert any(field in error and message in error for error in errors)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("applicability", "unsupported"),
+        ("applicability", "ambiguous"),
+        ("actual_conflict", "no"),
+        ("actual_conflict", "uncertain"),
+        ("obligation_status", "optional_not_adopted"),
+        ("obligation_status", "informational"),
+    ],
+)
+def test_confirm_requires_supported_direct_binding_conflict(
+    critic_state, field, value,
+):
+    critic = _critic(str(critic_state["session_id"]))
+    critic["normative_assessment"][field] = value
+    errors = _errors(critic_state, critic)
+    assert any(
+        "confirm_contradiction requires supported applicability" in error
+        for error in errors
+    )
+
+
+def test_critic_normative_assessment_must_match_claim_strength(critic_state):
+    critic = _critic(str(critic_state["session_id"]))
+    critic["normative_assessment"]["claim_strength"] = "recommended"
+    critic["normative_assessment"]["obligation_status"] = "binding_recommended"
+    errors = _errors(critic_state, critic)
+    assert any("claim_strength does not match" in error for error in errors)
+    assert any("incompatible with claim strength" in error for error in errors)
+
+
+def test_optional_claim_requires_adoption_to_confirm(critic_state):
+    state = Path(critic_state["state"])
+    claims, errors = ac.load_jsonl(state / "design_claims.jsonl")
+    assert errors == []
+    claims[0]["normative_strength"] = "optional"
+    _write_jsonl(state / "design_claims.jsonl", claims)
+
+    not_adopted = _critic(str(critic_state["session_id"]))
+    not_adopted["normative_assessment"].update({
+        "claim_strength": "optional",
+        "obligation_status": "optional_not_adopted",
+    })
+    errors = _errors(critic_state, not_adopted)
+    assert any("binding/adopted obligation" in error for error in errors)
+
+    adopted = _critic(str(critic_state["session_id"]))
+    adopted["normative_assessment"].update({
+        "claim_strength": "optional",
+        "obligation_status": "optional_adopted",
+    })
+    result = _merge(critic_state, adopted)
+    assert result["validated_ids"] == ["FINDING-1"]
 
 
 @pytest.mark.parametrize("remaining_risks", [None, "none", {}])

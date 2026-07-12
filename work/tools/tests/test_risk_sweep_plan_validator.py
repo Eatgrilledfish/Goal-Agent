@@ -491,7 +491,7 @@ def test_observation_rejects_unknown_sweep_id(tmp_path: Path) -> None:
     assert any("unknown sweep_id 'SWEEP-UNKNOWN'" in error for error in errors)
 
 
-def test_risk_observations_exactly_cover_each_sweep_assignment(tmp_path: Path) -> None:
+def test_risk_observations_may_be_sparse_within_each_completed_sweep(tmp_path: Path) -> None:
     state_root, _plan = _write_valid_state(tmp_path)
     risks = {
         "RISK-A-BOUNDARY": _observation(
@@ -522,32 +522,38 @@ def test_risk_observations_exactly_cover_each_sweep_assignment(tmp_path: Path) -
             lens=LENSES[1],
         ),
     }
-    risks["RISK-B"]["review_lenses"] = LENSES
-
     errors, metrics = validator.validate_risk_coverage(risks, state_root)
 
     assert errors == []
     assert metrics["expected_sweeps"] == ["SWEEP-A", "SWEEP-B"]
     assert metrics["observed_sweeps"] == ["SWEEP-A", "SWEEP-B"]
 
-    incomplete = deepcopy(risks)
-    incomplete["RISK-A-PLANE-PATH"]["parallel_path_ids"] = []
-    errors, _metrics = validator.validate_risk_coverage(incomplete, state_root)
+    sparse = deepcopy(risks)
+    del sparse["RISK-A-PLANE-PATH"]
+    errors, sparse_metrics = validator.validate_risk_coverage(sparse, state_root)
 
-    assert any("risk observations do not cover parallel paths: ['PATH-A']" in error for error in errors)
-    assert any(
-        "risk sweep SWEEP-A: observation parallel_path_ids must exactly cover assignment" in error
-        and "missing=['PATH-A']" in error
-        for error in errors
-    )
+    assert errors == []
+    assert sparse_metrics["observed_sweeps"] == ["SWEEP-A", "SWEEP-B"]
+    assert sparse_metrics["unobserved_paths"] == ["PATH-A"]
+    assert sparse_metrics["unobserved_planes"] == []
 
-    incomplete_lenses = deepcopy(risks)
-    incomplete_lenses["RISK-B"]["review_lenses"] = [LENSES[0]]
-    errors, _metrics = validator.validate_risk_coverage(
-        incomplete_lenses, state_root,
-    )
-    assert any(
-        "risk sweep SWEEP-B: observation review_lenses must exactly cover assignment"
-        in error
-        for error in errors
-    )
+
+def test_risk_coverage_still_requires_one_observation_per_planned_sweep(
+    tmp_path: Path,
+) -> None:
+    state_root, _plan = _write_valid_state(tmp_path)
+    risks = {
+        "RISK-A": _observation(
+            state_root,
+            sweep="SWEEP-A",
+            boundary="BOUNDARY-A",
+            plane="PLANE-A",
+            path_id="",
+            code_file="src/a.py",
+            lens=LENSES[0],
+        ),
+    }
+
+    errors, _metrics = validator.validate_risk_coverage(risks, state_root)
+
+    assert any("do not include completed sweeps: ['SWEEP-B']" in error for error in errors)

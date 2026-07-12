@@ -252,16 +252,37 @@ def validate_verdict(
         errors.append(
             f"{prefix} critic_review.decision must be one of {sorted(expected_critic_decisions)} for {status}"
         )
-    elif any(not _nonempty(critic.get(k)) for k in ("review_id", "challenges", "resolution")):
-        errors.append(f"{prefix} critic_review needs review_id/challenges/resolution")
+    elif any(
+        not _nonempty(critic.get(k))
+        for k in ("review_id", "challenges", "resolution", "normative_assessment")
+    ):
+        errors.append(
+            f"{prefix} critic_review needs review_id/challenges/resolution/"
+            "normative_assessment"
+        )
     if critic_artifact and critic_artifact.get("decision") not in expected_critic_decisions:
         errors.append(f"{prefix} critic artifact decision is incompatible with {status}")
     if critic_artifact and isinstance(critic, dict) and critic.get("review_id") != critic_artifact.get("review_id"):
         errors.append(f"{prefix} critic review_id does not match critic artifact")
     if critic_artifact and isinstance(critic, dict):
-        for field in ("decision", "challenges", "resolution", "review_context"):
+        for field in (
+            "decision", "challenges", "resolution", "review_context",
+            "normative_assessment",
+        ):
             if critic.get(field) != critic_artifact.get(field):
                 errors.append(f"{prefix} critic_review.{field} does not match critic artifact")
+    if status == "confirmed" and isinstance(critic_artifact, dict):
+        normative = critic_artifact.get("normative_assessment")
+        if not isinstance(normative, dict) or (
+            normative.get("applicability") != "supported"
+            or normative.get("actual_conflict") != "yes"
+            or normative.get("obligation_status")
+            in {"optional_not_adopted", "informational"}
+        ):
+            errors.append(
+                f"{prefix} confirmed verdict requires a supported, binding/adopted "
+                "normative conflict"
+            )
     finding = findings.get(finding_id, {})
     selection = finding.get("dynamic_probe_selection") if isinstance(finding.get("dynamic_probe_selection"), dict) else {}
     if selection.get("disposition") not in {

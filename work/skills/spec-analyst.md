@@ -30,7 +30,9 @@
 }
 ```
 
-每个 group至少一个真实 section；section range必须落在该 group member内。`behavior_families` 是语义地图，不是固定 taxonomy、关键词分类或任务配额。歧义如实记录。
+每个 group至少一个真实 section；section range必须落在该 group member内。`behavior_families` 是从当前设计原文动态提炼的语义地图，也是后续 design-origin frontier的轻量seed；每个相互独立的触发条件、角色、时序副作用、集合/链遍历、能力承诺或边界行为应可分别定位，但不是固定 taxonomy、关键词分类或任务配额。保留当前输入自己的领域术语，不要为了通用化改写成抽象的“某模块/某检查”。歧义如实记录。
+
+当文档标为superseded时，不得把其中仍约束兼容模式、旧版本输入或迁移行为的section静默丢弃：把它映射到替代文档中的现行义务，或明确记录版本/适用性歧义，确保该行为仍有seed可供coverage对账。
 
 在同一 Task内执行：
 

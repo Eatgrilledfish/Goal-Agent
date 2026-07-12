@@ -237,6 +237,58 @@ def test_task_plan_does_not_hard_code_first_round_semantic_portfolio(workspace):
     assert proc.returncode == 0, proc.stdout + proc.stderr
 
 
+def test_initial_frontier_rejects_code_risk_as_its_only_entry(workspace):
+    populate_handoffs(workspace)
+    _prepare_claim_scope(workspace)
+    state = workspace["state"]
+    assert isinstance(state, Path)
+    tasks, errors = ac.load_jsonl(state / "investigation_tasks.jsonl")
+    assert errors == []
+    for task in tasks:
+        task["exploration_mode"] = "code-to-design risk backtracking"
+        task["risk_observation_ids"] = [
+            "RISK-AUDIT-001"
+            if task["architecture_boundaries"] == ["BOUNDARY-AUDIT"]
+            else "RISK-API-001"
+        ]
+    _rewrite_jsonl(state / "investigation_tasks.jsonl", tasks)
+
+    proc = _run_stage(workspace, "task-plan-check", check=False)
+    assert proc.returncode == 1
+    trace = ac.load_json(workspace["logs"] / "trace" / "task_plan_validation.json")
+    assert any(
+        "code-risk observations cannot be the sole entry" in error
+        for error in trace["errors"]
+    )
+
+
+def test_initial_frontier_rejects_more_than_two_rounds(workspace):
+    populate_handoffs(workspace)
+    _prepare_claim_scope(workspace)
+    state = workspace["state"]
+    assert isinstance(state, Path)
+    tasks, errors = ac.load_jsonl(state / "investigation_tasks.jsonl")
+    assert errors == []
+    template = ac.load_jsonl(state / "investigation_rounds.jsonl")[0][0]
+    task_groups = [tasks[:2], tasks[2:3], tasks[3:]]
+    rounds = []
+    for index, group in enumerate(task_groups, start=1):
+        round_item = dict(template)
+        round_item["round_id"] = f"ROUND-{index:03d}"
+        round_item["task_ids"] = [task["task_id"] for task in group]
+        round_item["claim_ids"] = [task["claim_id"] for task in group]
+        rounds.append(round_item)
+    _rewrite_jsonl(state / "investigation_rounds.jsonl", rounds)
+
+    proc = _run_stage(workspace, "task-plan-check", check=False)
+    assert proc.returncode == 1
+    trace = ac.load_json(workspace["logs"] / "trace" / "task_plan_validation.json")
+    assert any(
+        "maximum_initial_frontier_rounds=2" in error
+        for error in trace["errors"]
+    )
+
+
 def test_first_round_can_defer_other_parallel_planes_to_coverage(workspace):
     populate_handoffs(workspace)
     _prepare_claim_scope(workspace)

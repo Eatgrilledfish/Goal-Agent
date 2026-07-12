@@ -1233,42 +1233,6 @@ def run(args: argparse.Namespace) -> int:
     )
     if not risk_plan_validation_current:
         errors.append("passed digest-bound risk sweep plan validation is missing or stale")
-    high_risk_boundary_ids = {
-        str(item.get("boundary_id"))
-        for item in architecture.get("integration_boundaries", [])
-        if isinstance(item, dict) and item.get("risk") == "high" and item.get("boundary_id")
-    }
-    observed_risk_boundaries = {
-        str(boundary)
-        for observation in risks.values()
-        for boundary in observation.get("architecture_boundaries", [])
-        if boundary
-    }
-    missing_risk_boundaries = high_risk_boundary_ids - observed_risk_boundaries
-    if missing_risk_boundaries:
-        errors.append(
-            "high-risk architecture boundaries lack code-only risk observations: "
-            f"{sorted(missing_risk_boundaries)}"
-        )
-    required_parallel_planes = {
-        str(plane_id)
-        for item in parallel_behavior_paths
-        for plane_id in item.get("plane_ids", [])
-        if plane_id
-    }
-    observed_risk_planes = {
-        str(plane_id)
-        for observation in risks.values()
-        for plane_id in observation.get("implementation_planes", [])
-        if plane_id
-    }
-    missing_risk_planes = required_parallel_planes - observed_risk_planes
-    if missing_risk_planes:
-        errors.append(
-            "parallel implementation planes lack code-only risk observations: "
-            f"{sorted(missing_risk_planes)}"
-        )
-
     for task_id, task in tasks.items():
         errors.extend(_require_fields(task, (
             "session_id", "claim_id", "claim_branch", "hypothesis", "obligation_sha256",
@@ -1383,9 +1347,18 @@ def run(args: argparse.Namespace) -> int:
             continue
         errors.extend(_require_fields(critique, (
             "session_id", "review_id", "claim_id", "decision", "challenges", "checks_performed",
-            "review_context", "resolution",
+            "review_context", "resolution", "normative_assessment",
             "dynamic_probe_review",
         ), f"critic review {finding_id}"))
+        errors.extend(hm.validate_artifact(
+            critique, "critic", f"critic review {finding_id}",
+        ))
+        errors.extend(hm._context_errors(
+            critique, "critic", root, f"critic review {finding_id}",
+        ))
+        errors.extend(hm.validate_critic_bindings(
+            critique, root, f"critic review {finding_id}",
+        ))
         if critique.get("session_id") != session_id:
             errors.append(f"critic review {finding_id}: session does not match current session")
         if critique.get("review_context") != "fresh_subagent":

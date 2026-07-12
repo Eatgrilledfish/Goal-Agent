@@ -549,12 +549,12 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
             "status": "complete",
             "defer_reason": "",
             "review_lenses": task_lenses,
-            "exploration_mode": contract["coverage_contract"]["exploration_modes"][index % 3],
+            "exploration_mode": contract["coverage_contract"]["exploration_modes"][(index - 1) % 3],
             "architecture_boundaries": [task_boundary],
             "implementation_planes": [task_plane],
             "parallel_path_ids": [],
             "risk_observation_ids": [task_risk] if (
-                contract["coverage_contract"]["exploration_modes"][index % 3]
+                contract["coverage_contract"]["exploration_modes"][(index - 1) % 3]
                 == "code-to-design risk backtracking"
             ) else [],
         })
@@ -603,6 +603,13 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
             "finding_id": finding_id,
             "claim_id": claim_id,
             "decision": "confirm_contradiction",
+            "normative_assessment": {
+                "claim_strength": "mandatory",
+                "applicability": "supported",
+                "obligation_status": "binding_required",
+                "actual_conflict": "yes",
+                "rationale": "The applicable mandatory contract directly conflicts with the reachable implementation.",
+            },
             "challenges": [
                 "Could another reachable path enforce the claim?",
                 "Could configuration or scope make the cited branch inapplicable?",
@@ -658,6 +665,7 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
             },
             "critic_review": {
                 "review_id": review_id, "decision": "confirm_contradiction",
+                "normative_assessment": critic["normative_assessment"],
                 "challenges": critic["challenges"], "resolution": critic["resolution"],
                 "review_context": critic["review_context"],
             },
@@ -1139,7 +1147,7 @@ def test_prepare_is_semantic_neutral_and_writes_agent_contract(workspace):
     assert "paths" not in design_manifest
     assert "code_root" not in json.dumps(design_manifest)
     assert contract["execution_model"] == "opencode-owned-model-driven-loop"
-    assert contract["contract_version"] == 14
+    assert contract["contract_version"] == 15
     assert contract["handoff_integrity"]["max_concurrent_subagent_tasks"] == 2
     assert contract["tool_protocol"]["agent_event_contract"]["required_fields"] == [
         "event", "role", "phase", "scope_id", "scope",
@@ -2183,6 +2191,26 @@ def test_instruction_requires_risk_plan_gate_before_parallel_risk_tasks():
     assert "通过后" in instruction[gate_position:launch_position]
     assert "切片按真实耦合 component" in instruction[:launch_position]
     assert "不得重叠" in instruction[:launch_position]
+
+
+def test_discovery_policy_uses_dual_entry_frontier_without_synthetic_risk_padding():
+    instruction = (ROOT / "INSTRUCTION.md").read_text(encoding="utf-8")
+    skill = (ROOT / "work" / "skill" / "SKILL.md").read_text(encoding="utf-8")
+    orchestrator = (ROOT / "work" / "skills" / "orchestrator.md").read_text(
+        encoding="utf-8"
+    )
+    risk = (ROOT / "work" / "skills" / "risk-explorer.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert "design-origin" in instruction
+    assert "design-origin" in skill
+    assert "Risk observation不是唯一入口" in orchestrator
+    assert "初始 frontier最多两轮" in orchestrator
+    assert "不要求 observation 的 boundary/plane/path/lens 并集覆盖整个 slice" in risk
+    assert "不得制造 observation" in risk
+    assert "当前输入" in instruction
+    assert "动态发现" in skill
 
 
 def test_prepare_resumes_same_session_without_erasing_handoffs(workspace):

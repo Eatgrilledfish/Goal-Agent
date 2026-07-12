@@ -15,6 +15,8 @@
 
 Catalog链接只证明来源，不自动证明 capability promise；但也不能从“代码没实现”反推该能力不适用。Scope exclusion必须有 supplied design或当前构建/发布边界正面证据。Mandatory/recommended/optional/declared capability按真实强度判断；SHOULD/MAY差异不能升级成 MUST violation，也不能因强度较低而自动忽略真实 expected/actual差异。
 
+先完成规范约束判定，再选择 decision。`confirm_contradiction` 只允许当前设计确实适用、实际行为与该义务直接冲突，并且义务是 mandatory、recommended、明确 capability，或实现有正面证据表明已采用该 optional branch。仅仅“最好这样做”、最佳实践差异、每个实际输出都满足设计但聚合行为令人担忧、或 optional 行为未采用，都必须 `reject_issue`；证据不足时用 `needs_more_evidence`。Optional 的“已采用”必须由代码、配置或产品声明中的正面证据支持，不能从局部启发式实现推断。
+
 Probe未运行不阻止静态证据充分的确认。Environment/baseline/reachability失败只能 inconclusive。`disconfirms_contradiction` 是必须解释的反证；probe failure不能单独确认。
 
 ## 唯一输出 schema
@@ -28,6 +30,13 @@ Probe未运行不阻止静态证据充分的确认。Environment/baseline/reacha
   "finding_id":"FINDING-...",
   "claim_id":"CLAIM-...",
   "decision":"confirm_contradiction|reject_issue|needs_more_evidence",
+  "normative_assessment":{
+    "claim_strength":"mandatory|recommended|optional|declared_capability|informational",
+    "applicability":"supported|unsupported|ambiguous",
+    "obligation_status":"binding_required|binding_recommended|declared_capability|optional_adopted|optional_not_adopted|informational",
+    "actual_conflict":"yes|no|uncertain",
+    "rationale":"用当前claim/finding事实解释约束力及actual是否直接冲突"
+  },
   "challenges":[
     "至少两项具体替代解释/反证挑战，包含target",
     "第二项具体挑战"
@@ -52,11 +61,11 @@ Probe未运行不阻止静态证据充分的确认。Environment/baseline/reacha
 
 不得增加 title、severity、confidence、issue_type、design/code evidence副本或其他 final verdict字段。`challenges` 与 `checks_performed` 各至少两个不同的具体非空字符串；禁止“independent check”等占位。
 
-Raw handoff不要填写工具所有的 `input_digests` 或 `evidence_critic_prompt_version`。Self-check/merge会从当前 claim、finding与实际引用的probe确定性绑定 `claim_sha256/finding_sha256/probe_sha256`，并写入 `evidence-critic-v2`；已提供但不匹配的绑定会被拒绝。Claim、finding或probe任一摘要变化都会使旧 critic失效，必须由 fresh critic基于新证据复审，不能只刷新 hash。
+Raw handoff不要填写工具所有的 `input_digests` 或 `evidence_critic_prompt_version`。Self-check/merge会从当前 claim、finding与实际引用的probe确定性绑定 `claim_sha256/finding_sha256/probe_sha256`，并写入 `evidence-critic-v3`；已提供但不匹配的绑定会被拒绝。Claim、finding或probe任一摘要变化都会使旧 critic失效，必须由 fresh critic基于新证据复审，不能只刷新 hash。
 
 Decision：
 
-- `confirm_contradiction`：所有关键挑战已由当前静态证据（及可选有效probe）解决，expected/actual真实冲突；
+- `confirm_contradiction`：所有关键挑战已解决，且 `normative_assessment` 证明 applicability=supported、actual_conflict=yes、义务为 binding/adopted；
 - `reject_issue`：实现满足设计、设计不适用、关键替代路径补偿，或证据无法支持该issue；
 - `needs_more_evidence`：差异可能存在但证据尚未闭环，且一个明确可执行的新证据问题可能改变结论。把问题写进 `remaining_risks`，不得要求泛化“继续调查”；Final Judge只能由该状态映射为 probable。
 
@@ -77,4 +86,4 @@ python3 ${WORK_ROOT}/tools/scripts/handoff_merge.py \
   --report ${LOG_ROOT}/trace/critic-check-${FINDING_ID}.json
 ```
 
-Schema/identity错误在本 Task内修正并重跑；不能让 orchestrator补 `review_context`、challenges或resolution。只有命令返回0且 report passed，并且 report给出当前 `input_digests` 与 `evidence_critic_prompt_version=evidence-critic-v2`，才返回 handoff路径与 decision。成功交接时按入口写`critic_review/evidence-critic` complete checkpoint，`--task-id`逐值使用当前`${FINDING_ID}`，provider session只属于该finding。
+Schema/identity错误在本 Task内修正并重跑；不能让 orchestrator补 `review_context`、challenges或resolution。只有命令返回0且 report passed，并且 report给出当前 `input_digests` 与 `evidence_critic_prompt_version=evidence-critic-v3`，才返回 handoff路径与 decision。成功交接时按入口写`critic_review/evidence-critic` complete checkpoint，`--task-id`逐值使用当前`${FINDING_ID}`，provider session只属于该finding。

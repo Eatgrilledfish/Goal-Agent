@@ -913,6 +913,41 @@ def validate_task_plan_stage(
     ordered_rounds = _validate_round_plan(
         tasks, rounds, max_tasks_per_round, global_errors, errors_by_task,
     )
+    max_initial_rounds = iteration_policy.get("maximum_initial_frontier_rounds", 2)
+    if (
+        not isinstance(max_initial_rounds, int)
+        or isinstance(max_initial_rounds, bool)
+        or max_initial_rounds < 1
+    ):
+        global_errors.append(
+            "agent_loop_contract.json: maximum_initial_frontier_rounds must be a positive integer"
+        )
+        max_initial_rounds = 2
+    initial_task_ids = {
+        task_id for task_id, task in tasks.items()
+        if not task.get("coverage_request_sha256")
+    }
+    initial_round_ids = [
+        str(round_item.get("round_id") or "")
+        for round_item in rounds
+        if initial_task_ids.intersection(round_item.get("task_ids", []))
+    ]
+    if len(initial_round_ids) > max_initial_rounds:
+        global_errors.append(
+            "initial evidence-pair frontier exceeds "
+            f"maximum_initial_frontier_rounds={max_initial_rounds}: {initial_round_ids}"
+        )
+    if initial_task_ids and not any(
+        tasks[task_id].get("exploration_mode") in {
+            "design-to-code obligation tracing",
+            "capability-absence reconciliation",
+        }
+        for task_id in initial_task_ids
+    ):
+        global_errors.append(
+            "initial evidence-pair frontier must include a design-origin or "
+            "capability-absence task; code-risk observations cannot be the sole entry"
+        )
     valid_task_ids = sorted(
         task_id for task_id, task_errors in errors_by_task.items() if not task_errors
     )

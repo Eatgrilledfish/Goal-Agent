@@ -116,7 +116,7 @@ def replay_source(tmp_path: Path) -> dict[str, Path | str]:
         "state": str(state / "agent_loop_state.json"),
     }
     ac.save_json(state / "agent_loop_contract.json", {
-        "contract_version": 14,
+        "contract_version": 15,
         "execution_model": "opencode-owned-model-driven-loop",
         "session": {"session_id": session_id, "artifacts": artifacts},
         "coverage_contract": {
@@ -681,6 +681,13 @@ def _prepare_valid_coverage_artifacts(replay_source: dict[str, Path | str]) -> N
             "finding_id": finding["finding_id"],
             "claim_id": finding["claim_id"],
             "decision": "confirm_contradiction",
+            "normative_assessment": {
+                "claim_strength": claim["normative_strength"],
+                "applicability": "supported",
+                "obligation_status": "binding_required",
+                "actual_conflict": "yes",
+                "rationale": "The applicable mandatory contract directly conflicts with the reachable implementation.",
+            },
             "challenges": [
                 "Checked whether the cited branch is reachable.",
                 "Checked whether another layer enforces the design obligation.",
@@ -704,7 +711,7 @@ def _prepare_valid_coverage_artifacts(replay_source: dict[str, Path | str]) -> N
                 "finding_sha256": _canonical_sha256(finding),
                 "probe_sha256": "",
             },
-            "evidence_critic_prompt_version": "evidence-critic-v2",
+            "evidence_critic_prompt_version": "evidence-critic-v3",
         })
     _write_jsonl(state / "critic_reviews.jsonl", critics)
     _write_jsonl(state / "critic_review_history.jsonl", [
@@ -793,7 +800,7 @@ def test_claims_prepare_writes_frozen_manifest_and_no_llm(replay_source, tmp_pat
     assert manifest["development_only"] is True
     assert manifest["llm_invoked"] is False
     assert manifest["runtime"] == {"provider": "provider-a", "model": "model-b"}
-    assert manifest["schema"]["contract_version"] == 14
+    assert manifest["schema"]["contract_version"] == 15
     assert len(manifest["source_digest"]) == 64
     assert len(manifest["replay_input_digest"]) == 64
     assert len(manifest["prompt"]["sha256"]) == 64

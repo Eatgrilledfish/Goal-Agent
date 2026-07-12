@@ -8,7 +8,7 @@
 
 ## 审计问题
 
-- 哪些 in-scope/ambiguous document group或 inventory section完全未探索；
+- 哪些 in-scope/ambiguous document group、inventory section或独立behavior family完全未探索；优先级高于继续深挖已有多个candidate的同一域；
 - 哪些 high/medium-risk architecture boundary、parallel plane、adapter/imported/generated/fast/slow path没有直接证据；
 - 哪些通用 design semantic lens只有标签，没有真实 task/finding；
 - 哪些 risk observation尚未与设计义务配对；
@@ -16,7 +16,7 @@
 - 当前 pending/in_progress/deferred状态是否诚实；
 - 是否值得在剩余预算内做一次有明确信息增益的 supplement。
 
-未覆盖 gap是合法输出。不要要求每个 inventory section、每个 lens或三种 exploration mode都实际调查；不要因 group gap阻塞已接受 claim；不要为 candidate/confirmed数量创建 task。少量合规 finding不能证明整个域合规，但其余范围可以明确写 `gap_recorded`。
+未覆盖 gap是合法输出。每个适用 inventory section/behavior family都必须被investigated或明确记为具体gap，但不要求每个都生成task；不要因 group gap阻塞已接受 claim；不要为 candidate/confirmed数量创建 task。少量合规 finding不能证明整个域合规，也不能替代对另一个完全未探索设计域的对账。
 
 ## `semantic_coverage.json`
 
@@ -97,7 +97,7 @@
 
 Gap的 `kind/ref_id` 必须可机器对账：`claim_review_expansion` 使用 claim-review trace 的 `expansion_request_id`；`lens` 使用完整 lens；`architecture_boundary/parallel_path/exploration_mode/frontier_claim/critic_request` 分别使用对应稳定 ID；文档组或 section gap用 `inventory`。`gap_recorded` lens的 task/finding arrays必须为空，并有同 lens `remaining_gaps`；high-risk boundary或parallel path未直接调查时也必须有对应 gap。
 
-Next task必须来自具体 gap，不得写宽泛“再检查整个模块”。若 gap尚无 accepted claim，只记录具体 design lookup/section gap，由 orchestrator先走 claim resolution；不能虚构 claim ID。Deferred只接受 task中两次 provider/tool failure的结构化证据；普通证据不足不是 deferred。
+Next task必须来自具体 gap，不得写宽泛“再检查整个模块”。若最高信息增益gap尚无 accepted claim，先记录具体design lookup/section/behavior-family gap并返回`closed=false`，由orchestrator完成claim resolution/review后重新运行本次初始审计；不能虚构claim ID，也不能因为暂时没有claim就跳过该域并关闭coverage。Deferred只接受 task中两次 provider/tool failure的结构化证据；普通证据不足不是 deferred。
 
 Coverage validation 的 `closed=true` 只表示：当前 accepted evidence-pair frontier 的 `remaining_scoped_claims=[]`、无 pending/in_progress task、一次 supplement已明确执行或放弃、`next_round_tasks=[]`。它不要求 `remaining_gaps=[]`，不要求每个 lens/mode/boundary全部 investigated，也不推翻已闭环 candidate。
 

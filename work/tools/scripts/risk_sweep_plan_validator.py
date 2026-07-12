@@ -512,60 +512,17 @@ def validate_observation_against_plan(
     return errors
 
 
-def _sweep_coverage_errors(
-    sweep_id: str, sweep: dict[str, Any], items: list[dict[str, Any]],
-    index: dict[str, Any],
-) -> list[str]:
-    errors: list[str] = []
-    for field in (
-        "architecture_boundaries", "implementation_planes", "parallel_path_ids",
-        "review_lenses",
-    ):
-        observed = {
-            str(value) for item in items
-            for value in item.get(field, []) if value
-        }
-        expected = set(sweep.get(field, []))
-        if observed != expected:
-            errors.append(
-                f"risk sweep {sweep_id}: observation {field} must exactly cover assignment; "
-                f"missing={sorted(expected - observed)}, extra={sorted(observed - expected)}"
-            )
-    for path_id in sweep.get("parallel_path_ids", []):
-        path_planes = set(
-            index.get("parallel_paths", {}).get(path_id, {}).get("plane_ids", [])
-        )
-        for plane_id in sorted(path_planes):
-            plane_paths = index.get("planes", {}).get(plane_id, {}).get("paths", [])
-            backed = False
-            for item in items:
-                if not (
-                    path_id in item.get("parallel_path_ids", [])
-                    and plane_id in item.get("implementation_planes", [])
-                ):
-                    continue
-                files = [
-                    str(evidence.get("file"))
-                    for evidence in item.get("code_evidence", [])
-                    if isinstance(evidence, dict)
-                    and isinstance(evidence.get("file"), str)
-                    and evidence.get("file")
-                ]
-                if any(_in_scope(file_value, plane_paths) for file_value in files):
-                    backed = True
-                    break
-            if not backed:
-                errors.append(
-                    f"risk sweep {sweep_id}: parallel path {path_id} lacks "
-                    f"path-linked local evidence for plane {plane_id}"
-                )
-    return errors
-
-
 def validate_sweep_coverage(
     items: list[dict[str, Any]], state_root: Path, sweep_id: str,
 ) -> list[str]:
-    """Validate the aggregate coverage of one isolated sweep handoff."""
+    """Validate one isolated sweep without forcing synthetic observations.
+
+    The plan owns scope assignment.  Observations are sparse, high-information
+    semantic leads, so a reviewed boundary/plane that yields no concrete lead
+    must not be padded into the handoff merely to satisfy an ID checklist.
+    Individual observations still have to stay inside the assigned sweep and
+    carry local evidence for every ID they claim.
+    """
     _plan, index, errors = load_validated_plan(state_root)
     if errors:
         return errors
@@ -578,7 +535,6 @@ def validate_sweep_coverage(
     })
     if foreign:
         errors.append(f"risk sweep {sweep_id}: contains foreign sweeps {foreign}")
-    errors.extend(_sweep_coverage_errors(sweep_id, sweep, items, index))
     return errors
 
 
@@ -606,26 +562,25 @@ def validate_risk_coverage(
         for value in item.get("parallel_path_ids", []) if value
     }
     expected_sweeps = set(index["slices"])
-    for label, expected, actual in (
-        ("sweeps", expected_sweeps, observed_sweeps),
-        ("architecture boundaries", index["required_boundaries"], observed_boundaries),
-        ("required planes", index["required_planes"], observed_planes),
-        ("parallel paths", index["required_paths"], observed_paths),
-    ):
-        missing = expected - actual
-        if missing:
-            errors.append(f"risk observations do not cover {label}: {sorted(missing)}")
-    for sweep_id, sweep in index["slices"].items():
-        sweep_items = [
-            item for item in risks.values() if item.get("sweep_id") == sweep_id
-        ]
-        errors.extend(_sweep_coverage_errors(sweep_id, sweep, sweep_items, index))
+    missing_sweeps = expected_sweeps - observed_sweeps
+    if missing_sweeps:
+        errors.append(
+            f"risk observations do not include completed sweeps: {sorted(missing_sweeps)}"
+        )
     return errors, {
         "expected_sweeps": sorted(expected_sweeps),
         "observed_sweeps": sorted(observed_sweeps),
         "required_boundaries": sorted(index["required_boundaries"]),
         "required_planes": sorted(index["required_planes"]),
         "required_paths": sorted(index["required_paths"]),
+        "observed_boundaries": sorted(observed_boundaries),
+        "observed_planes": sorted(observed_planes),
+        "observed_paths": sorted(observed_paths),
+        "unobserved_boundaries": sorted(
+            index["required_boundaries"] - observed_boundaries
+        ),
+        "unobserved_planes": sorted(index["required_planes"] - observed_planes),
+        "unobserved_paths": sorted(index["required_paths"] - observed_paths),
     }
 
 

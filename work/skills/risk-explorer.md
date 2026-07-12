@@ -8,11 +8,11 @@
 
 若发现真实可达但 architecture map 未记录的 plane/boundary，或一项实质 observation 必须引用其他 slice 的 boundary/plane/path 或代码证据，说明 architecture/plan 漏掉真实耦合。不得把它硬塞进现有 ID，也不得静默忽略；聊天返回 `plan_repair_required`、精确代码路径和可达性证据，不写 risk handoff。orchestrator 修 map、重跑 architecture-check、重写 plan 后，所有 slices 都必须由 fresh Tasks 重做。这个反查只依据代码，不接触设计。
 
-重点寻找该 lens 下能改变外部行为的具体控制流，例如集合是否提前停止或存在隐藏容量、链/嵌套元素是否逐跳推进、同步与延迟/重试/主动副作用的差异、分类/分派/所有权变化、能力注册与相邻能力的不对称、配置分支、导入/自有/fast/slow 实现的行为分叉，以及状态/错误路径的不变量。这里的例子是跨项目的阅读视角，不是关键词命中规则；没有真实代码证据就不输出。
+重点寻找该 lens 下能改变外部行为的具体控制流，例如集合是否提前停止或存在隐藏容量、链/嵌套元素是否逐跳推进、同步与延迟/重试/主动副作用的差异、分类/分派/所有权变化、能力注册与相邻能力的不对称、配置分支、导入/自有/fast/slow 实现的行为分叉，以及状态/错误路径的不变量。这里的例子是跨项目的阅读视角，不是关键词命中规则；可以且应当使用从当前代码、目录、构建和注释动态读出的领域术语进行导航，但不得预置项目/协议答案。没有真实代码证据就不输出。
 
-每项 observation 必须是一个可由设计回答的中性行为问题，并给出当前代码实际行为、精确代码行、至少两项替代路径/配置/调用者反查和真实 tool trace。禁止使用 “violates/MUST missing/issue/bug” 等 verdict，禁止写 design evidence、claim_id、assessment、confidence 或 recommendation。不得把“全仓无命中”单独当 observation。
+每项 observation 必须是一个可由设计回答的中性行为问题，并给出当前代码实际行为、精确代码行、至少一项替代路径/配置/调用者反查和真实 tool trace。Risk阶段只负责高召回线索，完整反证链留给 investigator/critic。禁止使用 “violates/MUST missing/issue/bug” 等 verdict，禁止写 design evidence、claim_id、assessment、confidence 或 recommendation。不得把“全仓无命中”单独当 observation。
 
-每个 Task 必须真实检查本 slice 的全部 boundary、plane 和 parallel path；对每个分配的 boundary、每个 path 及其全部 planes 都要有落在该 ID 自身 path 和本 slice anchor 内的精确代码证据。每个 parallel path 的每个 plane 都要至少一项同时引用该 path+plane 的 observation。Plan只会给本 slice一个非空且相关的 lens子集，不要求你在每个 slice重复完整 portfolio；未分配 lens不得自行扩张。observation 不需要可疑：正常终止条件、完整链推进或正确分派也可以成为设计可回答的问题，后续 investigator 可得到 `design_satisfied`。一个真实 observation 可以覆盖同一 slice 内由同一调用链连接、且各自都有本地 evidence 的多个 ID，但不能代表未读取的路径，也不能引用另一 slice 的 ownership ID。将任意数量的 observations 写成 orchestrator 指定的一个独立 JSON 数组；数组中 boundary/plane/path/lens 的并集必须精确覆盖本 slice自身分配范围；单 observation仍只取1–3个 lens，多项 observation只补齐本 slice已分配 checklist。每项字段严格为：
+每个 Task 必须真实检查本 slice 的全部 boundary、plane 和 parallel path，但只为发现的具体高信息量语义风险写 observation。不得为证明范围已读而把正常入口、正确实现或宽泛架构描述写成 observation，也不要求 observation 的 boundary/plane/path/lens 并集覆盖整个 slice。每条 observation 声明的 ID 都必须属于本 slice，并由该 ID 自身 path 与 anchor 内的代码证据支持。Plan只会给本 slice一个非空且相关的 lens子集，未分配 lens不得自行扩张。一个真实 observation 可以覆盖同一调用链连接且各自有本地证据的多个 ID，但不能代表未读取的路径或引用另一 slice 的 ownership ID。将发现的 observations 写成 orchestrator 指定的独立 JSON 数组。每项字段严格为：
 
 ```json
 {
@@ -33,4 +33,4 @@
 }
 ```
 
-每项 boundary/plane/path 必须属于本 slice，`sweep_id` 与 plan digest 必须逐值一致。tool trace 至少包含 code search/navigation、code_read、reverse_check；不得包含 design_read。若没有足够证据，明确返回未完成并让 orchestrator修 plan 或重新分配，不能用空 handoff 假装已覆盖，也不能制造 observation。你只能写指定 JSON 数组和独立 self-check report；禁止修改 `risk_sweep_plan.json`、`architecture_map.json` 或共享 `risk_observations.jsonl`。写完必须执行 orchestrator 提供的 `handoff_merge.py --check-file --artifact-type risk --session-id SESSION_ID --code-root REVIEW_CODE_ROOT --report ...`；只有 report passed 才返回 observation 数量、`sweep_id` 和 handoff 路径。成功交接时还要按入口写`code_risk_backtracking/risk-explorer` complete checkpoint，`--task-id`逐值使用当前`${SWEEP_ID}`，provider session只属于该sweep。
+每项 boundary/plane/path 必须属于本 slice，`sweep_id` 与 plan digest 必须逐值一致。tool trace 至少包含 code search/navigation 与 code_read；reverse check 可写但不在高召回阶段强制。不得包含 design_read。若整个 slice没有任何具体语义风险，明确返回未完成并让 orchestrator重新审视切片，不得制造 observation。你只能写指定 JSON 数组和独立 self-check report；禁止修改 `risk_sweep_plan.json`、`architecture_map.json` 或共享 `risk_observations.jsonl`。写完必须执行 orchestrator 提供的 `handoff_merge.py --check-file --artifact-type risk --session-id SESSION_ID --code-root REVIEW_CODE_ROOT --report ...`；只有 report passed 才返回 observation 数量、`sweep_id` 和 handoff 路径。成功交接时还要按入口写`code_risk_backtracking/risk-explorer` complete checkpoint，`--task-id`逐值使用当前`${SWEEP_ID}`，provider session只属于该sweep。

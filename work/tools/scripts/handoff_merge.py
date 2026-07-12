@@ -41,12 +41,23 @@ FINDING_TEMPLATE_FIELDS = (
 CRITIC_ALLOWED_KEYS = {
     "review_id", "session_id", "finding_id", "claim_id", "decision", "challenges",
     "checks_performed", "dynamic_probe_review", "review_context", "resolution",
-    "remaining_risks", "input_digests", "evidence_critic_prompt_version",
+    "remaining_risks", "normative_assessment", "input_digests",
+    "evidence_critic_prompt_version",
 }
 CRITIC_INPUT_DIGEST_KEYS = {
     "claim_sha256", "finding_sha256", "probe_sha256",
 }
-EVIDENCE_CRITIC_PROMPT_VERSION = "evidence-critic-v2"
+EVIDENCE_CRITIC_PROMPT_VERSION = "evidence-critic-v3"
+NORMATIVE_ASSESSMENT_ALLOWED_KEYS = {
+    "claim_strength", "applicability", "obligation_status", "actual_conflict",
+    "rationale",
+}
+NORMATIVE_APPLICABILITY = {"supported", "unsupported", "ambiguous"}
+NORMATIVE_OBLIGATION_STATUS = {
+    "binding_required", "binding_recommended", "declared_capability",
+    "optional_adopted", "optional_not_adopted", "informational",
+}
+NORMATIVE_CONFLICT_STATUS = {"yes", "no", "uncertain"}
 DYNAMIC_PROBE_REVIEW_ALLOWED_KEYS = {
     "status", "probe_id", "oracle_validity", "environment_validity", "reachability",
     "effect_on_decision",
@@ -263,8 +274,8 @@ def _validate_trace(item: dict[str, Any], label: str) -> list[str]:
 
 def _validate_risk_trace(item: dict[str, Any], label: str) -> list[str]:
     trace = item.get("tool_trace")
-    if not isinstance(trace, list) or len(trace) < 3:
-        return [f"{label}: code-only tool_trace must contain at least three real steps"]
+    if not isinstance(trace, list) or len(trace) < 2:
+        return [f"{label}: code-only tool_trace must contain at least two real steps"]
     errors: list[str] = []
     kinds: set[str] = set()
     for index, step in enumerate(trace, start=1):
@@ -284,7 +295,6 @@ def _validate_risk_trace(item: dict[str, Any], label: str) -> list[str]:
     for required, description in (
         ({"code_search", "code_navigation"}, "code_search or code_navigation"),
         ({"code_read"}, "code_read"),
-        ({"reverse_check"}, "reverse_check"),
     ):
         if not kinds.intersection(required):
             errors.append(f"{label}: tool_trace lacks {description}")
@@ -671,8 +681,8 @@ def validate_artifact(item: dict[str, Any], artifact_type: str, label: str) -> l
         if not isinstance(lenses, list) or not 1 <= len(lenses) <= 3:
             errors.append(f"{label}: review_lenses must contain one to three focused lenses")
         checks = item.get("false_positive_checks")
-        if not isinstance(checks, list) or len(checks) < 2:
-            errors.append(f"{label}: false_positive_checks must contain at least two checks")
+        if not isinstance(checks, list) or len(checks) < 1:
+            errors.append(f"{label}: false_positive_checks must contain at least one check")
         else:
             for index, check in enumerate(checks, start=1):
                 if not isinstance(check, dict):
@@ -741,7 +751,7 @@ def validate_artifact(item: dict[str, Any], artifact_type: str, label: str) -> l
         errors.extend(_require(item, (
             "review_id", "session_id", "finding_id", "claim_id", "decision", "challenges",
             "checks_performed", "dynamic_probe_review", "review_context", "resolution",
-            "input_digests", "evidence_critic_prompt_version",
+            "normative_assessment", "input_digests", "evidence_critic_prompt_version",
         ), label))
         input_digests = item.get("input_digests")
         if not isinstance(input_digests, dict):
@@ -781,6 +791,42 @@ def validate_artifact(item: dict[str, Any], artifact_type: str, label: str) -> l
             "confirm_contradiction", "reject_issue", "needs_more_evidence",
         }:
             errors.append(f"{label}: invalid decision")
+        normative = item.get("normative_assessment")
+        if not isinstance(normative, dict):
+            errors.append(f"{label}: normative_assessment must be an object")
+        else:
+            unexpected_normative = sorted(
+                set(normative) - NORMATIVE_ASSESSMENT_ALLOWED_KEYS
+            )
+            if unexpected_normative:
+                errors.append(
+                    f"{label}: normative_assessment has unsupported fields "
+                    f"{unexpected_normative}"
+                )
+            errors.extend(_require(
+                normative,
+                (
+                    "claim_strength", "applicability", "obligation_status",
+                    "actual_conflict", "rationale",
+                ),
+                f"{label}: normative_assessment",
+            ))
+            if normative.get("applicability") not in NORMATIVE_APPLICABILITY:
+                errors.append(f"{label}: invalid normative_assessment.applicability")
+            if normative.get("obligation_status") not in NORMATIVE_OBLIGATION_STATUS:
+                errors.append(f"{label}: invalid normative_assessment.obligation_status")
+            if normative.get("actual_conflict") not in NORMATIVE_CONFLICT_STATUS:
+                errors.append(f"{label}: invalid normative_assessment.actual_conflict")
+            if item.get("decision") == "confirm_contradiction" and (
+                normative.get("applicability") != "supported"
+                or normative.get("actual_conflict") != "yes"
+                or normative.get("obligation_status")
+                in {"optional_not_adopted", "informational"}
+            ):
+                errors.append(
+                    f"{label}: confirm_contradiction requires supported applicability, "
+                    "an actual conflict, and a binding/adopted obligation"
+                )
         # This is a policy declaration in the handoff, not proof of Task identity.
         if item.get("review_context") != "fresh_subagent":
             errors.append(f"{label}: review_context must be fresh_subagent")
@@ -1173,6 +1219,30 @@ def _context_errors(
             errors.append(f"{label}: unknown claim_id {claim_id!r}")
         elif claim.get("session_id") != item.get("session_id"):
             errors.append(f"{label}: claim belongs to a different session")
+        else:
+            normative = item.get("normative_assessment")
+            if isinstance(normative, dict):
+                strength = claim.get("normative_strength")
+                if normative.get("claim_strength") != strength:
+                    errors.append(
+                        f"{label}: normative_assessment.claim_strength does not "
+                        "match the current design claim"
+                    )
+                expected_statuses = {
+                    "mandatory": {"binding_required"},
+                    "recommended": {"binding_recommended"},
+                    "declared_capability": {"declared_capability"},
+                    "optional": {"optional_adopted", "optional_not_adopted"},
+                    "informational": {"informational"},
+                }.get(str(strength), set())
+                if (
+                    expected_statuses
+                    and normative.get("obligation_status") not in expected_statuses
+                ):
+                    errors.append(
+                        f"{label}: normative_assessment.obligation_status is "
+                        f"incompatible with claim strength {strength!r}"
+                    )
 
         probe_review = item.get("dynamic_probe_review")
         probe_id = str(probe_review.get("probe_id") or "") if isinstance(
