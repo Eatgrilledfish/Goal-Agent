@@ -3,13 +3,16 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
 import re
+import tempfile
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 
 DEFAULT_ASSET_ROOT = "/app/code/judge-assets/01_03_ai_implementation_design_difference_detection"
@@ -43,17 +46,68 @@ def load_json(path: Path) -> Any:
         return json.load(handle)
 
 
-def save_json(path: Path, value: Any) -> None:
+def _lock_path(path: Path) -> Path:
+    """Return a stable sidecar inode for advisory locking across replacements."""
+    return path.parent / ".locks" / f"{path.name}.lock"
+
+
+@contextmanager
+def file_lock(path: Path) -> Iterator[None]:
+    """Serialize one state artifact on macOS/Linux without locking its replaced inode."""
+    lock_path = _lock_path(path)
+    ensure_dir(lock_path.parent)
+    with lock_path.open("a+b") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def atomic_write_bytes(path: Path, payload: bytes) -> None:
+    """Replace ``path`` from a unique same-directory temporary file."""
     ensure_dir(path.parent)
-    with path.open("w", encoding="utf-8") as handle:
-        json.dump(value, handle, ensure_ascii=False, indent=2)
-        handle.write("\n")
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp",
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def atomic_write_text(path: Path, value: str) -> None:
+    atomic_write_bytes(path, value.encode("utf-8"))
+
+
+def atomic_write_jsonl(path: Path, values: Iterable[dict[str, Any]]) -> None:
+    atomic_write_text(
+        path,
+        "".join(json.dumps(value, ensure_ascii=False) + "\n" for value in values),
+    )
+
+
+def save_json(path: Path, value: Any) -> None:
+    atomic_write_text(
+        path,
+        json.dumps(value, ensure_ascii=False, indent=2) + "\n",
+    )
 
 
 def append_jsonl(path: Path, value: dict[str, Any]) -> None:
     ensure_dir(path.parent)
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(value, ensure_ascii=False) + "\n")
+    payload = json.dumps(value, ensure_ascii=False) + "\n"
+    with file_lock(path):
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
 
 
 def load_jsonl(path: Path) -> tuple[list[dict[str, Any]], list[str]]:

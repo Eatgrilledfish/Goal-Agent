@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Append an agent progress event and update resumable session state."""
+"""Append semantic-agent progress evidence to the session ledger.
+
+Pipeline state is projected exclusively by ``pipeline_controller.py``.  A
+role-local checkpoint must never move the global phase or next action.
+"""
 
 from __future__ import annotations
 
@@ -347,27 +351,6 @@ def main(argv: list[str] | None = None) -> int:
     state_path = root / "agent_loop_state.json"
     state = ac.load_json(state_path)
     recorded_at = ac.now_iso()
-    # A role-local checkpoint is progress evidence, not a terminal decision for
-    # the whole review.  In particular, a completed scout/investigator/critic
-    # must not make an unfinished pipeline look globally complete.  The final
-    # gate is the sole owner of the terminal ``complete`` state.
-    final_gate_complete = (
-        state.get("status") == "complete"
-        and state.get("stop_reason") == "final_gate_passed"
-    )
-    if not final_gate_complete:
-        state["updated_at"] = recorded_at
-        state["status"] = "in_progress" if args.status == "complete" else args.status
-        state["current_phase"] = args.phase
-        completed = state.setdefault("completed_phases", [])
-        for phase in args.completed_phase:
-            if phase not in completed:
-                completed.append(phase)
-        state.setdefault("metrics", {}).update(metrics)
-        if args.next:
-            state["next_actions"] = args.next
-        state["stop_reason"] = args.stop_reason
-        ac.save_json(state_path, state)
     event = {
         "recorded_at": recorded_at,
         "session_id": state.get("session_id", ""),
@@ -383,6 +366,7 @@ def main(argv: list[str] | None = None) -> int:
         "artifact_snapshots": artifact_snapshots,
         "artifact_sha256": artifact_sha256,
         "next_actions": args.next,
+        "completed_phases": args.completed_phase,
     }
     event.update({
         "scope": args.scope,
@@ -405,10 +389,10 @@ def main(argv: list[str] | None = None) -> int:
         event["validation_error_count"] = sum(error_categories.values())
     ac.append_jsonl(root / "agent_run_ledger.jsonl", event)
     print(json.dumps({
-        "updated": str(state_path),
+        "recorded": str(root / "agent_run_ledger.jsonl"),
         "phase": args.phase,
         "checkpoint_status": args.status,
-        "status": state.get("status"),
+        "global_status": state.get("status"),
     }))
     return 0
 

@@ -30,12 +30,13 @@ def _read_values(path: Path) -> list[dict[str, Any]]:
 
 def record(
     state_root: Path, sweep_id: str, handoff: Path,
-    check_report: Path | None = None,
+    check_report: Path | None = None, coverage_report: Path | None = None,
 ) -> dict[str, Any]:
     _plan, index, errors = rpv.load_validated_plan(state_root)
     if errors:
         raise ValueError("scout plan is invalid: " + "; ".join(errors))
-    if sweep_id not in index.get("slices", {}):
+    sweep = index.get("slices", {}).get(sweep_id)
+    if not isinstance(sweep, dict):
         raise ValueError(f"unknown scout sweep_id {sweep_id!r}")
     if handoff.name != f"{sweep_id}.json":
         raise ValueError(f"scout handoff filename must be {sweep_id}.json")
@@ -52,28 +53,58 @@ def record(
         candidate_ids = [str(item.get("observation_id") or "") for item in values]
         if not isinstance(validated, list) or set(validated) != set(candidate_ids):
             raise ValueError("scout check report does not validate the current candidates")
+    if coverage_report is None or not coverage_report.is_file() or coverage_report.is_symlink():
+        raise ValueError("scout completion requires a regular coverage report")
+    coverage = ac.load_json(coverage_report)
+    if not isinstance(coverage, dict):
+        raise ValueError("scout coverage report must be an object")
+    if coverage.get("sweep_id") != sweep_id:
+        raise ValueError("scout coverage report sweep_id does not match")
+    direction = str(sweep.get("direction") or "")
+    assigned_section_ids = list(sweep.get("section_ids", []))
+    assigned_anchor_paths = list(sweep.get("anchor_paths", []))
+    reviewed_section_ids = coverage.get("reviewed_section_ids")
+    reviewed_anchor_paths = coverage.get("reviewed_anchor_paths")
+    if reviewed_section_ids != assigned_section_ids:
+        raise ValueError(
+            "reviewed_section_ids must exactly match the assigned plan sections"
+        )
+    if reviewed_anchor_paths != assigned_anchor_paths:
+        raise ValueError(
+            "reviewed_anchor_paths must exactly match the assigned plan anchors"
+        )
+    if direction == "design_to_code" and assigned_anchor_paths:
+        raise ValueError("design_to_code scout cannot own code anchor paths")
+    if direction == "code_to_design" and assigned_section_ids:
+        raise ValueError("code_to_design scout cannot own design sections")
     state = ac.load_json(state_root / "agent_loop_state.json")
     plan_path = state_root / "risk_sweep_plan.json"
     receipt = {
         "session_id": state.get("session_id"),
         "sweep_id": sweep_id,
+        "direction": direction,
         "risk_sweep_plan_sha256": ac.sha256_file(plan_path),
         "handoff_sha256": ac.sha256_file(handoff),
+        "coverage_report_sha256": ac.sha256_file(coverage_report),
         "status": "complete",
         "candidate_count": len(values),
         "candidate_ids": [str(item.get("observation_id")) for item in values],
+        "assigned_section_ids": assigned_section_ids,
+        "reviewed_section_ids": reviewed_section_ids,
+        "assigned_anchor_paths": assigned_anchor_paths,
+        "reviewed_anchor_paths": reviewed_anchor_paths,
         "completed_at": ac.now_iso(),
     }
     path = state_root / "scout_receipts.jsonl"
-    prior, parse_errors = ac.load_jsonl(path)
-    if parse_errors:
-        raise ValueError("existing scout receipts are invalid: " + "; ".join(parse_errors))
-    retained = [item for item in prior if item.get("sweep_id") != sweep_id]
-    retained.append(receipt)
-    path.write_text(
-        "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in retained),
-        encoding="utf-8",
-    )
+    with ac.file_lock(path):
+        prior, parse_errors = ac.load_jsonl(path)
+        if parse_errors:
+            raise ValueError(
+                "existing scout receipts are invalid: " + "; ".join(parse_errors)
+            )
+        retained = [item for item in prior if item.get("sweep_id") != sweep_id]
+        retained.append(receipt)
+        ac.atomic_write_jsonl(path, retained)
     ac.append_jsonl(state_root / "agent_run_ledger.jsonl", {
         "recorded_at": ac.now_iso(), "session_id": state.get("session_id"),
         "event": "semantic_scout_complete", "actor": "scout_receipt_helper",
@@ -90,12 +121,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--sweep-id", required=True)
     parser.add_argument("--handoff", required=True)
     parser.add_argument("--check-report")
+    parser.add_argument("--coverage-report", required=True)
     args = parser.parse_args(argv)
     try:
         receipt = record(
             Path(args.state_root).resolve(), args.sweep_id,
             Path(args.handoff).resolve(),
             Path(args.check_report).resolve() if args.check_report else None,
+            Path(args.coverage_report).resolve(),
         )
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         print(json.dumps({"passed": False, "error": str(exc)}, ensure_ascii=False))

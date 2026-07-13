@@ -608,7 +608,7 @@ def validate_artifact(item: dict[str, Any], artifact_type: str, label: str) -> l
             "task_id", "session_id", "claim_id", "claim_branch", "hypothesis",
             "obligation_sha256", "starting_points",
             "supporting_evidence_needed", "disconfirming_evidence_needed", "review_lenses",
-            "exploration_mode", "architecture_boundaries", "implementation_planes", "status",
+            "exploration_mode", "status",
         ), label))
         if "question" in item:
             errors.append(f"{label}: legacy question is unsupported; use hypothesis")
@@ -642,7 +642,10 @@ def validate_artifact(item: dict[str, Any], artifact_type: str, label: str) -> l
         lenses = item.get("review_lenses")
         if not isinstance(lenses, list) or not 1 <= len(lenses) <= 3:
             errors.append(f"{label}: review_lenses must contain one to three focused lenses")
-        for field in ("parallel_path_ids", "risk_observation_ids"):
+        for field in (
+            "architecture_boundaries", "implementation_planes",
+            "parallel_path_ids", "risk_observation_ids",
+        ):
             if field not in item:
                 errors.append(f"{label}: missing {field}")
             elif not isinstance(item.get(field), list):
@@ -673,17 +676,6 @@ def validate_artifact(item: dict[str, Any], artifact_type: str, label: str) -> l
                     errors.append(
                         f"{label}: {field}[{index}] must be a concrete non-empty string"
                     )
-        if (
-            item.get("direction") == "code_to_design"
-            and len(scoped_arrays) == 3 and not any(
-                isinstance(entry, str) and entry.strip()
-                for values in scoped_arrays for entry in values
-            )
-        ):
-            errors.append(
-                f"{label}: a code_to_design candidate must identify at least one "
-                "architecture boundary, implementation plane, or parallel path"
-            )
         for field in ("sweep_id", "risk_sweep_plan_sha256"):
             value = item.get(field)
             if _present(value) and (not isinstance(value, str) or not value.strip()):
@@ -952,6 +944,56 @@ def _read_values(path: Path) -> list[dict[str, Any]]:
     raise ValueError("handoff must be one JSON object, an object array, or JSONL objects")
 
 
+FINDING_METADATA_SUFFIXES = (
+    ".semantic.json", ".report.json", ".trace.json",
+)
+
+
+def _finding_handoff_files(input_dir: Path) -> list[Path]:
+    """Return only final finding payloads, never semantic or report JSON.
+
+    The canonical per-candidate filename is ``<TASK_ID>.json`` under a
+    ``<TASK_ID>`` directory.  A canonical file owns its directory and all
+    sibling JSON is non-mergeable metadata.  The legacy single ``finding.json``
+    name remains readable for existing handoffs, as does one otherwise-typed
+    finding file when no canonical file exists.
+    """
+    all_paths = sorted(
+        path for path in input_dir.rglob("*")
+        if path.is_file() and path.suffix.lower() in {".json", ".jsonl"}
+    )
+    canonical_by_parent = {
+        path.parent: path
+        for path in all_paths
+        if path.name == f"{path.parent.name}.json"
+    }
+    selected: list[Path] = sorted(canonical_by_parent.values())
+    selected_set = set(selected)
+    for path in all_paths:
+        if path in selected_set or path.parent in canonical_by_parent:
+            continue
+        if path.name.endswith(FINDING_METADATA_SUFFIXES):
+            continue
+        if path.name == "finding.json":
+            selected.append(path)
+            selected_set.add(path)
+            continue
+        values = _read_values(path)
+        if any(isinstance(item.get("finding_id"), str) and item.get("finding_id") for item in values):
+            selected.append(path)
+            selected_set.add(path)
+    return sorted(selected)
+
+
+def _handoff_files(input_dir: Path, artifact_type: str) -> list[Path]:
+    if artifact_type == "finding":
+        return _finding_handoff_files(input_dir)
+    return sorted(
+        path for path in input_dir.rglob("*")
+        if path.is_file() and path.suffix.lower() in {".json", ".jsonl"}
+    )
+
+
 def _template_errors(
     item: dict[str, Any], template: dict[str, Any] | None, label: str,
 ) -> list[str]:
@@ -1007,12 +1049,11 @@ def _load_template(
     return value
 
 
-def _handoff_identifiers(input_dir: Path, key: str) -> set[str]:
+def _handoff_identifiers(
+    input_dir: Path, key: str, *, artifact_type: str = "generic",
+) -> set[str]:
     identifiers: set[str] = set()
-    for path in sorted(
-        path for path in input_dir.rglob("*")
-        if path.is_file() and path.suffix.lower() in {".json", ".jsonl"}
-    ):
+    for path in _handoff_files(input_dir, artifact_type):
         for item in _read_values(path):
             identifier = str(item.get(key) or "")
             if identifier:
@@ -1389,8 +1430,10 @@ def _context_errors(
         unknown_planes = _string_entries(item.get("implementation_planes")) - planes
     else:
         unknown_lenses = set(item.get("review_lenses", [])) - lenses
-        unknown_boundaries = set(item.get("architecture_boundaries", [])) - boundaries
-        unknown_planes = set(item.get("implementation_planes", [])) - planes
+        # Task architecture arrays are optional navigation hints copied from a
+        # scout.  They are deliberately not task-validity foreign keys.
+        unknown_boundaries = set()
+        unknown_planes = set()
     if unknown_lenses:
         errors.append(f"{label}: unknown review lenses {sorted(unknown_lenses)}")
     if unknown_boundaries:
@@ -1440,7 +1483,7 @@ def _context_errors(
     if mode not in modes:
         errors.append(f"{label}: unknown exploration_mode {mode!r}")
     path_ids = item.get("parallel_path_ids", [])
-    if isinstance(path_ids, list):
+    if artifact_type != "task" and isinstance(path_ids, list):
         unknown_paths = set(path_ids) - parallel_paths
         if unknown_paths:
             errors.append(f"{label}: unknown parallel_path_ids {sorted(unknown_paths)}")
@@ -1451,18 +1494,6 @@ def _context_errors(
             errors.append(f"{label}: unknown risk_observation_ids {sorted(unknown_risks)}")
         if mode == "code-to-design risk backtracking" and not risk_ids:
             errors.append(f"{label}: code-to-design task requires risk_observation_ids")
-        for risk_id in set(risk_ids).intersection(risks):
-            risk = risks[risk_id]
-            risk_boundaries = set(risk.get("architecture_boundaries", []))
-            if risk_boundaries and not set(
-                item.get("architecture_boundaries", [])
-            ).intersection(risk_boundaries):
-                errors.append(f"{label}: risk observation {risk_id} shares no architecture boundary")
-            risk_planes = set(risk.get("implementation_planes", []))
-            if risk_planes and not set(
-                item.get("implementation_planes", [])
-            ).intersection(risk_planes):
-                errors.append(f"{label}: risk observation {risk_id} shares no implementation plane")
     errors.extend(validate_task_coverage_binding(item, state_root, label))
     return errors
 
@@ -1490,7 +1521,9 @@ def _finding_batch_expectation(output: Path, input_dir: Path) -> tuple[list[str]
     deferred_ids = sorted(
         f"FINDING-{task_id}" for task_id in deferred_task_ids
     )
-    submitted = sorted(_handoff_identifiers(input_dir, "finding_id"))
+    submitted = sorted(_handoff_identifiers(
+        input_dir, "finding_id", artifact_type="finding",
+    ))
     if len(submitted) > 2:
         raise ValueError(
             f"finding merge submits more than two candidate IDs: {submitted}"
@@ -1511,10 +1544,7 @@ def _deferred_finding_input_errors(
     if task_errors:
         raise ValueError(f"investigation task ledger is invalid: {'; '.join(task_errors)}")
     errors: dict[str, list[str]] = {}
-    for path in sorted(
-        path for path in input_dir.rglob("*")
-        if path.is_file() and path.suffix.lower() in {".json", ".jsonl"}
-    ):
+    for path in _handoff_files(input_dir, "finding"):
         for item in _read_values(path):
             finding_id = str(item.get("finding_id") or "?")
             task_id = str(item.get("task_id") or "")
@@ -1537,9 +1567,7 @@ def _restore_files(snapshot: dict[Path, bytes | None]) -> None:
             if path.exists():
                 path.unlink()
             continue
-        temporary = path.with_suffix(path.suffix + ".rollback")
-        temporary.write_bytes(content)
-        temporary.replace(path)
+        ac.atomic_write_bytes(path, content)
 
 
 def validate_item(
@@ -1757,7 +1785,7 @@ def _risk_ledger_sweep_ids(output: Path, state_root: Path) -> list[str]:
     })
 
 
-def merge(
+def _merge_unlocked(
     input_dir: Path,
     output: Path,
     key: str,
@@ -1837,10 +1865,11 @@ def merge(
             if not key_value or key_value in critic_history_by_key:
                 raise ValueError("critic review history contains a missing or duplicate review_key")
             critic_history_by_key[key_value] = entry
-    files = sorted(
-        path for path in input_dir.rglob("*")
-        if path.is_file() and path.suffix.lower() in {".json", ".jsonl"}
-    )
+    files = _handoff_files(input_dir, artifact_type)
+    if artifact_type == "finding" and not files:
+        raise ValueError(
+            "finding merge requires one canonical final finding JSON per candidate"
+        )
     imported_items: list[tuple[Path, dict[str, Any]]] = []
     imported_sources: dict[str, Path] = {}
     for path in files:
@@ -1994,31 +2023,14 @@ def merge(
             ))
         if sweep_errors:
             raise ValueError("; ".join(sweep_errors))
-        closed = completed_sweep_ids == expected_sweep_ids
-        if closed:
-            coverage_errors, _coverage = validator.validate_risk_coverage(
-                values, context_root,
-            )
-            if coverage_errors:
-                raise ValueError("; ".join(coverage_errors))
+        observation_sweeps_complete = completed_sweep_ids == expected_sweep_ids
 
-    ac.ensure_dir(output.parent)
-    temporary = output.with_suffix(output.suffix + ".tmp")
-    temporary.write_text(
-        "".join(json.dumps(values[identifier], ensure_ascii=False) + "\n" for identifier in ordered),
-        encoding="utf-8",
-    )
-    temporary.replace(output)
+    ac.atomic_write_jsonl(output, (values[identifier] for identifier in ordered))
     if critic_history_path is not None and pending_critic_history:
-        history_temporary = critic_history_path.with_suffix(".jsonl.tmp")
-        history_temporary.write_text(
-            "".join(
-                json.dumps(entry, ensure_ascii=False) + "\n"
-                for entry in [*critic_history_values, *pending_critic_history]
-            ),
-            encoding="utf-8",
+        ac.atomic_write_jsonl(
+            critic_history_path,
+            [*critic_history_values, *pending_critic_history],
         )
-        history_temporary.replace(critic_history_path)
     validated_ids = [
         identifier for identifier in ordered if identifier not in validation_errors
     ]
@@ -2046,13 +2058,37 @@ def merge(
             "validated_sweep_ids": sorted(submitted_sweep_ids),
             "completed_sweep_ids": completed,
             "missing_sweep_ids": sorted(expected_sweep_ids - completed_sweep_ids),
-            "closed": closed,
-            "global_coverage_validated": closed,
+            # A merge validates only the submitted slice.  Completion belongs to
+            # the receipt/controller/final gates, including zero-candidate sweeps.
+            "observation_sweeps_complete": observation_sweeps_complete,
+            "closed": False,
+            "global_coverage_validated": False,
         })
     return result
 
 
-def _complete_tasks_for_findings(
+def merge(
+    input_dir: Path,
+    output: Path,
+    key: str,
+    artifact_type: str = "generic",
+    session_id: str | None = None,
+    code_root: Path | None = None,
+    design_root: Path | None = None,
+    template_root: Path | None = None,
+    context_root: Path | None = None,
+) -> dict[str, Any]:
+    """Serialize cumulative ledger publication while semantic workers stay parallel."""
+    with ac.file_lock(output):
+        return _merge_unlocked(
+            input_dir, output, key,
+            artifact_type=artifact_type, session_id=session_id,
+            code_root=code_root, design_root=design_root,
+            template_root=template_root, context_root=context_root,
+        )
+
+
+def _complete_tasks_for_findings_unlocked(
     state_root: Path, submitted_finding_ids: set[str],
 ) -> dict[str, Any]:
     """Apply finding-owned lifecycle updates without revalidating the stable plan."""
@@ -2138,18 +2174,8 @@ def _complete_tasks_for_findings(
         linked_findings.append(finding_id)
     if errors:
         raise ValueError("; ".join(errors))
-    temporary = task_path.with_suffix(task_path.suffix + ".tmp")
-    temporary.write_text(
-        "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in tasks),
-        encoding="utf-8",
-    )
-    temporary.replace(task_path)
-    round_temporary = round_path.with_suffix(round_path.suffix + ".tmp")
-    round_temporary.write_text(
-        "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in rounds),
-        encoding="utf-8",
-    )
-    round_temporary.replace(round_path)
+    ac.atomic_write_jsonl(task_path, tasks)
+    ac.atomic_write_jsonl(round_path, rounds)
     return {
         # Populated from the fresh candidate-aware lifecycle trace by the caller.
         "validated_ids": [],
@@ -2159,6 +2185,16 @@ def _complete_tasks_for_findings(
         "ledger_sha256": ac.sha256_file(task_path),
         "rounds_sha256": ac.sha256_file(round_path),
     }
+
+
+def _complete_tasks_for_findings(
+    state_root: Path, submitted_finding_ids: set[str],
+) -> dict[str, Any]:
+    task_path = state_root / "investigation_tasks.jsonl"
+    with ac.file_lock(task_path):
+        return _complete_tasks_for_findings_unlocked(
+            state_root, submitted_finding_ids,
+        )
 
 
 def _task_lifecycle_trace_path(state_root: Path) -> Path | None:
@@ -2192,7 +2228,9 @@ def _refresh_task_lifecycle_trace(
         "--log-root", str(log_root),
         "--state-root", str(state_root),
     ]
+    started_at = ac.now_iso()
     result = subprocess.run(command, text=True, capture_output=True)
+    ended_at = ac.now_iso()
     trace_path = log_root / "trace" / "task_lifecycle_validation.json"
     trace = ac.load_json(trace_path) if trace_path.is_file() else {}
     if not isinstance(trace, dict) or trace.get("global_passed") is not True:
@@ -2218,6 +2256,21 @@ def _refresh_task_lifecycle_trace(
         raise ValueError(
             f"submitted finding tasks failed lifecycle validation after merge: {missing}"
         )
+    state = ac.load_json(state_root / "agent_loop_state.json")
+    ac.append_jsonl(state_root / "agent_run_ledger.jsonl", {
+        "recorded_at": ac.now_iso(),
+        "session_id": state.get("session_id", ""),
+        "event": "deterministic_helper_trace",
+        "actor": "handoff_merge_helper",
+        "phase": "task-lifecycle-refresh",
+        "status": "complete",
+        "helper": "stage_artifact_validator.py:task-lifecycle",
+        "started_at": started_at,
+        "ended_at": ended_at,
+        "returncode": result.returncode,
+        "report": str(trace_path.resolve()),
+        "report_sha256": ac.sha256_file(trace_path),
+    })
     return trace
 
 
@@ -2489,10 +2542,6 @@ def main(argv: list[str] | None = None) -> int:
                 "task": "investigation_planning", "finding": "investigation",
                 "risk": "code_risk_backtracking", "probe": "dynamic_probe", "critic": "critic_review",
             }.get(args.artifact_type, "handoff")
-            state["updated_at"] = ac.now_iso()
-            state["status"] = "in_progress"
-            state["current_phase"] = phase
-            ac.save_json(state_path, state)
             ac.append_jsonl(output.parent / "agent_run_ledger.jsonl", {
                 "recorded_at": ac.now_iso(), "session_id": state.get("session_id", ""),
                 "event": "handoff_merge", "actor": "handoff_merge_helper",

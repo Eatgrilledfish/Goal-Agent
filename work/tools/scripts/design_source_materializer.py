@@ -13,9 +13,11 @@ import argparse
 import copy
 import hashlib
 import json
+import os
 import re
 import shutil
 import sys
+import tempfile
 import urllib.error
 import urllib.request
 from html.parser import HTMLParser
@@ -28,7 +30,7 @@ import agent_common as ac
 
 TEXT_SUFFIXES = {".md", ".markdown", ".txt", ".rst", ".adoc", ".asc", ".json", ".yaml", ".yml", ".toml"}
 ARTIFACT_KINDS = {"auto-inventory", "inventory", "claims"}
-AUTO_INVENTORY_SECTION_LINES = 800
+AUTO_INVENTORY_SECTION_LINES = 300
 
 
 class _VisibleHTML(HTMLParser):
@@ -212,26 +214,66 @@ def _strict_line(value: Any, field: str) -> int:
     return value
 
 
-_NUMBERED_HEADING = re.compile(r"^(?:\d+(?:\.\d+)*\.?|[A-Z]\.)\s+\S")
+_NUMBERED_HEADING = re.compile(
+    r"^(?:\d+\.|\d+(?:\.\d+)+\.?)\s+\S"
+)
+
+
+def _source_heading(lines: list[str], index: int) -> str | None:
+    """Return a mechanical heading at ``index`` without semantic parsing."""
+    stripped = lines[index].strip()
+    if not stripped or len(stripped) > 200:
+        return None
+    if stripped.startswith("#"):
+        return stripped.lstrip("#").strip() or None
+    if index + 1 < len(lines):
+        underline = lines[index + 1].strip()
+        if len(underline) >= 3 and set(underline) in ({"="}, {"-"}):
+            return stripped
+    # RFC tables of contents use dotted leaders.  Treat the actual numbered
+    # body headings as boundaries, but do not explode one TOC into dozens of
+    # tiny retrieval chunks.
+    if _NUMBERED_HEADING.match(stripped) and not re.search(r"(?:\.\s*){3,}", stripped):
+        return stripped
+    return None
 
 
 def _section_heading(lines: list[str], start: int, relative_path: str) -> str:
     """Return a mechanical nearby heading, never a semantic interpretation."""
     for index in range(min(start - 1, len(lines) - 1), -1, -1):
-        stripped = lines[index].strip()
-        if not stripped:
-            continue
-        if stripped.startswith("#"):
-            heading = stripped.lstrip("#").strip()
-            if heading:
-                return heading
-        if index + 1 < len(lines):
-            underline = lines[index + 1].strip()
-            if len(underline) >= 3 and set(underline) in ({"="}, {"-"}):
-                return stripped
-        if len(stripped) <= 200 and _NUMBERED_HEADING.match(stripped):
-            return stripped
+        heading = _source_heading(lines, index)
+        if heading:
+            return heading
     return f"{relative_path} lines {start}"
+
+
+def _auto_section_ranges(
+    lines: list[str], relative_path: str,
+) -> list[tuple[int, int, str]]:
+    """Split a source on textual headings, then cap every retrieval range."""
+    heading_starts = {
+        index + 1: heading
+        for index in range(len(lines))
+        if (heading := _source_heading(lines, index)) is not None
+    }
+    starts = sorted({1, *heading_starts})
+    ranges: list[tuple[int, int, str]] = []
+    for position, natural_start in enumerate(starts):
+        natural_end = (
+            starts[position + 1] - 1 if position + 1 < len(starts) else len(lines)
+        )
+        heading = heading_starts.get(
+            natural_start,
+            _section_heading(lines, natural_start, relative_path),
+        )
+        for line_start in range(
+            natural_start, natural_end + 1, AUTO_INVENTORY_SECTION_LINES,
+        ):
+            line_end = min(
+                natural_end, line_start + AUTO_INVENTORY_SECTION_LINES - 1,
+            )
+            ranges.append((line_start, line_end, heading))
+    return ranges
 
 
 def materialize_source_ref(
@@ -343,14 +385,19 @@ def _mechanical_retrieval_labels(relative_path: str, heading: str) -> list[str]:
     return list(dict.fromkeys((heading, relative_path)))
 
 
-def _catalog_group(document_key: str, members: list[str]) -> bool:
-    """Recognize the materializer-owned catalog directory without semantic guessing."""
-    if document_key == "catalog" or document_key.startswith("catalog/"):
-        return True
-    return bool(members) and all(
-        Path(member).parts and Path(member).parts[0].lower() == "catalog"
-        for member in members
-    )
+def _catalog_paths(design: dict[str, Any]) -> set[str]:
+    """Read exact catalog provenance emitted by this source materializer."""
+    source_manifest = design.get("source_manifest")
+    if not isinstance(source_manifest, dict):
+        return set()
+    return {
+        str(item.get("bundle_path"))
+        for item in source_manifest.get("sources", [])
+        if isinstance(item, dict)
+        and item.get("source_id") == "catalog"
+        and isinstance(item.get("bundle_path"), str)
+        and item.get("bundle_path")
+    }
 
 
 def materialize_auto_inventory(
@@ -373,6 +420,7 @@ def materialize_auto_inventory(
         raise ValueError("design agent manifest design must be an object")
     raw_documents = design.get("documents")
     raw_groups = design.get("document_groups")
+    catalog_paths = _catalog_paths(design)
     if not isinstance(raw_documents, list):
         raise ValueError("design agent manifest design.documents must be an array")
     if not isinstance(raw_groups, list):
@@ -437,11 +485,9 @@ def materialize_auto_inventory(
             lines = source_text.splitlines()
             if not lines:
                 raise ValueError(f"design member is empty and cannot be line-indexed: {relative_path}")
-            for line_start in range(1, len(lines) + 1, AUTO_INVENTORY_SECTION_LINES):
-                line_end = min(
-                    len(lines), line_start + AUTO_INVENTORY_SECTION_LINES - 1,
-                )
-                heading = _section_heading(lines, line_start, relative_path)
+            for line_start, line_end, heading in _auto_section_ranges(
+                lines, relative_path,
+            ):
                 sections.append(_materialize_inventory_section({
                     "section_id": _auto_section_id(relative_path, line_start),
                     "source_ref": {
@@ -467,7 +513,9 @@ def materialize_auto_inventory(
             "document_key": document_key,
             "members": members,
             "scope_relation": (
-                "informational" if _catalog_group(document_key, members) else "in_scope"
+                "informational"
+                if members and set(members).issubset(catalog_paths)
+                else "in_scope"
             ),
             "scope_evidence": scope_evidence,
             "sections": sections,
@@ -579,7 +627,10 @@ def materialize(args: argparse.Namespace) -> int:
             })
         print(json.dumps({"passed": False, "sources": 0, "errors": len(errors)}))
         return 2
-    ac.ensure_dir(output_root)
+    ac.ensure_dir(output_root.parent)
+    staging_root = Path(tempfile.mkdtemp(
+        prefix=f".{output_root.name}.staging-", dir=output_root.parent,
+    ))
 
     try:
         plan = ac.load_json(plan_path)
@@ -600,14 +651,14 @@ def materialize(args: argparse.Namespace) -> int:
     if not catalog or not catalog.is_file():
         errors.append("plan catalog_path must name a file under source_root")
     else:
-        catalog_target = output_root / "catalog" / catalog.name
+        catalog_target = staging_root / "catalog" / catalog.name
         ac.ensure_dir(catalog_target.parent)
         shutil.copyfile(catalog, catalog_target)
         records.append({
             "source_id": "catalog",
             "kind": "local",
             "location": str(catalog),
-            "bundle_path": ac.relative_path(output_root, catalog_target),
+            "bundle_path": ac.relative_path(staging_root, catalog_target),
             "sha256": ac.sha256_file(catalog_target),
             "catalog_evidence": {"path": catalog_value},
         })
@@ -626,7 +677,7 @@ def materialize(args: argparse.Namespace) -> int:
         kind = str(source["kind"])
         location = str(source["location"])
         output_path = str(source["output_path"])
-        target = _target_path(output_root, output_path)
+        target = _target_path(staging_root, output_path)
         if source_id in seen_ids:
             errors.append(f"{label} duplicates source_id {source_id!r}")
             continue
@@ -696,7 +747,7 @@ def materialize(args: argparse.Namespace) -> int:
             "source_id": source_id,
             "kind": kind,
             "location": location,
-            "bundle_path": ac.relative_path(output_root, target),
+            "bundle_path": ac.relative_path(staging_root, target),
             "sha256": ac.sha256_file(target),
             "bytes": target.stat().st_size,
             "normalization": normalization,
@@ -714,6 +765,24 @@ def materialize(args: argparse.Namespace) -> int:
         "sources": records,
         "errors": errors,
     }
+    if manifest["passed"]:
+        backup_root = staging_root.with_name(staging_root.name + ".previous")
+        try:
+            if output_root.exists():
+                os.replace(output_root, backup_root)
+            os.replace(staging_root, output_root)
+            if backup_root.exists():
+                shutil.rmtree(backup_root)
+        except OSError as exc:
+            errors.append(f"could not publish complete design-source bundle: {exc}")
+            manifest["passed"] = False
+            if output_root.exists() and backup_root.exists():
+                shutil.rmtree(output_root, ignore_errors=True)
+            if backup_root.exists() and not output_root.exists():
+                os.replace(backup_root, output_root)
+    if staging_root.exists():
+        shutil.rmtree(staging_root, ignore_errors=True)
+    manifest["errors"] = errors
     ac.save_json(manifest_path, manifest)
     print(json.dumps({"passed": manifest["passed"], "sources": len(records), "errors": len(errors)}))
     return 0 if manifest["passed"] else 1

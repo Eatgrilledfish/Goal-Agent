@@ -379,6 +379,7 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
                 "sweep_id": "RISK-SWEEP-API",
                 "direction": "code_to_design",
                 "document_keys": [],
+                "section_ids": [],
                 "architecture_boundaries": ["BOUNDARY-API"],
                 "implementation_planes": ["PLANE-SERVICE"],
                 "parallel_path_ids": [],
@@ -390,6 +391,7 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
                 "sweep_id": "RISK-SWEEP-AUDIT",
                 "direction": "code_to_design",
                 "document_keys": [],
+                "section_ids": [],
                 "architecture_boundaries": ["BOUNDARY-AUDIT"],
                 "implementation_planes": ["PLANE-AUDIT"],
                 "parallel_path_ids": [],
@@ -401,6 +403,7 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
                 "sweep_id": "RISK-SWEEP-DESIGN",
                 "direction": "design_to_code",
                 "document_keys": ["contract"],
+                "section_ids": ["SECTION-CONTRACT"],
                 "architecture_boundaries": [],
                 "implementation_planes": [],
                 "parallel_path_ids": [],
@@ -520,16 +523,33 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
             "RISK-SWEEP-API", "RISK-SWEEP-AUDIT", "RISK-SWEEP-DESIGN",
         )
     }
+    slices_by_id = {
+        item["sweep_id"]: item
+        for item in ac.load_json(state / "risk_sweep_plan.json")["slices"]
+    }
     for sweep_id, candidates in candidates_by_sweep.items():
         handoff = state / "handoffs" / "risks" / sweep_id / f"{sweep_id}.json"
         ac.ensure_dir(handoff.parent)
         handoff.write_text(json.dumps(candidates, ensure_ascii=False) + "\n", encoding="utf-8")
+        sweep = slices_by_id[sweep_id]
+        coverage_report = state / "scout-coverage" / f"{sweep_id}.json"
+        ac.save_json(coverage_report, {
+            "sweep_id": sweep_id,
+            "reviewed_section_ids": list(sweep["section_ids"]),
+            "reviewed_anchor_paths": list(sweep["anchor_paths"]),
+        })
         append(state / "scout_receipts.jsonl", {
             "session_id": workspace["session_id"], "sweep_id": sweep_id,
+            "direction": sweep["direction"],
             "risk_sweep_plan_sha256": risk_plan_digest,
             "handoff_sha256": ac.sha256_file(handoff), "status": "complete",
+            "coverage_report_sha256": ac.sha256_file(coverage_report),
             "candidate_count": len(candidates),
             "candidate_ids": [item["observation_id"] for item in candidates],
+            "assigned_section_ids": list(sweep["section_ids"]),
+            "reviewed_section_ids": list(sweep["section_ids"]),
+            "assigned_anchor_paths": list(sweep["anchor_paths"]),
+            "reviewed_anchor_paths": list(sweep["anchor_paths"]),
             "completed_at": ac.now_iso(),
         })
     for index, (design_line, quote, code_start, code_end, symbol, snippet) in enumerate(specs[:count], start=1):
@@ -2097,6 +2117,11 @@ def test_finding_merge_isolates_valid_candidate_from_invalid_peer(workspace, tmp
     assert "TASK-001" in lifecycle_trace["valid_task_ids"]
     assert "TASK-002" in plan_trace["invalid_task_ids"]
     assert "TASK-002" in lifecycle_trace["invalid_task_ids"]
+    controller_state_path = state / "agent_loop_state.json"
+    controller_state = ac.load_json(controller_state_path)
+    controller_state["current_phase"] = "controller-owned-phase"
+    controller_state["next_actions"] = ["controller-owned-action"]
+    ac.save_json(controller_state_path, controller_state)
 
     report = tmp_path / "valid-candidate-report.json"
     valid = subprocess.run([
@@ -2130,6 +2155,19 @@ def test_finding_merge_isolates_valid_candidate_from_invalid_peer(workspace, tmp
     assert refreshed_lifecycle["passed"] is False
     assert "TASK-001" in refreshed_lifecycle["valid_task_ids"]
     assert "TASK-002" in refreshed_lifecycle["invalid_task_ids"]
+    current_state = ac.load_json(controller_state_path)
+    assert current_state["current_phase"] == "controller-owned-phase"
+    assert current_state["next_actions"] == ["controller-owned-action"]
+    ledger, ledger_errors = ac.load_jsonl(state / "agent_run_ledger.jsonl")
+    assert ledger_errors == []
+    lifecycle_path = trace_root / "task_lifecycle_validation.json"
+    assert any(
+        event.get("event") == "deterministic_helper_trace"
+        and event.get("status") == "complete"
+        and event.get("report") == str(lifecycle_path.resolve())
+        and event.get("report_sha256") == ac.sha256_file(lifecycle_path)
+        for event in ledger
+    )
 
     # The next frontier candidate can start even though candidate 2's isolated
     # validation failed and its template remains unresolved.
@@ -2275,12 +2313,12 @@ def test_instruction_allows_valid_candidate_to_merge_without_waiting_for_its_pee
     assert "--check-file" in instruction
     assert "--report" in instruction
     assert "handoffs/investigators/${TASK_ID}/${TASK_ID}.json" in instruction
-    assert "仅merge该candidate目录" in instruction
+    assert "--input-dir ${STATE_ROOT}/handoffs/investigators/${TASK_ID}" in instruction
     assert "一个 candidate失败不能阻塞有效 peer" in orchestrator
     assert "全部 handoff self-check 通过后原子 merge" not in instruction
     assert "部分批次不得继续" not in instruction
     assert "${REVIEW_CODE_ROOT}" in instruction
-    assert "Merge会更新task lifecycle" in instruction
+    assert "goal_runner.py task-lifecycle-check" in instruction
 
 
 def test_instruction_requires_risk_plan_gate_before_parallel_risk_tasks():
@@ -2289,7 +2327,7 @@ def test_instruction_requires_risk_plan_gate_before_parallel_risk_tasks():
     launch_position = instruction.index("按 plan最多并发两个 fresh `risk-explorer`")
     assert gate_position < launch_position
     assert "primary code anchors" in instruction[:launch_position]
-    assert "不重叠 top-level ownership" in instruction[:launch_position]
+    assert "不同 design section ownership" in instruction[:launch_position]
 
 
 def test_discovery_policy_uses_design_guided_trace_candidates_without_quotas():
@@ -2306,10 +2344,10 @@ def test_discovery_policy_uses_design_guided_trace_candidates_without_quotas():
     assert "finish_scouts → select_candidates" in instruction
     assert "design-to-code" in instruction
     assert "code-to-design" in instruction
-    assert "自身 design groups 或 code anchors" in orchestrator
+    assert "互斥 design slice section ownership、互斥 code anchors" in orchestrator
     assert "`design_to_code`" in risk
     assert "`code_to_design`" in risk
-    assert "所有 receipts 完成前禁止 candidate selection" in orchestrator
+    assert "所有current receipts完成前禁止 candidate selection" in orchestrator
     assert "design_section_ids" in risk
     assert "最多 12 个疑似差异 ID" in orchestrator
     assert "不要为了完成 slice 填充候选" in risk
@@ -2533,6 +2571,28 @@ def test_full_handoff_review_report_and_gate(workspace):
     assert all(issue["agent_review"]["critic_review"]["decision"] == "confirm_contradiction" for issue in result["issues"])
     assert gate["passed"] is True
     assert gate["checks"]["handoff_chain_complete"] is True
+
+
+def test_review_and_report_do_not_overwrite_controller_phase(workspace):
+    populate_handoffs(workspace)
+    state_path = Path(workspace["state"]) / "agent_loop_state.json"
+    state = ac.load_json(state_path)
+    state["current_phase"] = "controller-owned-phase"
+    state["next_actions"] = ["controller-owned-action"]
+    ac.save_json(state_path, state)
+
+    run_runner(
+        "review", workspace["code"], workspace["design"],
+        workspace["result"], workspace["logs"],
+    )
+    run_runner(
+        "report", workspace["code"], workspace["design"],
+        workspace["result"], workspace["logs"],
+    )
+
+    current = ac.load_json(state_path)
+    assert current["current_phase"] == "controller-owned-phase"
+    assert current["next_actions"] == ["controller-owned-action"]
 
 
 def test_competition_review_then_finalize_path_uses_current_traces(workspace):
@@ -3421,6 +3481,14 @@ def test_unselected_inventory_section_does_not_require_synthetic_gap(workspace):
     ac.save_json(state / "design_inventory.json", inventory)
     plan = ac.load_json(state / "risk_sweep_plan.json")
     plan["design_inventory_sha256"] = ac.sha256_file(state / "design_inventory.json")
+    design_slice = next(
+        item for item in plan["slices"] if item["direction"] == "design_to_code"
+    )
+    design_slice["section_ids"] = [
+        "SECTION-CONTRACT-API",
+        "SECTION-CONTRACT-LIFECYCLE",
+        "SECTION-NOT-MATERIALIZED",
+    ]
     ac.save_json(state / "risk_sweep_plan.json", plan)
     plan_digest = ac.sha256_file(state / "risk_sweep_plan.json")
     risks, risk_errors = ac.load_jsonl(state / "risk_observations.jsonl")
@@ -3447,8 +3515,14 @@ def test_unselected_inventory_section_does_not_require_synthetic_gap(workspace):
     )
     receipts, receipt_errors = ac.load_jsonl(state / "scout_receipts.jsonl")
     assert receipt_errors == []
+    slices_by_id = {item["sweep_id"]: item for item in plan["slices"]}
     for receipt in receipts:
+        sweep = slices_by_id[receipt["sweep_id"]]
         receipt["risk_sweep_plan_sha256"] = plan_digest
+        receipt["assigned_section_ids"] = list(sweep["section_ids"])
+        receipt["reviewed_section_ids"] = list(sweep["section_ids"])
+        receipt["assigned_anchor_paths"] = list(sweep["anchor_paths"])
+        receipt["reviewed_anchor_paths"] = list(sweep["anchor_paths"])
     (state / "scout_receipts.jsonl").write_text(
         "".join(json.dumps(item) + "\n" for item in receipts), encoding="utf-8",
     )

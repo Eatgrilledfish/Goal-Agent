@@ -4,25 +4,25 @@
 
 ## 两种互斥入口
 
-- `design_to_code`：你独占 `document_keys`，必须阅读这些文档组的全部 inventory sections，并把其中可观察的 subject、trigger、obligation、时序、集合/链遍历、能力和可选行为逐项追到代码。代码搜索范围是整个仓库，包括自有、导入、adapter、fast/slow、构建、注册和配置路径；不得受 architecture map 预选范围限制。
-- `code_to_design`：你独占 `anchor_paths`，从这些代码入口、调用链、构建和注册行为反查完整 design inventory。`code_evidence` 只能来自本 slice 的 anchors，设计检索不受预选 section 限制。
+- `design_to_code`：你独占当前slice中总计不超过3500行、来自最多2个文档的document-local chunks。每个chunk内的`section_ids`连续，同一slice不含同文档的两个不连续chunk；大文档的其他连续chunk可属于另一slice。你必须逐项阅读自己的sections，提炼可观察的 subject、trigger、obligation、时序、集合/链遍历、能力和可选行为，再寻找真实代码lead或结构化absence lead。代码搜索范围是整个仓库，包括自有、导入、adapter、fast/slow、构建、注册和配置路径；不得受 architecture map 预选范围限制。
+- `code_to_design`：你独占按实际scope递归拆分后的 `anchor_paths`，当前slice覆盖不超过1200个文件；不得用粗粒度根目录替代必要的递归分片。从这些代码入口、调用链、构建和注册行为反查完整 design inventory。`code_evidence` 只能来自本 slice 的 anchors，设计检索不受预选 section 限制。
 
-不同并发 scout 的主范围不得重叠。可读取范围外代码用于导航，但 code-to-design 的证据必须回到自身 anchors；design-to-code 的归属由文档组决定。
+不同并发 scout 的主范围不得重叠。可读取范围外代码用于导航，但 code-to-design 的证据必须回到自身 anchors；design-to-code 的归属由current slice section IDs决定。`test_surfaces`只作导航，不能据此删除implementation plane、代码路径或候选。
 
 ## 只输出疑似差异
 
-普通一致实现、代码质量、测试覆盖率、纯安全猜测和与 supplied design 无关的问题一律不输出。只允许：
+Catalog/链接清单只证明正文来源，architecture map只导航代码；二者绝不能作为 `design_requirement.source_ref` 或义务文本。普通一致实现、代码质量、测试覆盖率、纯安全猜测和与 supplied design 无关的问题一律不输出。测试代码可以帮助反证，但“没有测试”不能证明runtime能力缺失。只允许：
 
-- `direct_conflict`：可达代码行为与原子设计义务直接相反；
-- `capability_absence`：设计要求的能力经入口、构建、注册、配置、邻近能力和依赖反查后仍有结构化缺失证据；
+- `direct_conflict`：真实代码lead已经显示与原子设计义务直接相反的行为；
+- `capability_absence`：设计要求的能力已有指向入口、构建、注册、配置或邻近能力位置的结构化缺失线索；完整缺失证明留给investigator/critic；
 - `cross_plane_mismatch`：同一设计行为在并行实现/adapter/fast-slow path 上不一致；
 - `uncertain`：已有同一语义和代码证据，但仍需深查才能排除差异。
 
-每项必须绑定一条原子设计要求和真实代码位置。不要输出“实现看起来正确”的 observation，也不要为了完成 slice 填充候选。一个 scout 可以合法返回 `[]`。
+每项必须绑定一条来自required/in_scope正文、最多80行的原子设计要求，以及真实runtime代码lead或结构化absence lead。对于absence lead，`code_evidence`绑定最近的入口、dispatch、registration、build/config或邻近能力代码位置。Raw阶段只要求至少一次candidate-specific最低限度反证，以说明线索不是单纯搜索无命中；此时即可使用`uncertain`，不要求穷尽完整入口链、全部替代/补偿/并行路径或形成最终误报闭环。完整证明由后续investigator完成，并由fresh critic独立挑战。不要输出“实现看起来正确”的 observation，也不要为了完成 slice 填充候选。一个 scout 可以合法返回 `[]`。
 
 ## 输出 schema
 
-写入指定的 `<sweep_id>.json`，顶层是数组，最多 8 项：
+写入指定的 `<sweep_id>.json`，顶层是数组，最多 12 项：
 
 ```json
 {
@@ -39,7 +39,7 @@
     "trigger":"触发条件",
     "obligation":"一个原子义务",
     "observable_result":"设计要求的结果，不写实现差异前缀",
-    "normative_strength":"required|recommended|declared_capability|optional|informational",
+    "normative_strength":"mandatory|recommended|declared_capability|optional|informational",
     "applicability":"为什么适用于当前目标",
     "exceptions":[],
     "ambiguities":[]
@@ -60,6 +60,6 @@
 }
 ```
 
-`direction` 必须等于 slice。Design-to-code 可以不填 architecture IDs，因为新发现的真实实现不能被旧地图阻断；code-to-design 至少填写一个已分配的 architecture ID。能力缺失至少增加 build/config/registration 反查步骤。每项至少一次候选特定误报排除。
+`direction` 必须等于 slice。三个 architecture ID数组一律写空数组；slice ownership和代码证据已足以绑定范围，模型不得猜测或复制导航元数据。能力缺失至少记录一个build/config/registration或邻近能力的结构化lead；完整反查由investigator/critic承担。每项至少一次最低限度的候选特定误报排除。
 
-非空数组先运行 `handoff_merge.py --check-file --artifact-type risk`，通过后再 merge；无论数组是否为空，最后都运行 `scout_receipt.py` 记录完成。只有 receipt 成功才写 `code_risk_backtracking/risk-explorer` complete checkpoint，`scope-id` 和 `task-id` 都等于 sweep ID；零候选时 `output-count=0` 合法。
+除上述candidate handoff外，在merge目录外写coverage report：`sweep_id`逐值复制当前slice；design-to-code的`reviewed_section_ids`逐值等于slice.section_ids且`reviewed_anchor_paths=[]`，code-to-design则相反。然后停止并向orchestrator返回两个文件路径、真实provider session ID、开始/结束时间、attempt和repair计数。你不得运行check、merge、receipt、validator或`session_event.py`；orchestrator按`INSTRUCTION.md`执行这些helper。零候选时handoff为`[]`且合法。

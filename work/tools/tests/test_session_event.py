@@ -119,10 +119,14 @@ def test_trace_event_records_required_fields_and_real_input_digests(tmp_path: Pa
     state = ac.load_json(root / "agent_loop_state.json")
     events, errors = ac.load_jsonl(root / "agent_run_ledger.jsonl")
     assert errors == []
-    assert state["status"] == "in_progress"
-    assert state["metrics"]["reviewed"] == 2
-    assert state["completed_phases"] == ["candidate_review"]
-    assert state["stop_reason"] == "candidate_evidence_closed"
+    # Rich role-local fields belong to the event ledger.  Only the pipeline
+    # controller may project global phase, status, and next actions.
+    assert state["status"] == "ready"
+    assert state["current_phase"] == "prepare"
+    assert state["metrics"] == {}
+    assert state["completed_phases"] == []
+    assert state["next_actions"] == []
+    assert state["stop_reason"] == ""
     assert len(events) == 1
 
     event = events[0]
@@ -141,6 +145,9 @@ def test_trace_event_records_required_fields_and_real_input_digests(tmp_path: Pa
     assert event["repair_count"] == 1
     assert event["outcome"] == "accepted"
     assert event["stop_reason"] == "candidate_evidence_closed"
+    assert event["metrics"] == {"reviewed": 2}
+    assert event["completed_phases"] == ["candidate_review"]
+    assert event["next_actions"] == ["Run coverage supplement."]
     assert event["artifacts"] == [str(output)]
     assert event["artifact_snapshots"] == [{
         "path": str(output),
@@ -168,14 +175,15 @@ def test_trace_event_records_required_fields_and_real_input_digests(tmp_path: Pa
     assert event["validation_error_count"] == 7
 
 
-def test_local_complete_checkpoint_cannot_complete_global_session(tmp_path: Path) -> None:
+def test_local_complete_checkpoint_does_not_mutate_global_session(tmp_path: Path) -> None:
     root = _state_root(tmp_path)
     artifact = _input_file(tmp_path)
+    original_state = ac.load_json(root / "agent_loop_state.json")
 
     assert session_event.main(_required_args(root, [artifact], status="complete")) == 0
 
     state = ac.load_json(root / "agent_loop_state.json")
-    assert state["status"] == "in_progress"
+    assert state == original_state
     events, errors = ac.load_jsonl(root / "agent_run_ledger.jsonl")
     assert errors == []
     assert events[-1]["status"] == "complete"
@@ -198,7 +206,7 @@ def test_local_checkpoint_preserves_final_gate_complete_state(tmp_path: Path) ->
     assert final_state["stop_reason"] == "final_gate_passed"
 
 
-def test_local_checkpoint_repairs_non_gate_complete_state(tmp_path: Path) -> None:
+def test_local_checkpoint_does_not_repair_or_rewrite_global_state(tmp_path: Path) -> None:
     root = _state_root(tmp_path)
     state = ac.load_json(root / "agent_loop_state.json")
     state["status"] = "complete"
@@ -208,7 +216,10 @@ def test_local_checkpoint_repairs_non_gate_complete_state(tmp_path: Path) -> Non
 
     assert session_event.main(_required_args(root, [artifact], status="complete")) == 0
 
-    assert ac.load_json(root / "agent_loop_state.json")["status"] == "in_progress"
+    final_state = ac.load_json(root / "agent_loop_state.json")
+    assert final_state["status"] == "complete"
+    assert final_state["current_phase"] == "prepare"
+    assert final_state["stop_reason"] == "round_partially_complete"
 
 
 def test_only_risk_explorer_complete_checkpoint_may_record_zero_outputs(

@@ -80,6 +80,20 @@ def _generate(state: Path, task_id: str, *, force: bool = False):
     return subprocess.run(command, text=True, capture_output=True)
 
 
+def _generate_frontier(state: Path, *, force: bool = False):
+    command = [
+        sys.executable,
+        str(SCRIPTS / "handoff_template.py"),
+        "--tasks", str(state / "investigation_tasks.jsonl"),
+        "--claims", str(state / "design_claims.jsonl"),
+        "--frontier",
+        "--output-dir", str(state / "handoff-templates" / "investigators"),
+    ]
+    if force:
+        command.append("--force")
+    return subprocess.run(command, text=True, capture_output=True)
+
+
 def test_template_requires_current_plan_and_lifecycle_validation(workspace):
     state, tasks = _prepare_pending_frontier(workspace)
     trace_path = workspace["logs"] / "trace" / "task_plan_validation.json"
@@ -110,6 +124,41 @@ def test_template_allows_only_first_two_pending_tasks_in_earliest_open_round(wor
     assert second.returncode == 0, second.stdout + second.stderr
     first = _generate(state, "TASK-001")
     assert first.returncode == 0, first.stdout + first.stderr
+
+
+def test_frontier_mode_mechanically_generates_at_most_two_templates(workspace):
+    state, _ = _prepare_pending_frontier(workspace)
+
+    generated = _generate_frontier(state)
+
+    assert generated.returncode == 0, generated.stdout + generated.stderr
+    result = json.loads(generated.stdout)
+    assert result["passed"] is True
+    assert result["mode"] == "frontier"
+    assert result["task_ids"] == ["TASK-001", "TASK-002"]
+    assert result["count"] == 2
+    assert [item["task_id"] for item in result["outputs"]] == [
+        "TASK-001", "TASK-002",
+    ]
+    templates = state / "handoff-templates" / "investigators"
+    assert sorted(path.name for path in templates.glob("*.json")) == [
+        "TASK-001.json", "TASK-002.json",
+    ]
+
+
+def test_frontier_mode_reports_passed_false_without_partial_templates(workspace):
+    state, _ = _prepare_pending_frontier(workspace)
+    (workspace["logs"] / "trace" / "task_lifecycle_validation.json").unlink()
+
+    generated = _generate_frontier(state)
+
+    assert generated.returncode == 3
+    result = json.loads(generated.stdout)
+    assert result["passed"] is False
+    assert result["task_ids"] == ["TASK-001", "TASK-002"]
+    assert set(result["validation_errors"]) == {"TASK-001", "TASK-002"}
+    templates = state / "handoff-templates" / "investigators"
+    assert list(templates.glob("*.json")) == []
 
 
 def test_template_rejects_stale_candidate_lifecycle(workspace):

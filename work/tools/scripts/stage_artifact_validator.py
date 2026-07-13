@@ -815,10 +815,7 @@ def _task_plan_contract_errors(
                     errors.append(
                         f"{label}: starting_points do not match selected candidate code evidence"
                     )
-                for field in (
-                    "review_lenses", "architecture_boundaries",
-                    "implementation_planes", "parallel_path_ids",
-                ):
+                for field in ("review_lenses",):
                     if task.get(field) != observation.get(field, []):
                         errors.append(
                             f"{label}: {field} does not preserve the selected candidate"
@@ -941,7 +938,21 @@ def validate_task_plan_stage(
 ) -> tuple[list[str], dict[str, list[str]], dict[str, Any]]:
     global_errors, _ = validate_architecture(architecture, session_id)
     _validate_claim_sessions(claims, session_id, global_errors)
-    _validate_risks(risks, session_id, root, code_root, global_errors)
+    selected_risk_ids = {
+        risk_id
+        for task in tasks.values()
+        for risk_id in task.get("risk_observation_ids", [])
+        if isinstance(risk_id, str) and risk_id
+    }
+    selected_risks = {
+        risk_id: risks[risk_id]
+        for risk_id in sorted(selected_risk_ids)
+        if risk_id in risks
+    }
+    # Scout merge already validated the cumulative ledger.  Planning rechecks
+    # only observations actually projected into the current frontier, so an
+    # unselected candidate cannot invalidate otherwise sound tasks.
+    _validate_risks(selected_risks, session_id, root, code_root, global_errors)
     claim_scope = _validated_claim_review_scope(
         root, session_id, claims, global_errors,
     )

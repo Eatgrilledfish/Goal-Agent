@@ -2,61 +2,57 @@
 
 ## 结论
 
-本次确认此前“一个正确候选都没有”是流程设计缺陷，不是模型偶然失手，也不是provider额度问题。旧流程在深度调查前已经丢失了召回：
+本轮先停止了正在运行的 OpenCode 全量验证，再依据完整日志做根因重构。停止状态已确认：LaunchAgent未加载、wrapper/child/process group均不存在，退出码为SIGTERM对应的 `-15`；不是provider或额度中断。
 
-- 先按代码地图裁剪设计section，未分配的规范永远不会进入候选；
-- 按代码slice限制design-to-code证据，导入实现、adapter和未映射路径被挡在搜索外；
-- 强迫每个sweep产出样本，使合规样本占用候选预算；
-- 部分sweep完成后就开始全局选题，形成first-arrival bias；
-- claim/task由模型重复改写，候选的设计分支和代码起点会在handoff中漂移；
-- 局部checkpoint的`complete`曾被错误复制成全局complete；
-- 模型大量时间用于生成inventory和修复大schema，而不是阅读设计与代码。
+被停止的运行只召回开发 oracle 的一小部分，最终 finding为零。原因不是单一模型失误，而是两类系统缺陷叠加：
 
-这些问题属于严重架构缺陷，已按根因重构。
+- 探索范围过大且raw scout被要求提前完成接近最终证明的工作，产生“receipt全部完成但真实候选召回很低”；
+- 并发risk merge/receipt无锁读改写，真实发生过候选被后写覆盖；最后一个risk merge还等待尚未写入的receipt，形成顺序死锁。后续finding目录、task lifecycle trace和多写者phase又会继续阻断已经发现的候选。
+
+这些问题已按根因重构，而不是增加项目专用规则、兼容分支或放松最终证据gate。
 
 ## 当前运行架构
 
-正式评测只需让运行中的OpenCode CLI读取仓库根目录`INSTRUCTION.md`。入口固定使用：
+正式评测由运行中的OpenCode CLI读取仓库根目录 `INSTRUCTION.md`。比赛入口固定发现：
 
 ```text
 /app/code/judge-assets/01_03_ai_implementation_design_difference_detection/
 ```
 
-不需要注册、人工参数、provider配置或`opencode.json`。目标代码与supplied design只读；运行结果写入`/result`，状态和证据写入`/logs`。
+不需要注册、人工参数、provider配置或 `opencode.json`。目标代码与supplied design只读；运行产物仅写入 `/logs` 和 `/result`。
 
-新流程为：
+当前流程：
 
 ```text
 prepare + 只读快照
-→ 轻量architecture map
-→ 确定性design inventory
-→ 双向semantic scouts
-→ 全部scout receipts完成
-→ 模型只排序candidate IDs
-→ 确定性candidate→claim
+→ 模型建立轻量architecture map（只导航）
+→ 确定性heading-aware design inventory
+→ 输入规模驱动的双向semantic scout plan
+→ 全部current handoff/coverage receipts
+→ 模型选择最多12个candidate IDs
+→ 确定性candidate→claim→task provenance投影
 → fresh spec critic
-→ 确定性claim→task
 → investigator + fresh evidence critic
-→ 确定性coverage记账
-→ final judge + report + final gate
+→ coverage + final judge
+→ provisional report + final gate
 ```
 
-关键变化：
+关键约束：
 
-1. Design-to-code scouts按互斥document groups覆盖全部in-scope设计，并可搜索整个代码仓，不受预先architecture map裁剪。
-2. Code-to-design scouts按不重叠top-level anchors探索，并可从完整design inventory动态检索规范。
-3. Scout只输出疑似差异；合规实现不进入候选，零候选合法。
-4. 每个scout独立写receipt；全部receipt完成前，controller拒绝candidate selection。
-5. Receipt机械核对handoff候选是否全部merge，避免候选静默丢失。
-6. 模型只选择最多12个candidate IDs；requirement、source range、code evidence、direction和mismatch signal由helper逐值投影成claim/task。
-7. Spec critic和investigator只写最小语义输出；identity、digest、设计证据、代码snippet和recommendation由materializer生成。
-8. Coverage只按已有证据记录investigated/gap，不再启动额外coverage LLM或fallback supplement。
-9. 局部checkpoint只能表示局部进展；只有final gate能把全局session置为complete。
-10. `pipeline_controller.py`机械给出唯一下一步，防止跳过breadth、claim review、investigation或critic。
+1. Design plan按当前输入规模生成；每slice不超过3500行、最多2个文档，document-local chunk连续，全部in-scope section全局唯一owner。
+2. Code plan只从当前architecture实际scope和boundary path生成，递归拆分为互斥anchors；risk-plan gate实际核对每slice不超过1200个文件。
+3. Boundary path与linked plane代码完全分离时，boundary获得自己的合法slice，不会被挂到不包含该代码的plane slice中伪装覆盖。
+4. `test_surfaces`、architecture IDs和catalog不能成为candidate/task的语义门槛；地图遗漏不会机械删除plane或候选。
+5. Raw scout负责高召回线索：原子设计义务、真实代码lead或结构化absence lead和最低限度反证即可输出`uncertain`；完整入口、替代/补偿、配置/注册/构建和误报闭环由investigator完成、critic独立挑战。
+6. 每个semantic scout最多12条raw observation；全局模型只排序最多12个ID进入深查。Helper不按关键词、regex、项目名、固定分数或已知答案判断。
+7. Design-source bundle先在staging完整构建，成功才整体替换；失败不发布半成品，成功重跑会删除已不在current plan中的旧source。
+8. Catalog身份来自source manifest显式provenance，不按目录名猜测；普通用户设计位于名为`catalog`的目录时仍可正常in-scope。
+9. 累计JSONL使用跨进程sidecar lock，发布使用同目录唯一临时文件和原子replace；两个并发scout不会丢更新。
+10. Risk merge只验证当前slice，不等待全局receipts；全局closure由controller/final gate判断，消除最后一个scout的顺序死锁。
+11. `pipeline_controller.py`覆盖 `map_architecture → build_inventory → build_scout_plan` bootstrap，并作为phase、pending IDs和next action的唯一真相源。局部checkpoint和其他helper只写ledger。
+12. 当前无人值守链路没有完整dynamic probe执行协议，因此明确拒绝`selected`，避免进入永远无法闭合的分支。
 
-运行链路没有项目名、协议名、固定路径/符号、公开答案、regex检测器、关键词评分表或固定issue数量逻辑。模型仍负责规范理解、代码探索、候选语义、调查、反证和最终判断；helper只负责检索范围分配、schema、provenance、状态机与输出验真。
-
-## 自验证
+## 确定性验证
 
 执行：
 
@@ -69,48 +65,53 @@ git diff --check
 结果：
 
 ```text
-416 passed in 115.04s
+456 passed in 116.02s
 py_compile: passed
 git diff --check: passed
 ```
 
-测试覆盖：
+回归覆盖包括：
 
-- 完整design source物化与确定性auto-inventory；
-- requirement-centric双向scout plan和互斥code anchors；
-- 空/非空scout receipt、stale digest、foreign sweep和候选漏merge拒绝；
-- candidate→lookup→claim→task一对一lineage；
-- 合规observation不能进入frontier；
-- task代码起点、方向、architecture IDs和candidate ID不可漂移；
-- 最小spec review/finding materializer的字段覆盖攻击拒绝；
-- investigator、probe、critic、judge的identity和evidence绑定；
-- 局部complete不能终止全局session；
-- controller从scouts到final的前置条件短路；
-- coverage、报告、只读完整性、clock、trace和final gate；
-- 普通设计与catalog/外部HTTPS设计来源；
-- 完整小型夹具从prepare到confirmed-only报告的端到端gate。
+- Controller bootstrap、stable task-plan/lifecycle snapshot、hard deadline terminal状态；
+- design/source staging整体替换和失败回滚；
+- heading inventory、3500行/2文档分片和大文档连续chunk；
+- 1501文件broad plane拆分、1200文件strict gate、anchor全局不重叠；
+- boundary-only entry与linked core分离分片；
+- architecture test metadata不再删除plane或candidate；
+- current receipt的session、plan、handoff、coverage hash和精确scope；
+- 并发risk merge、并发receipt、agent ledger append不丢更新；
+- risk merge与receipt顺序解耦；
+- candidate→claim→task一对一lineage与selected-frontier gate；
+- canonical finding发布、task lifecycle trace登记、critic和verdict链；
+- helper不覆盖Controller phase；
+- provisional report、final gate、只读完整性和机器可读结果。
 
-使用本地F-Stack材料的确定性breadth smoke结果：
+## 公开材料静态breadth smoke
+
+用本地公开材料重新生成current inventory和plan，结果：
 
 ```text
 design document groups: 24
-bounded inventory sections: 75
-inventory size: 65,789 bytes
-design-to-code scouts: 4
-code-to-design scouts: 2
-in-scope document groups owned: 23（剩余catalog为informational）
+bounded inventory sections: 2418
+design-to-code scouts: 18
+code-to-design scouts: 13
+total semantic scouts: 31
+measured maximum design slice: 3479 lines（hard cap 3500）
+measured maximum code slice: 1194 files（hard cap 1200）
 risk-plan validation: passed
 ```
 
-相比旧run中约2.1MB的模型手写inventory，新inventory约65KB；所有实际设计文档均有owner，代码scouts的primary anchors不重叠。
+开发侧oracle仅在运行资产之外用于对照。静态机会审计结果为：六项均各自拥有包含规范正文的design入口和包含相关实现路径的code入口，机械validator阻断为 `0/6`。这只证明它们不会在探索前被计划或gate排除，不等同于真实模型已经召回。
 
-## 仍需由真实完整模型run确认
+运行资产中没有公开工程名、协议专用检测器、固定RFC章节、固定代码路径/符号、公开答案、关键词评分表或固定issue数量逻辑。相同流程可用于不同文档格式、代码语言和仓库结构。
 
-单元/端到端夹具证明新的状态机和证据链不会再机械丢失候选，但不能代替OpenCode在真实F-Stack上的完整语义运行。下一次后台全量验证仍需实测：
+## 尚需真实全量run确认
 
-- 隐藏正例最终召回数量；
-- confirmed中的误报率；
-- scout、investigation、critic和总墙钟；
-- 模型在真实长session中是否持续遵循handoff和fresh-session约束。
+本轮没有在修改后重新启动耗时的OpenCode全量验证，因此不宣称已经实际召回全部开发oracle。下一次后台全量run需要实测：
 
-在未完成新的全量模型run前，不宣称已经实际召回全部隐藏答案；本次交付解决的是导致“零召回”的结构性原因，并已通过确定性breadth与完整回归验证。
+- raw与selected candidate的真实召回；
+- investigator/critic后的confirmed数量与误报率；
+- 31个scout在最多两个并发下的墙钟与provider稳定性；
+- `/result/issues.json`、`issues.jsonl`、`00-summary.md`和单issue报告的最终gate。
+
+当前剩余风险主要是模型是否真实履行每个receipt声明的审阅范围；机械系统可以验证scope、hash、工具链和证据lineage，但不能用规则替代语义理解。下一次run若仍漏召回，应依据每个小slice的候选和tool trace定位语义失败，不应再次放大scope、放松证据或添加项目专用答案。

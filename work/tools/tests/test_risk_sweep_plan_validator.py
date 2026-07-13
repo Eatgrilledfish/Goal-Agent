@@ -30,14 +30,23 @@ def _inventory() -> dict:
                 "document_key": "design",
                 "scope_relation": "required",
                 "sections": [
-                    {"section_id": "SECTION-A"},
-                    {"section_id": "SECTION-B"},
+                    {
+                        "section_id": "SECTION-A", "path": "design.md",
+                        "line_start": 1, "line_end": 10,
+                    },
+                    {
+                        "section_id": "SECTION-B", "path": "design.md",
+                        "line_start": 11, "line_end": 20,
+                    },
                 ],
             },
             {
                 "document_key": "supporting",
                 "scope_relation": "informational",
-                "sections": [{"section_id": "SECTION-SUPPORTING"}],
+                "sections": [{
+                    "section_id": "SECTION-SUPPORTING", "path": "supporting.md",
+                    "line_start": 1, "line_end": 10,
+                }],
             },
         ],
     }
@@ -76,6 +85,7 @@ def _architecture(*, distinct_boundary_paths: bool = False) -> dict:
             {"path_id": "PATH-A", "plane_ids": ["PLANE-A"]},
             {"path_id": "PATH-B", "plane_ids": ["PLANE-B"]},
         ],
+        "test_surfaces": [],
     }
 
 
@@ -116,6 +126,7 @@ def _valid_plan(
                 "sweep_id": "DESIGN-SCOUT",
                 "direction": "design_to_code",
                 "document_keys": ["design"],
+                "section_ids": ["SECTION-A", "SECTION-B"],
                 "architecture_boundaries": [],
                 "implementation_planes": [],
                 "parallel_path_ids": [],
@@ -127,6 +138,7 @@ def _valid_plan(
                 "sweep_id": "SWEEP-A",
                 "direction": "code_to_design",
                 "document_keys": [],
+                "section_ids": [],
                 "architecture_boundaries": ["BOUNDARY-A"],
                 "implementation_planes": ["PLANE-A"],
                 "parallel_path_ids": ["PATH-A"],
@@ -140,6 +152,7 @@ def _valid_plan(
                 "sweep_id": "SWEEP-B",
                 "direction": "code_to_design",
                 "document_keys": [],
+                "section_ids": [],
                 "architecture_boundaries": ["BOUNDARY-B"],
                 "implementation_planes": ["PLANE-B"],
                 "parallel_path_ids": ["PATH-B"],
@@ -162,6 +175,182 @@ def _validate(plan: dict, architecture: dict) -> tuple[list[str], dict]:
         contract=_contract(),
         inventory=_inventory(), inventory_digest=INVENTORY_DIGEST,
     )
+
+
+def test_accepts_balanced_multi_document_design_slice() -> None:
+    architecture = _architecture()
+    inventory = _inventory()
+    inventory["document_groups"].append({
+        "document_key": "second-design",
+        "scope_relation": "in_scope",
+        "sections": [
+            {
+                "section_id": "SECTION-C", "path": "second.md",
+                "line_start": 1, "line_end": 10,
+            },
+            {
+                "section_id": "SECTION-D", "path": "second.md",
+                "line_start": 11, "line_end": 20,
+            },
+        ],
+    })
+    plan = _valid_plan(architecture)
+    plan["slices"][0]["document_keys"] = ["design", "second-design"]
+    plan["slices"][0]["section_ids"] = [
+        "SECTION-A", "SECTION-B", "SECTION-C", "SECTION-D",
+    ]
+
+    errors, index = validator.validate_plan(
+        plan,
+        session_id=SESSION_ID,
+        architecture=architecture,
+        architecture_digest=ARCHITECTURE_DIGEST,
+        contract=_contract(),
+        inventory=inventory,
+        inventory_digest=INVENTORY_DIGEST,
+    )
+
+    assert errors == []
+    assert index["covered_document_keys"] == {"design", "second-design"}
+
+
+def test_accepts_one_large_document_split_across_bounded_design_slices() -> None:
+    architecture = _architecture()
+    inventory = _inventory()
+    large_sections = [
+        {
+            "section_id": f"SECTION-LARGE-{index}",
+            "path": "large.md",
+            "line_start": index * 800 + 1,
+            "line_end": (index + 1) * 800,
+        }
+        for index in range(5)
+    ]
+    inventory["document_groups"][0] = {
+        "document_key": "large-design",
+        "scope_relation": "required",
+        "sections": large_sections,
+    }
+    plan = _valid_plan(architecture)
+    plan["slices"][0]["document_keys"] = ["large-design"]
+    plan["slices"][0]["section_ids"] = [
+        section["section_id"] for section in large_sections[:4]
+    ]
+    plan["slices"].insert(1, {
+        **plan["slices"][0],
+        "sweep_id": "DESIGN-SCOUT-TAIL",
+        "section_ids": [large_sections[4]["section_id"]],
+    })
+
+    errors, index = validator.validate_plan(
+        plan,
+        session_id=SESSION_ID,
+        architecture=architecture,
+        architecture_digest=ARCHITECTURE_DIGEST,
+        contract=_contract(),
+        inventory=inventory,
+        inventory_digest=INVENTORY_DIGEST,
+    )
+
+    assert errors == []
+    assert index["covered_document_keys"] == {"large-design"}
+    assert index["covered_section_ids"] == {
+        section["section_id"] for section in large_sections
+    }
+
+
+def test_accepts_broad_plane_shared_by_disjoint_partition_anchors(
+    tmp_path: Path,
+) -> None:
+    review_root = tmp_path / "review-code"
+    for child in ("left", "right"):
+        target = review_root / "broad" / child
+        target.mkdir(parents=True)
+        (target / "runtime.c").write_text("int runtime;\n", encoding="utf-8")
+    architecture = {
+        "session_id": SESSION_ID,
+        "implementation_planes": [{
+            "plane_id": "PLANE-BROAD",
+            "paths": ["broad"],
+        }],
+        "integration_boundaries": [{
+            "boundary_id": "BOUNDARY-BROAD",
+            "risk": "high",
+            "plane_ids": ["PLANE-BROAD"],
+            "paths": ["broad"],
+        }],
+        "parallel_behavior_paths": [],
+        "test_surfaces": [],
+    }
+    plan = {
+        "session_id": SESSION_ID,
+        "plan_id": "RISK-PLAN-PARTITIONED",
+        "architecture_map_sha256": ARCHITECTURE_DIGEST,
+        "design_inventory_sha256": INVENTORY_DIGEST,
+        "required_coverage": {
+            "boundary_ids": ["BOUNDARY-BROAD"],
+            "plane_ids": ["PLANE-BROAD"],
+            "parallel_path_ids": [],
+        },
+        "slices": [
+            {
+                "sweep_id": "DESIGN-SCOUT",
+                "direction": "design_to_code",
+                "document_keys": ["design"],
+                "section_ids": ["SECTION-A", "SECTION-B"],
+                "architecture_boundaries": [],
+                "implementation_planes": [],
+                "parallel_path_ids": [],
+                "anchor_paths": [],
+                "review_lenses": LENSES,
+                "scope_rationale": "Trace the complete design.",
+            },
+            {
+                "sweep_id": "CODE-LEFT",
+                "direction": "code_to_design",
+                "document_keys": [],
+                "section_ids": [],
+                "architecture_boundaries": ["BOUNDARY-BROAD"],
+                "implementation_planes": ["PLANE-BROAD"],
+                "parallel_path_ids": [],
+                "anchor_paths": ["broad/left"],
+                "review_lenses": LENSES,
+                "scope_rationale": "Review the left partition.",
+            },
+            {
+                "sweep_id": "CODE-RIGHT",
+                "direction": "code_to_design",
+                "document_keys": [],
+                "section_ids": [],
+                "architecture_boundaries": [],
+                "implementation_planes": ["PLANE-BROAD"],
+                "parallel_path_ids": [],
+                "anchor_paths": ["broad/right"],
+                "review_lenses": LENSES,
+                "scope_rationale": "Review the right partition.",
+            },
+        ],
+    }
+
+    errors, index = validator.validate_plan(
+        plan,
+        session_id=SESSION_ID,
+        architecture=architecture,
+        architecture_digest=ARCHITECTURE_DIGEST,
+        contract=_contract(),
+        inventory=_inventory(),
+        inventory_digest=INVENTORY_DIGEST,
+        review_code_root=review_root,
+    )
+
+    assert errors == []
+    assert set(index["slices"]) == {"DESIGN-SCOUT", "CODE-LEFT", "CODE-RIGHT"}
+
+
+def test_file_count_union_drops_redundant_nested_anchors() -> None:
+    assert validator._minimal_anchor_scopes({
+        "broad", "broad/left", "broad/left/runtime.c", "other/file.c",
+    }) == ["broad", "other/file.c"]
 
 
 def _write_valid_state(tmp_path: Path) -> tuple[Path, dict]:
@@ -193,6 +382,7 @@ def _write_receipts(
     directions = {
         item["sweep_id"]: item["direction"] for item in plan["slices"]
     }
+    slices = {item["sweep_id"]: item for item in plan["slices"]}
     path = state_root / validator.SCOUT_RECEIPTS_NAME
     path.write_text("", encoding="utf-8")
     for sweep_id in sorted(selected):
@@ -204,6 +394,11 @@ def _write_receipts(
             "status": "complete",
             "candidate_count": 0,
             "candidate_ids": [],
+            "coverage_report_sha256": "a" * 64,
+            "assigned_section_ids": list(slices[sweep_id].get("section_ids", [])),
+            "reviewed_section_ids": list(slices[sweep_id].get("section_ids", [])),
+            "assigned_anchor_paths": list(slices[sweep_id].get("anchor_paths", [])),
+            "reviewed_anchor_paths": list(slices[sweep_id].get("anchor_paths", [])),
         })
 
 
@@ -232,6 +427,8 @@ def _observation(
     code_file: str,
     lens: str,
 ) -> dict:
+    section_id = "SECTION-A" if sweep == "SWEEP-A" else "SECTION-B"
+    line = 1 if section_id == "SECTION-A" else 11
     return {
         "sweep_id": sweep,
         "direction": "code_to_design",
@@ -240,7 +437,12 @@ def _observation(
         "implementation_planes": [plane] if plane else [],
         "parallel_path_ids": [path_id] if path_id else [],
         "review_lenses": [lens],
-        "design_section_ids": ["SECTION-A" if sweep == "SWEEP-A" else "SECTION-B"],
+        "design_section_ids": [section_id],
+        "design_requirement": {
+            "source_ref": {
+                "path": "design.md", "line_start": line, "line_end": line,
+            },
+        },
         "code_evidence": [{"file": code_file, "line_start": 1, "line_end": 1}],
     }
 
@@ -256,7 +458,7 @@ def test_accepts_requirement_scout_plus_two_independent_code_components() -> Non
     assert index["covered_document_keys"] == {"design"}
 
 
-def test_design_to_code_owns_document_group_without_prebound_sections() -> None:
+def test_design_to_code_owns_exact_contiguous_document_sections() -> None:
     architecture = _architecture()
     plan = _valid_plan(architecture)
 
@@ -265,7 +467,9 @@ def test_design_to_code_owns_document_group_without_prebound_sections() -> None:
     assert errors == []
     assert index["required_document_keys"] == {"design"}
     assert index["covered_document_keys"] == {"design"}
-    assert "design_section_ids" not in plan["slices"][0]
+    assert index["required_section_ids"] == {"SECTION-A", "SECTION-B"}
+    assert index["covered_section_ids"] == {"SECTION-A", "SECTION-B"}
+    assert plan["slices"][0]["section_ids"] == ["SECTION-A", "SECTION-B"]
 
 
 def test_rejects_legacy_prebound_design_sections() -> None:
@@ -276,6 +480,16 @@ def test_rejects_legacy_prebound_design_sections() -> None:
     errors, _index = _validate(plan, architecture)
 
     assert any("unsupported fields ['design_section_ids']" in error for error in errors)
+
+
+def test_rejects_reordered_design_section_ownership() -> None:
+    architecture = _architecture()
+    plan = _valid_plan(architecture)
+    plan["slices"][0]["section_ids"] = ["SECTION-B", "SECTION-A"]
+
+    errors, _index = _validate(plan, architecture)
+
+    assert any("contiguous document-local range" in error for error in errors)
 
 
 def test_rejects_missing_or_duplicate_required_document_ownership() -> None:
@@ -345,6 +559,7 @@ def test_accepts_more_than_two_focused_slices() -> None:
             "sweep_id": f"SWEEP-{suffix}",
             "direction": "code_to_design",
             "document_keys": [],
+            "section_ids": [],
             "architecture_boundaries": [boundary_id],
             "implementation_planes": [plane_id],
             "parallel_path_ids": [path_id],
@@ -385,6 +600,20 @@ def test_plane_only_repository_partitions_all_reachable_planes() -> None:
     assert index["required_planes"] == {"PLANE-A", "PLANE-B"}
 
 
+def test_architecture_test_surface_metadata_does_not_delete_a_code_plane() -> None:
+    architecture = _architecture()
+    architecture["implementation_planes"].append({
+        "plane_id": "PLANE-QA", "kind": "owned", "paths": ["qa/scenarios"],
+    })
+    architecture["test_surfaces"] = [{"path": "qa"}]
+    plan = _valid_plan(architecture)
+
+    errors, index = _validate(plan, architecture)
+
+    assert "PLANE-QA" in index["required_planes"]
+    assert any("PLANE-QA" in error for error in errors)
+
+
 def test_rejects_stale_architecture_digest() -> None:
     architecture = _architecture()
     plan = _valid_plan(architecture)
@@ -413,6 +642,7 @@ def test_rejects_repository_root_as_an_unfocused_anchor() -> None:
         "sweep_id": "SWEEP-ALL",
         "direction": "code_to_design",
         "document_keys": [],
+        "section_ids": [],
         "architecture_boundaries": ["BOUNDARY-A", "BOUNDARY-B"],
         "implementation_planes": ["PLANE-A", "PLANE-B"],
         "parallel_path_ids": ["PATH-A", "PATH-B"],
@@ -463,6 +693,7 @@ def test_accepts_one_slice_when_parallel_path_couples_all_risk_nodes() -> None:
         "sweep_id": "SWEEP-SHARED",
         "direction": "code_to_design",
         "document_keys": [],
+        "section_ids": [],
         "architecture_boundaries": ["BOUNDARY-A", "BOUNDARY-B"],
         "implementation_planes": ["PLANE-A", "PLANE-B"],
         "parallel_path_ids": ["PATH-SHARED"],
@@ -516,6 +747,7 @@ def test_accepts_connected_architecture_split_by_disjoint_primary_code_scope() -
             "sweep_id": "SWEEP-A",
             "direction": "code_to_design",
             "document_keys": [],
+            "section_ids": [],
             "architecture_boundaries": ["BOUNDARY-A"],
             "implementation_planes": ["PLANE-A"],
             "parallel_path_ids": ["PATH-SHARED"],
@@ -527,6 +759,7 @@ def test_accepts_connected_architecture_split_by_disjoint_primary_code_scope() -
             "sweep_id": "SWEEP-B",
             "direction": "code_to_design",
             "document_keys": [],
+            "section_ids": [],
             "architecture_boundaries": ["BOUNDARY-B"],
             "implementation_planes": ["PLANE-B"],
             "parallel_path_ids": ["PATH-SHARED"],
@@ -553,6 +786,7 @@ def test_allows_architecture_ids_to_be_shared_across_disjoint_primary_scopes() -
             "sweep_id": "SWEEP-A",
             "direction": "code_to_design",
             "document_keys": [],
+            "section_ids": [],
             "architecture_boundaries": ["BOUNDARY-A"],
             "implementation_planes": ["PLANE-A"],
             "parallel_path_ids": ["PATH-A"],
@@ -564,6 +798,7 @@ def test_allows_architecture_ids_to_be_shared_across_disjoint_primary_scopes() -
             "sweep_id": "SWEEP-B",
             "direction": "code_to_design",
             "document_keys": [],
+            "section_ids": [],
             "architecture_boundaries": ["BOUNDARY-A", "BOUNDARY-B"],
             "implementation_planes": ["PLANE-A", "PLANE-B"],
             "parallel_path_ids": ["PATH-A", "PATH-B"],
@@ -649,7 +884,9 @@ def test_rejects_nested_anchor_paths_across_sweeps() -> None:
     )
 
 
-def test_observation_rejects_out_of_slice_id_and_code_evidence(tmp_path: Path) -> None:
+def test_observation_allows_architecture_refinement_but_rejects_code_scope_escape(
+    tmp_path: Path,
+) -> None:
     state_root, _plan = _write_valid_state(tmp_path)
     observation = _observation(
         state_root,
@@ -665,11 +902,11 @@ def test_observation_rejects_out_of_slice_id_and_code_evidence(tmp_path: Path) -
         observation, state_root, "risk (RISK-ESCAPE)",
     )
 
-    assert any("architecture_boundaries escapes assigned sweep" in error for error in errors)
+    assert not any("architecture_boundaries" in error for error in errors)
     assert any("code_evidence[1] is outside assigned primary paths" in error for error in errors)
 
 
-def test_observation_cannot_use_another_local_file_for_owned_ids(tmp_path: Path) -> None:
+def test_observation_code_evidence_must_stay_in_owned_anchor(tmp_path: Path) -> None:
     state_root, _plan = _write_valid_state(tmp_path)
     observation = _observation(
         state_root,
@@ -685,8 +922,8 @@ def test_observation_cannot_use_another_local_file_for_owned_ids(tmp_path: Path)
         observation, state_root, "risk (RISK-WRONG-LOCAL)",
     )
 
-    assert any("BOUNDARY-A lacks local code evidence" in error for error in errors)
-    assert any("PLANE-A lacks local code evidence" in error for error in errors)
+    assert any("code_evidence[1] is outside assigned primary paths" in error for error in errors)
+    assert not any("BOUNDARY-A" in error or "PLANE-A" in error for error in errors)
 
 
 def test_observation_rejects_unknown_sweep_id(tmp_path: Path) -> None:
@@ -795,7 +1032,7 @@ def test_zero_candidates_are_closed_by_complete_receipts(tmp_path: Path) -> None
     assert metrics["closed"] is True
 
 
-def test_code_to_design_observation_retrieves_any_inventory_section(
+def test_code_to_design_observation_rejects_informational_source(
     tmp_path: Path,
 ) -> None:
     state_root, _plan = _write_valid_state(tmp_path)
@@ -809,9 +1046,40 @@ def test_code_to_design_observation_retrieves_any_inventory_section(
         lens=LENSES[0],
     )
     observation["design_section_ids"] = ["SECTION-SUPPORTING"]
+    observation["design_requirement"]["source_ref"] = {
+        "path": "supporting.md", "line_start": 1, "line_end": 1,
+    }
 
     errors = validator.validate_observation_against_plan(
         observation, state_root, "risk (RISK-DYNAMIC-DESIGN)",
+    )
+
+    assert any("candidate source is not required/in_scope" in error for error in errors)
+
+
+def test_test_surface_metadata_is_not_a_semantic_candidate_gate(
+    tmp_path: Path,
+) -> None:
+    state_root, plan = _write_valid_state(tmp_path)
+    architecture = ac.load_json(state_root / validator.ARCHITECTURE_NAME)
+    architecture["implementation_planes"][0]["paths"] = ["impl/a"]
+    architecture["integration_boundaries"][0]["paths"] = ["impl/a"]
+    architecture["test_surfaces"] = [{"path": "impl/a/test_case.py"}]
+    ac.save_json(state_root / validator.ARCHITECTURE_NAME, architecture)
+    plan["architecture_map_sha256"] = ac.sha256_file(
+        state_root / validator.ARCHITECTURE_NAME
+    )
+    plan["slices"][1]["anchor_paths"] = ["impl/a"]
+    ac.save_json(state_root / validator.PLAN_NAME, plan)
+    _write_receipts(state_root, plan)
+    observation = _observation(
+        state_root,
+        sweep="SWEEP-A", boundary="BOUNDARY-A", plane="PLANE-A",
+        path_id="PATH-A", code_file="impl/a/test_case.py", lens=LENSES[0],
+    )
+
+    errors = validator.validate_observation_against_plan(
+        observation, state_root, "risk (RISK-TEST-ONLY)",
     )
 
     assert errors == []
@@ -830,6 +1098,9 @@ def test_design_to_code_observation_stays_with_assigned_document_group(
         "parallel_path_ids": [],
         "review_lenses": [LENSES[0]],
         "design_section_ids": ["SECTION-SUPPORTING"],
+        "design_requirement": {"source_ref": {
+            "path": "supporting.md", "line_start": 1, "line_end": 1,
+        }},
         "code_evidence": [{"file": "src/b.py", "line_start": 1, "line_end": 1}],
     }
 
@@ -837,7 +1108,7 @@ def test_design_to_code_observation_stays_with_assigned_document_group(
         observation, state_root, "risk (RISK-WRONG-DOCUMENT)",
     )
 
-    assert any("escape assigned document groups" in error for error in errors)
+    assert any("escape assigned section range" in error for error in errors)
 
 
 def test_design_to_code_observation_may_cross_repository_code_scopes(
@@ -853,6 +1124,9 @@ def test_design_to_code_observation_may_cross_repository_code_scopes(
         "parallel_path_ids": ["PATH-B"],
         "review_lenses": [LENSES[0]],
         "design_section_ids": ["SECTION-A"],
+        "design_requirement": {"source_ref": {
+            "path": "design.md", "line_start": 1, "line_end": 1,
+        }},
         "code_evidence": [{"file": "src/b.py", "line_start": 1, "line_end": 1}],
     }
 
@@ -863,10 +1137,10 @@ def test_design_to_code_observation_may_cross_repository_code_scopes(
     assert errors == []
 
 
-def test_sweep_rejects_more_than_eight_observations(tmp_path: Path) -> None:
+def test_sweep_rejects_more_than_twelve_observations(tmp_path: Path) -> None:
     state_root, _plan = _write_valid_state(tmp_path)
     items = []
-    for index in range(9):
+    for index in range(13):
         item = _observation(
             state_root,
             sweep="SWEEP-A",
@@ -881,4 +1155,4 @@ def test_sweep_rejects_more_than_eight_observations(tmp_path: Path) -> None:
 
     errors = validator.validate_sweep_coverage(items, state_root, "SWEEP-A")
 
-    assert any("may emit at most 8" in error for error in errors)
+    assert any("may emit at most 12" in error for error in errors)

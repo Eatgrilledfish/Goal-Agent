@@ -31,8 +31,9 @@ def finding_workspace(tmp_path: Path) -> dict[str, object]:
     design = tmp_path / "design"
     state = tmp_path / "state"
     handoff = state / "handoffs" / "investigators" / "TASK-001"
+    semantics = state / "semantics" / "investigators"
     templates = state / "handoff-templates" / "investigators"
-    for path in (code, design, handoff, templates):
+    for path in (code, design, handoff, semantics, templates):
         path.mkdir(parents=True)
     (code / "service.py").write_text(
         "def charge(amount):\n"
@@ -105,7 +106,7 @@ def finding_workspace(tmp_path: Path) -> dict[str, object]:
         "code_search_result": "The charge implementation is in service.py.",
         "reverse_check_result": "No compensating enforcement path was found.",
     }
-    semantic_path = handoff / "semantic.json"
+    semantic_path = semantics / "TASK-001.json"
     output_path = handoff / "TASK-001.json"
     trace_path = tmp_path / "finding-materialization.json"
     ac.save_json(semantic_path, semantic)
@@ -228,6 +229,21 @@ def test_materializer_rejects_out_of_range_code_location(finding_workspace):
     assert any("exceeds 4 lines" in error for error in trace["errors"])
 
 
+def test_materializer_rejects_selected_probe_without_an_execution_workflow(
+    finding_workspace,
+):
+    semantic = dict(finding_workspace["semantic"])
+    semantic["dynamic_probe_selection"] = {
+        "disposition": "selected",
+        "reason": "A focused runtime check might add evidence.",
+    }
+    ac.save_json(Path(finding_workspace["semantic_path"]), semantic)
+
+    assert _run(finding_workspace) == 1
+    trace = ac.load_json(Path(finding_workspace["trace_path"]))
+    assert any("does not execute selected probes" in error for error in trace["errors"])
+
+
 def test_materializer_cannot_overwrite_pristine_template(finding_workspace):
     original = Path(finding_workspace["template_path"]).read_bytes()
     finding_workspace["output_path"] = finding_workspace["template_path"]
@@ -236,3 +252,27 @@ def test_materializer_cannot_overwrite_pristine_template(finding_workspace):
     assert Path(finding_workspace["template_path"]).read_bytes() == original
     trace = ac.load_json(Path(finding_workspace["trace_path"]))
     assert any("pristine template directory" in error for error in trace["errors"])
+
+
+def test_materializer_requires_semantic_input_outside_merge_directory(
+    finding_workspace,
+):
+    candidate_dir = Path(finding_workspace["output_path"]).parent
+    inside = candidate_dir / "TASK-001.semantic.json"
+    ac.save_json(inside, finding_workspace["semantic"])
+    finding_workspace["semantic_path"] = inside
+
+    assert _run(finding_workspace) == 1
+    assert not Path(finding_workspace["output_path"]).exists()
+    trace = ac.load_json(Path(finding_workspace["trace_path"]))
+    assert any("outside the final finding merge directory" in error for error in trace["errors"])
+
+
+def test_materializer_requires_canonical_task_output(finding_workspace):
+    candidate_dir = Path(finding_workspace["output_path"]).parent
+    finding_workspace["output_path"] = candidate_dir / "finding.json"
+
+    assert _run(finding_workspace) == 1
+    assert not Path(finding_workspace["output_path"]).exists()
+    trace = ac.load_json(Path(finding_workspace["trace_path"]))
+    assert any("canonical task handoff" in error for error in trace["errors"])

@@ -27,7 +27,7 @@ RECOMMENDATIONS = {
     "design_satisfied": "reject",
 }
 PROBE_DISPOSITIONS = {
-    "selected", "not_selected", "not_suitable", "environment_limited",
+    "not_selected", "not_suitable", "environment_limited",
 }
 SEMANTIC_FIELDS = {
     "task_id", "assessment", "observed_behavior", "code_locations",
@@ -183,7 +183,10 @@ def _probe_selection(value: Any) -> dict[str, str]:
             "dynamic_probe_selection must contain exactly disposition and reason"
         )
     if value.get("disposition") not in PROBE_DISPOSITIONS:
-        raise ValueError("dynamic_probe_selection has invalid disposition")
+        raise ValueError(
+            "dynamic_probe_selection has invalid disposition; the active autonomous "
+            "workflow does not execute selected probes"
+        )
     if not _nonempty_string(value.get("reason")):
         raise ValueError("dynamic_probe_selection.reason must be a non-empty string")
     return {"disposition": value["disposition"], "reason": value["reason"]}
@@ -313,11 +316,23 @@ def run(args: argparse.Namespace) -> int:
         errors.append("trace must not overwrite the semantic input or finding output")
     if output_path == input_path:
         errors.append("finding output must not overwrite the semantic input")
+    if _inside(output_path.parent, input_path):
+        errors.append(
+            "investigator semantic input must be outside the final finding merge directory"
+        )
     if not errors:
         try:
             semantic = ac.load_json(input_path)
             if isinstance(semantic, dict):
                 task_id = str(semantic.get("task_id") or "")
+            state_root = _state_root_for_template(template_path)
+            expected_output = (
+                state_root / "handoffs" / "investigators" / task_id / f"{task_id}.json"
+            ).resolve()
+            if output_path != expected_output:
+                raise ValueError(
+                    f"finding output must be the canonical task handoff: {expected_output}"
+                )
             finding = materialize_finding(semantic, template_path, code_root)
             ac.save_json(output_path, finding)
         except (OSError, ValueError, json.JSONDecodeError) as exc:

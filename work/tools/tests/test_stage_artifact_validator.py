@@ -108,6 +108,57 @@ def test_task_check_rejects_code_to_design_task_without_risk_refs(workspace):
     )
 
 
+def test_task_plan_allows_empty_architecture_navigation_arrays(workspace):
+    populate_handoffs(workspace)
+    _prepare_claim_scope(workspace)
+    state = workspace["state"]
+    assert isinstance(state, Path)
+    tasks, task_errors = ac.load_jsonl(state / "investigation_tasks.jsonl")
+    risks, risk_errors = ac.load_jsonl(state / "risk_observations.jsonl")
+    assert task_errors == []
+    assert risk_errors == []
+    task = next(
+        item for item in tasks
+        if item["exploration_mode"] == "design-to-code obligation tracing"
+    )
+    risk = next(
+        item for item in risks if item["observation_id"] == task["candidate_id"]
+    )
+    for item in (task, risk):
+        item["architecture_boundaries"] = []
+        item["implementation_planes"] = []
+        item["parallel_path_ids"] = []
+    _rewrite_jsonl(state / "investigation_tasks.jsonl", tasks)
+    _rewrite_jsonl(state / "risk_observations.jsonl", risks)
+
+    proc = _run_stage(workspace, "task-plan-check", check=False)
+
+    assert proc.returncode == 0
+    trace = ac.load_json(workspace["logs"] / "trace" / "task_plan_validation.json")
+    assert trace["passed"] is True
+
+
+def test_task_plan_does_not_revalidate_unselected_risk_semantics(workspace):
+    populate_handoffs(workspace)
+    _prepare_claim_scope(workspace)
+    state = workspace["state"]
+    assert isinstance(state, Path)
+    risks, errors = ac.load_jsonl(state / "risk_observations.jsonl")
+    assert errors == []
+    unselected = dict(risks[1])
+    unselected["observation_id"] = "RISK-UNSELECTED"
+    unselected["architecture_boundaries"] = ["BOUNDARY-NOT-IN-PLAN"]
+    risks.append(unselected)
+    _rewrite_jsonl(state / "risk_observations.jsonl", risks)
+
+    proc = _run_stage(workspace, "task-plan-check", check=False)
+
+    assert proc.returncode == 0
+    trace = ac.load_json(workspace["logs"] / "trace" / "task_plan_validation.json")
+    assert trace["passed"] is True
+    assert trace["metrics"]["risks"] == len(risks)
+
+
 def test_task_plan_requires_one_task_for_every_accepted_claim(workspace):
     populate_handoffs(workspace)
     _prepare_claim_scope(workspace)

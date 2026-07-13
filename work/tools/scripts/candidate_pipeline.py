@@ -20,6 +20,7 @@ import stage_artifact_validator as sav
 
 
 MAX_CANDIDATES = 12
+MAX_REQUIREMENT_SOURCE_LINES = 80
 MISMATCH_SIGNALS = {
     "direct_conflict", "capability_absence", "cross_plane_mismatch", "uncertain",
 }
@@ -69,9 +70,11 @@ def _require_complete_scouts(root: Path) -> None:
     }
     receipts = _load_jsonl_index(root / "scout_receipts.jsonl", "sweep_id")
     plan_digest = ac.sha256_file(root / "risk_sweep_plan.json")
+    session_id = _current_session(root)
     complete = {
         sweep_id for sweep_id, item in receipts.items()
         if item.get("risk_sweep_plan_sha256") == plan_digest
+        and item.get("session_id") == session_id
         and item.get("status") == "complete"
     }
     missing = sorted(expected - complete)
@@ -86,6 +89,49 @@ def _require_complete_scouts(root: Path) -> None:
     )
     for sweep_id in sorted(expected):
         receipt = receipts[sweep_id]
+        sweep = next(
+            item for item in plan.get("slices", [])
+            if isinstance(item, dict) and item.get("sweep_id") == sweep_id
+        )
+        expected_sections = list(sweep.get("section_ids", []))
+        expected_anchors = list(sweep.get("anchor_paths", []))
+        if receipt.get("direction") != sweep.get("direction"):
+            raise ValueError(f"{sweep_id}: receipt direction does not match plan")
+        for field, expected_scope in (
+            ("assigned_section_ids", expected_sections),
+            ("reviewed_section_ids", expected_sections),
+            ("assigned_anchor_paths", expected_anchors),
+            ("reviewed_anchor_paths", expected_anchors),
+        ):
+            if receipt.get(field) != expected_scope:
+                raise ValueError(
+                    f"{sweep_id}: receipt {field} does not exactly close plan scope"
+                )
+        coverage_digest = receipt.get("coverage_report_sha256")
+        if (
+            not isinstance(coverage_digest, str) or len(coverage_digest) != 64
+            or any(character not in "0123456789abcdef" for character in coverage_digest)
+        ):
+            raise ValueError(f"{sweep_id}: receipt lacks coverage report digest")
+        coverage_path = root / "scout-coverage" / f"{sweep_id}.json"
+        if not coverage_path.is_file() or coverage_path.is_symlink():
+            raise ValueError(f"{sweep_id}: current coverage report is missing")
+        if ac.sha256_file(coverage_path) != coverage_digest:
+            raise ValueError(f"{sweep_id}: receipt coverage report digest is stale")
+        coverage = ac.load_json(coverage_path)
+        if coverage.get("sweep_id") != sweep_id:
+            raise ValueError(f"{sweep_id}: current coverage report names another sweep")
+        if coverage.get("reviewed_section_ids") != expected_sections:
+            raise ValueError(f"{sweep_id}: current coverage report has stale sections")
+        if coverage.get("reviewed_anchor_paths") != expected_anchors:
+            raise ValueError(f"{sweep_id}: current coverage report has stale anchors")
+        handoff_path = (
+            root / "handoffs" / "risks" / sweep_id / f"{sweep_id}.json"
+        )
+        if not handoff_path.is_file() or handoff_path.is_symlink():
+            raise ValueError(f"{sweep_id}: current scout handoff is missing")
+        if receipt.get("handoff_sha256") != ac.sha256_file(handoff_path):
+            raise ValueError(f"{sweep_id}: receipt handoff digest is stale")
         candidate_ids = receipt.get("candidate_ids")
         if not isinstance(candidate_ids, list) or any(
             not isinstance(value, str) or not value for value in candidate_ids
@@ -125,7 +171,8 @@ def _inventory_indexes(
 
 def _candidate_claim(
     observation: dict[str, Any], *, session_id: str,
-    sections: dict[str, tuple[str, dict[str, Any]]], design_root: Path,
+    sections: dict[str, tuple[str, dict[str, Any]]],
+    groups: dict[str, dict[str, Any]], design_root: Path,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     observation_id = str(observation["observation_id"])
     if observation.get("mismatch_signal") not in MISMATCH_SIGNALS:
@@ -159,9 +206,27 @@ def _candidate_claim(
     document_keys = {key for key, _section in known}
     if len(document_keys) != 1:
         raise ValueError(f"{observation_id}: one atomic candidate must use one document group")
+    document_key = next(iter(document_keys))
+    group = groups.get(document_key, {})
+    if group.get("scope_relation") not in {"required", "in_scope"}:
+        raise ValueError(
+            f"{observation_id}: candidate source group must be required/in_scope"
+        )
     raw_ref = requirement.get("source_ref")
     if not isinstance(raw_ref, dict):
         raise ValueError(f"{observation_id}: source_ref must be an object")
+    line_start = raw_ref.get("line_start")
+    line_end = raw_ref.get("line_end")
+    if (
+        not isinstance(line_start, int) or isinstance(line_start, bool)
+        or not isinstance(line_end, int) or isinstance(line_end, bool)
+        or line_start < 1 or line_end < line_start
+    ):
+        raise ValueError(f"{observation_id}: source_ref range is invalid")
+    if line_end - line_start + 1 > MAX_REQUIREMENT_SOURCE_LINES:
+        raise ValueError(
+            f"{observation_id}: source_ref exceeds {MAX_REQUIREMENT_SOURCE_LINES} lines"
+        )
     in_selected_section = any(
         raw_ref.get("path") == section.get("path")
         and isinstance(raw_ref.get("line_start"), int)
@@ -181,7 +246,7 @@ def _candidate_claim(
         "candidate_id": observation_id,
         "request_id": request_id,
         "session_id": session_id,
-        "document_key": next(iter(document_keys)),
+        "document_key": document_key,
         **requirement,
     }
     claim = materializer.materialize_claims([raw_claim], design_root)[0]
@@ -211,16 +276,18 @@ def select(root: Path, design_root: Path, selection_path: Path) -> dict[str, Any
     _require_complete_scouts(root)
     selection = ac.load_json(selection_path)
     candidate_ids = selection.get("candidate_ids")
+    observations = _load_jsonl_index(root / "risk_observations.jsonl", "observation_id")
     if (
-        not isinstance(candidate_ids, list) or not candidate_ids
+        not isinstance(candidate_ids, list)
         or len(candidate_ids) > MAX_CANDIDATES
         or len(set(candidate_ids)) != len(candidate_ids)
         or any(not isinstance(value, str) or not value for value in candidate_ids)
     ):
         raise ValueError(
-            f"candidate_ids must contain 1..{MAX_CANDIDATES} unique IDs"
+            f"candidate_ids must contain 0..{MAX_CANDIDATES} unique IDs"
         )
-    observations = _load_jsonl_index(root / "risk_observations.jsonl", "observation_id")
+    if observations and not candidate_ids:
+        raise ValueError("non-empty observations require a non-empty candidate selection")
     unknown = sorted(set(candidate_ids) - set(observations))
     if unknown:
         raise ValueError(f"candidate selection contains unknown IDs: {unknown}")
@@ -230,9 +297,10 @@ def select(root: Path, design_root: Path, selection_path: Path) -> dict[str, Any
     claims: list[dict[str, Any]] = []
     lookups: list[dict[str, Any]] = []
     for candidate_id in candidate_ids:
+        observation = observations[candidate_id]
         claim, lookup = _candidate_claim(
-            observations[candidate_id], session_id=session_id,
-            sections=sections, design_root=design_root,
+            observation, session_id=session_id,
+            sections=sections, groups=groups, design_root=design_root,
         )
         claims.append(claim)
         lookups.append(lookup)

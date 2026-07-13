@@ -194,23 +194,19 @@ def run(args: argparse.Namespace) -> int:
         "issues": confirmed,
     }
     ac.save_json(result_root / "issues.json", result)
-    (result_root / "issues.jsonl").write_text(
+    ac.atomic_write_text(
+        result_root / "issues.jsonl",
         "\n".join(json.dumps(issue, ensure_ascii=False) for issue in confirmed) + ("\n" if confirmed else ""),
-        encoding="utf-8",
     )
     ac.save_json(root / "probable_review_queue.json", {
         "generated_at": ac.now_iso(), "session_id": state.get("session_id", ""), "issues": probable,
     })
-    (result_root / "00-summary.md").write_text(render_summary(result, len(probable)), encoding="utf-8")
+    ac.atomic_write_text(
+        result_root / "00-summary.md", render_summary(result, len(probable)),
+    )
     for issue in confirmed:
-        Path(issue["report_path"]).write_text(render_issue(issue), encoding="utf-8")
+        ac.atomic_write_text(Path(issue["report_path"]), render_issue(issue))
 
-    state["updated_at"] = ac.now_iso()
-    state["status"] = "reported"
-    state["current_phase"] = "final_gate"
-    state.setdefault("metrics", {}).update({"confirmed": len(confirmed), "probable": len(probable)})
-    state["next_actions"] = ["Run the final gate; resume semantic investigation if it reports a gap."]
-    ac.save_json(root / "agent_loop_state.json", state)
     ac.append_jsonl(root / "agent_run_ledger.jsonl", {
         "recorded_at": ac.now_iso(), "session_id": state.get("session_id", ""),
         "event": "report_handoff", "actor": "report_helper", "phase": "reporting", "status": "complete",

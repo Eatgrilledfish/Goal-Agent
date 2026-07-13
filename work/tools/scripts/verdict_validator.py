@@ -506,16 +506,6 @@ def run(args: argparse.Namespace) -> int:
         "metrics": {"verdicts": len(latest), "confirmed": confirmed, "probable": probable, "invalid": len(rejected)},
         "errors": validation_errors,
     })
-    state["updated_at"] = ac.now_iso()
-    state["status"] = "validation_failed" if validation_errors else "validated"
-    state["current_phase"] = "evidence_repair" if validation_errors else "reporting"
-    state.setdefault("metrics", {}).update({"confirmed": confirmed, "probable": probable, "invalid_verdicts": len(rejected)})
-    state["next_actions"] = (
-        ["Repair verdict evidence using /logs/trace/evidence_validation.json, then rerun review."]
-        if validation_errors else
-        ["Run report and gate."]
-    )
-    ac.save_json(root / "agent_loop_state.json", state)
     ac.append_jsonl(root / "agent_run_ledger.jsonl", {
         "recorded_at": ac.now_iso(),
         "session_id": session_id,

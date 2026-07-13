@@ -11,7 +11,7 @@
 ## 1. 固定路径与只读边界
 
 ```bash
-SUBMISSION_ROOT=<INSTRUCTION.md 所在目录>
+SUBMISSION_ROOT=$(pwd) # 平台从INSTRUCTION.md所在目录启动
 WORK_ROOT=${SUBMISSION_ROOT}/work
 ASSET_ROOT=/app/code/judge-assets/01_03_ai_implementation_design_difference_detection
 RESULT_ROOT=${SUBMISSION_ROOT}/result
@@ -32,17 +32,17 @@ python3 ${WORK_ROOT}/tools/scripts/goal_runner.py start-clock \
 
 ## 2. 设计来源与 prepare
 
-若 supplied design 已包含正文，直接 prepare。若只有 catalog/链接清单，主 Agent只根据 catalog逐字出现的 local path 或 HTTPS URL写 `${STATE_ROOT}/design_source_plan.json`：
+若 supplied design 已包含正文，直接 prepare。若只有 catalog/链接清单，主 Agent只根据 catalog逐字出现的 local path 或 HTTPS URL写 `${STATE_ROOT}/design_source_plan.json`。以下所有本地路径都相对初始 `DESIGN_ROOT`，包括嵌套目录中的catalog：
 
 ```json
 {
-  "catalog_path":"相对设计目录的入口文件",
+  "catalog_path":"相对初始DESIGN_ROOT的入口文件",
   "sources":[{
     "source_id":"稳定ID",
     "kind":"local|url",
-    "location":"catalog 中逐字出现的本地相对路径或 HTTPS URL",
+    "location":"catalog 中逐字出现、相对初始DESIGN_ROOT的本地路径或 HTTPS URL",
     "output_path":"sources/稳定文件名.txt",
-    "catalog_evidence":{"path":"catalog相对路径","line_start":1,"line_end":1,"quote":"逐字原文"}
+    "catalog_evidence":{"path":"相对初始DESIGN_ROOT的catalog路径","line_start":1,"line_end":1,"quote":"逐字原文"}
   }]
 }
 ```
@@ -51,7 +51,7 @@ python3 ${WORK_ROOT}/tools/scripts/goal_runner.py start-clock \
 
 ```bash
 python3 ${WORK_ROOT}/tools/scripts/design_source_materializer.py \
-  --source-root <catalog所在目录> \
+  --source-root ${DESIGN_ROOT} \
   --plan ${STATE_ROOT}/design_source_plan.json \
   --output-root ${STATE_ROOT}/design-sources \
   --manifest ${LOG_ROOT}/trace/design_source_materialization.json \
@@ -81,9 +81,17 @@ Prepare后完整读取：
 
 ## 3. 运行架构
 
-最多并发两个 fresh subagent。并发范围必须互斥：不同 design document ownership、不同 primary code anchors或不同 candidate。同一 candidate 的 investigator → optional probe → critic严格串行。每个 agent写独立 handoff，只有helper能merge共享ledger。
+最多并发两个 fresh subagent。并发范围必须互斥：不同 design section ownership、不同 primary code anchors或不同 candidate。同一 candidate 的 investigator → critic严格串行。Semantic subagent只写自己的 candidate/sweep 专属 semantic handoff，不调用materializer、validator或merge；orchestrator是所有 helper调用和共享ledger发布的唯一执行者。唯一例外是单实例 Final Judge可直接写 `${STATE_ROOT}/agent_review_verdicts.jsonl`，该文件在judge运行期间没有第二写者。
 
-每次决定下一步前执行：
+Prepare后先执行三个一次性bootstrap动作，它们发生在pipeline controller接管之前：
+
+```text
+map_architecture → build_inventory → build_scout_plan
+```
+
+对应命令全部列在第4节。只有 `architecture-check`、`inventory-check` 和 `risk-plan-check` 都返回0后，才开始用controller调度semantic loop。不要在缺少current `risk_sweep_plan.json`时把controller暂时返回的`finish_scouts/scout_plan_missing_or_invalid`解释为可以启动scout。
+
+Bootstrap完成后，每次决定下一步前执行：
 
 ```bash
 python3 ${WORK_ROOT}/tools/scripts/pipeline_controller.py status --state-root ${STATE_ROOT}
@@ -96,11 +104,13 @@ finish_scouts → select_candidates → review_claims → plan_investigations
 → finish_investigations → finish_critics → run_final
 ```
 
-不得跳过前置条件。每个语义 phase和candidate用 `session_event.py` 写 rich checkpoint，绑定真实输入/输出文件、时间、provider session、scope ID、输出数和repair数。每个 fresh角色最多两个provider attempt、最多一次语义repair。相同输入/artifact/error连续两次无进展后不要第三次原样重跑。只有 final gate可把全局state标为complete。
+不得跳过前置条件。从controller接管起，它是当前 phase、pending IDs 和 next action 的唯一真相源；角色checkpoint只追加执行证据，不改变pipeline phase。每个 fresh角色最多两个provider attempt、最多一次语义repair。相同输入/artifact/error连续两次无进展后不要第三次原样重跑。只有 final gate可把全局state标为complete。
+
+每个语义角色启动前，orchestrator必须从真实Task/session启动结果保存provider session ID，并在开始工作前保存UTC时间；不得编造ID或事后估算时间。下文命令中的 `*_PROVIDER_SESSION_ID`、`*_STARTED_AT`、`*_PROVIDER_ATTEMPT` 和 `*_REPAIR_COUNT` 都来自该真实运行记录；首次运行分别为attempt `1`、repair `0`。所有checkpoint的 `--event` 必须以 `.checkpoint` 结尾。
 
 ## 4. 轻量地图与确定性索引
 
-主 Agent从 `REVIEW_CODE_ROOT` 建立 `${STATE_ROOT}/architecture_map.json`，遵循 `work/skill/SKILL.md` schema。地图覆盖真实入口、subsystem、owned/imported/adapter/generated/fast/slow plane、integration boundary、配置/能力/构建/测试 surface和parallel paths；不判断一致性，也不能限制 design-to-code 全仓搜索。
+主 Agent从 `REVIEW_CODE_ROOT` 建立 `${STATE_ROOT}/architecture_map.json`，遵循 `work/skill/SKILL.md` schema。开始前执行 `ARCHITECTURE_STARTED_AT=$(date -u "+%Y-%m-%dT%H:%M:%SZ")`，并把当前主OpenCode session的真实ID保存为 `ARCHITECTURE_PROVIDER_SESSION_ID`。地图覆盖真实入口、subsystem、owned/imported/adapter/generated/fast/slow plane、integration boundary、配置/能力/构建/测试 surface和parallel paths；不判断一致性，也不能限制 design-to-code 全仓搜索。`architecture-check` 通过后地图冻结：它只服务导航和互斥分片，不能产生设计义务，也不能作为 candidate/task 合法性的语义外键。
 
 运行：
 
@@ -122,15 +132,36 @@ python3 ${WORK_ROOT}/tools/scripts/goal_runner.py risk-plan-check \
   --result-root ${RESULT_ROOT} --log-root ${LOG_ROOT} --state-root ${STATE_ROOT}
 ```
 
-Inventory和scout plan不由模型手写。Plan会把全部 in-scope design groups分配给互斥的 design-to-code scouts，并把架构代码按不重叠 top-level ownership分配给 code-to-design scouts。
+三个bootstrap gate全部通过后记录architecture checkpoint，再由controller接管：
+
+```bash
+ARCHITECTURE_ENDED_AT=$(date -u "+%Y-%m-%dT%H:%M:%SZ")
+python3 ${WORK_ROOT}/tools/scripts/session_event.py \
+  --state-root ${STATE_ROOT} --actor orchestrator --role orchestrator \
+  --phase architecture_mapping --status complete \
+  --event architecture_mapping.checkpoint --scope-id ARCHITECTURE-MAP \
+  --scope "validated repository architecture navigation map" \
+  --input-artifact ${STATE_ROOT}/agent_context.json \
+  --artifact ${STATE_ROOT}/architecture_map.json \
+  --started-at ${ARCHITECTURE_STARTED_AT} --ended-at ${ARCHITECTURE_ENDED_AT} \
+  --provider-attempt ${ARCHITECTURE_PROVIDER_ATTEMPT} \
+  --provider-session-id ${ARCHITECTURE_PROVIDER_SESSION_ID} \
+  --output-count 1 --repair-count ${ARCHITECTURE_REPAIR_COUNT} \
+  --outcome architecture_map_validated --stop-reason bootstrap_gates_passed
+```
+
+Inventory和scout plan不由模型手写。Inventory按真实文档标题边界生成连续section；Plan根据当前输入规模生成足够多的design slices，每个slice硬上限3500行且最多包含2个文档。每个document-local range必须连续；大文档可拆成多个连续chunk分给不同slice，同一slice不能包含同一文档的两个不连续chunk，全部in-scope sections在全局只有一个owner。Code plan依据architecture map中的实际scope递归拆分为互斥的primary anchors，每个code slice覆盖的文件不超过1200个；不得用粗粒度根目录替代必要的递归分片。`test_surfaces`只作导航提示，不能删除implementation plane、代码ownership或candidate。不得把超过上述边界的文档或代码范围塞给同一个scout。
 
 ## 5. 双向 Semantic Scouts
 
-按 plan最多并发两个 fresh `risk-explorer`，完整遵循 `${WORK_ROOT}/skills/risk-explorer.md`：
+按 plan最多并发两个 fresh `risk-explorer`，完整遵循 `${WORK_ROOT}/skills/risk-explorer.md`。Orchestrator在每个Task启动前保存 `${SCOUT_STARTED_AT}` 和返回的 `${SCOUT_PROVIDER_SESSION_ID}`；scout只写自己的 `<SWEEP_ID>.json` 和coverage report，下面所有helper命令都由orchestrator执行：
 
-- design-to-code scout独占文档组，逐段提炼可观察要求，并可搜索整个代码仓；
-- code-to-design scout独占primary code anchors，并可从完整design inventory动态检索规范；
+- design-to-code scout拥有总计不超过3500行、来自最多2个文档的document-local chunks；每个chunk内的`section_ids`连续，同一slice不含同一文档的两个不连续chunk，所有section在全局只有一个owner。Scout逐段提炼可观察要求，并可搜索整个代码仓；
+- code-to-design scout独占递归划分后的primary code anchors，该slice覆盖不超过1200个文件，并可从完整design inventory动态检索规范；
 - 只输出 direct conflict、结构化能力缺失、cross-plane mismatch或有证据的uncertain；
+- catalog、architecture map、测试缺失和普通代码质量不能成为设计义务；catalog只证明正文来源，测试代码只作静态反证线索；
+- raw scout每个slice最多输出12条线索。每条只需绑定原子设计义务，以及真实代码lead或指向入口、dispatch、registration、build/config邻近位置的结构化absence lead，并完成最低限度的candidate-specific反证，即可形成`uncertain`候选；raw阶段不要求闭合完整入口链、所有替代路径或补偿机制；
+- 完整的可达入口、调用链、替代/补偿路径、能力缺失和误报排除证明由后续investigator完成，并由fresh critic独立挑战；
 - 合规实现不输出，零候选合法。
 
 非空 `<SWEEP_ID>.json` 先check再merge：
@@ -147,16 +178,58 @@ python3 ${WORK_ROOT}/tools/scripts/handoff_merge.py \
   --report ${LOG_ROOT}/trace/risk-merge-${SWEEP_ID}.json
 ```
 
-然后每个scout（包括空数组）都记录receipt：
+每个scout还要在merge目录外写 `${STATE_ROOT}/scout-coverage/${SWEEP_ID}.json`。这不是候选或合规结论，只是逐值声明实际读完的分配范围：
+
+```json
+{
+  "sweep_id":"当前SWEEP_ID",
+  "reviewed_section_ids":["design-to-code逐值复制slice.section_ids"],
+  "reviewed_anchor_paths":["code-to-design逐值复制slice.anchor_paths"]
+}
+```
+
+Helper会把该slice全部assigned section IDs或anchor paths与coverage report逐值核对；未精确覆盖分配范围不能complete。非空handoff在check和merge成功后执行：
 
 ```bash
 python3 ${WORK_ROOT}/tools/scripts/scout_receipt.py \
   --state-root ${STATE_ROOT} --sweep-id ${SWEEP_ID} \
   --handoff ${STATE_ROOT}/handoffs/risks/${SWEEP_ID}/${SWEEP_ID}.json \
-  [--check-report ${LOG_ROOT}/trace/risk-check-${SWEEP_ID}.json]
+  --coverage-report ${STATE_ROOT}/scout-coverage/${SWEEP_ID}.json \
+  --check-report ${LOG_ROOT}/trace/risk-check-${SWEEP_ID}.json
 ```
 
-每个scout写 `code_risk_backtracking/risk-explorer` complete checkpoint；scope/task ID等于SWEEP_ID。全部receipts完成前禁止选择候选。
+空数组不运行check/merge，直接执行不带check report的receipt命令：
+
+```bash
+python3 ${WORK_ROOT}/tools/scripts/scout_receipt.py \
+  --state-root ${STATE_ROOT} --sweep-id ${SWEEP_ID} \
+  --handoff ${STATE_ROOT}/handoffs/risks/${SWEEP_ID}/${SWEEP_ID}.json \
+  --coverage-report ${STATE_ROOT}/scout-coverage/${SWEEP_ID}.json
+```
+
+Receipt成功后，orchestrator为该scout写精确checkpoint；scope/task ID都等于SWEEP_ID，候选数从handoff机械计算：
+
+```bash
+SCOUT_OUTPUT_COUNT=$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1], encoding="utf-8"))))' \
+  ${STATE_ROOT}/handoffs/risks/${SWEEP_ID}/${SWEEP_ID}.json)
+SCOUT_ENDED_AT=$(date -u "+%Y-%m-%dT%H:%M:%SZ")
+python3 ${WORK_ROOT}/tools/scripts/session_event.py \
+  --state-root ${STATE_ROOT} --actor risk-explorer --role risk-explorer \
+  --phase code_risk_backtracking --status complete \
+  --event risk-explorer.checkpoint --task-id ${SWEEP_ID} --scope-id ${SWEEP_ID} \
+  --scope "completed assigned semantic scout slice ${SWEEP_ID}" \
+  --input-artifact ${STATE_ROOT}/risk_sweep_plan.json \
+  --input-artifact ${STATE_ROOT}/design_inventory.json \
+  --artifact ${STATE_ROOT}/handoffs/risks/${SWEEP_ID}/${SWEEP_ID}.json \
+  --artifact ${STATE_ROOT}/scout-coverage/${SWEEP_ID}.json \
+  --started-at ${SCOUT_STARTED_AT} --ended-at ${SCOUT_ENDED_AT} \
+  --provider-attempt ${SCOUT_PROVIDER_ATTEMPT} \
+  --provider-session-id ${SCOUT_PROVIDER_SESSION_ID} \
+  --output-count ${SCOUT_OUTPUT_COUNT} --repair-count ${SCOUT_REPAIR_COUNT} \
+  --outcome scout_slice_completed --stop-reason current_receipt_recorded
+```
+
+Receipt是覆盖承诺，不代表必须制造候选。全部current session/current plan receipts完成前禁止选择候选。
 
 ## 6. 候选、规范审查与任务
 
@@ -166,7 +239,7 @@ python3 ${WORK_ROOT}/tools/scripts/scout_receipt.py \
 {"candidate_ids":["按证据强度排序的 observation_id，最多12个"]}
 ```
 
-优先规范直接冲突、外部可观察行为、跨plane不对称、结构化能力缺失、精确代码位置和反证后的信息增益。不做文档配额，不选择合规样本，不重写候选事实。
+只从机械准入通过的候选中选择。优先规范正文直接支持、外部可观察行为、跨实现不对称、结构化能力缺失、精确代码位置和反证后的信息增益；证据相当时先保留design-to-code的直接义务追踪，code-to-design用于补足实现侧意外行为。显式记录的optional分支可作为“未采用的可选设计”调查，但不能冒充MUST违反，也不能仅因强度较低被自动丢弃。不做文档配额，不选择catalog/architecture推导、测试覆盖缺失、合规样本或重复同义项，不重写候选事实。只要已有observation，selection不得为空。
 
 执行：
 
@@ -179,44 +252,147 @@ python3 ${WORK_ROOT}/tools/scripts/goal_runner.py design-check \
   --result-root ${RESULT_ROOT} --log-root ${LOG_ROOT} --state-root ${STATE_ROOT}
 ```
 
-启动一个 fresh `spec-critic`，只读 scoped claims和设计原文，遵循 `${WORK_ROOT}/skills/spec-critic.md` 写最小语义审查，并用 `claim_review_materializer.py` 生成完整review后运行 claim-check。不要重新运行spec analyst；claim已由candidate逐值物化。规范语义需repair时最多修一次源候选/claim，不能在task中改问题。
+启动一个 fresh `spec-critic` 前保存 `CLAIM_REVIEW_STARTED_AT` 和真实 `CLAIM_REVIEW_PROVIDER_SESSION_ID`。该角色只读 scoped claims和设计原文，遵循 `${WORK_ROOT}/skills/spec-critic.md`，只写 `${STATE_ROOT}/handoffs/design/spec-critic.semantic.json`；不得运行helper。返回后由orchestrator执行：
+
+```bash
+python3 ${WORK_ROOT}/tools/scripts/claim_review_materializer.py \
+  --state-root ${STATE_ROOT} \
+  --input ${STATE_ROOT}/handoffs/design/spec-critic.semantic.json \
+  --trace ${LOG_ROOT}/trace/claim-review-materialization.json
+python3 ${WORK_ROOT}/tools/scripts/goal_runner.py claim-check \
+  --code-root ${CODE_ROOT} --design-root ${DESIGN_ROOT} \
+  --result-root ${RESULT_ROOT} --log-root ${LOG_ROOT} --state-root ${STATE_ROOT}
+```
+
+只有fresh critic可以写semantic review；orchestrator只运行materializer/validator，禁止用脚本或模板代写语义结论。不要重新运行spec analyst；claim已由candidate逐值物化。规范语义需repair时最多修一次源候选/claim，不能在task中改问题。全部claims接受且claim-check返回0后记录：
+
+```bash
+CLAIM_REVIEW_SCOPE_ID=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["round_id"])' \
+  ${STATE_ROOT}/claim_review_scope.json)
+CLAIM_REVIEW_OUTPUT_COUNT=$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1], encoding="utf-8"))["claim_reviews"]))' \
+  ${STATE_ROOT}/design_claim_review.json)
+CLAIM_REVIEW_ENDED_AT=$(date -u "+%Y-%m-%dT%H:%M:%SZ")
+python3 ${WORK_ROOT}/tools/scripts/session_event.py \
+  --state-root ${STATE_ROOT} --actor spec-critic --role spec-critic \
+  --phase design_claim_review --status complete \
+  --event spec-critic.checkpoint --scope-id ${CLAIM_REVIEW_SCOPE_ID} \
+  --scope "reviewed all current materialized design claims" \
+  --input-artifact ${STATE_ROOT}/claim_review_scope.json \
+  --input-artifact ${STATE_ROOT}/design_claims.jsonl \
+  --artifact ${STATE_ROOT}/handoffs/design/spec-critic.semantic.json \
+  --artifact ${STATE_ROOT}/design_claim_review.json \
+  --started-at ${CLAIM_REVIEW_STARTED_AT} --ended-at ${CLAIM_REVIEW_ENDED_AT} \
+  --provider-attempt ${CLAIM_REVIEW_PROVIDER_ATTEMPT} \
+  --provider-session-id ${CLAIM_REVIEW_PROVIDER_SESSION_ID} \
+  --output-count ${CLAIM_REVIEW_OUTPUT_COUNT} \
+  --repair-count ${CLAIM_REVIEW_REPAIR_COUNT} \
+  --outcome claims_accepted --stop-reason claim_check_passed
+```
 
 全部 claims接受后：
 
 ```bash
 python3 ${WORK_ROOT}/tools/scripts/candidate_pipeline.py plan --state-root ${STATE_ROOT}
-python3 ${WORK_ROOT}/tools/scripts/goal_runner.py task-plan-check \
+python3 ${WORK_ROOT}/tools/scripts/goal_runner.py task-check \
   --code-root ${CODE_ROOT} --design-root ${DESIGN_ROOT} \
   --result-root ${RESULT_ROOT} --log-root ${LOG_ROOT} --state-root ${STATE_ROOT}
 ```
 
-Task的claim、hypothesis、direction、code starting points和候选ID均由helper冻结，主 Agent不得另写plan handoff。
+Task的claim、hypothesis、direction、code starting points和候选ID均由helper冻结，主 Agent不得另写plan handoff。Task不依赖architecture ID才能合法；task gate只重验selected frontier，未选候选不能阻断调查。`task-check`会同时生成current task-plan和task-lifecycle validation；两者均通过前controller保持`plan_investigations`，不得生成investigator template。
 
 ## 7. 调查与独立反证
 
-按 round顺序每批最多两个不同candidate。每项：
+按 round顺序每批最多两个不同candidate。每批先由helper一次性生成controller返回的当前frontier模板；只根据进程退出码与JSON `passed=true` 判断成功，禁止用grep统计字符串：
 
 ```bash
 python3 ${WORK_ROOT}/tools/scripts/handoff_template.py \
   --tasks ${STATE_ROOT}/investigation_tasks.jsonl \
-  --claims ${STATE_ROOT}/design_claims.jsonl --task-id ${TASK_ID} \
-  --output ${STATE_ROOT}/handoff-templates/investigators/${TASK_ID}.json --force
+  --claims ${STATE_ROOT}/design_claims.jsonl \
+  --frontier --output-dir ${STATE_ROOT}/handoff-templates/investigators --force
 ```
 
-Fresh investigator遵循 `${WORK_ROOT}/skills/code-investigator.md`，只写最小semantic JSON，再运行：
+为当前frontier中的每个Task启动fresh investigator前保存 `INVESTIGATION_STARTED_AT` 和真实 `INVESTIGATION_PROVIDER_SESSION_ID`。Investigator遵循 `${WORK_ROOT}/skills/code-investigator.md`，只写 `${STATE_ROOT}/semantic/investigators/${TASK_ID}.json`，不得调用helper。返回后由orchestrator执行完整的template → materialize → check → merge → lifecycle gate：
 
 ```bash
 python3 ${WORK_ROOT}/tools/scripts/finding_materializer.py \
-  --input ${STATE_ROOT}/handoffs/investigators/${TASK_ID}/${TASK_ID}.semantic.json \
+  --input ${STATE_ROOT}/semantic/investigators/${TASK_ID}.json \
   --template ${STATE_ROOT}/handoff-templates/investigators/${TASK_ID}.json \
   --code-root ${REVIEW_CODE_ROOT} \
   --output ${STATE_ROOT}/handoffs/investigators/${TASK_ID}/${TASK_ID}.json \
   --trace ${LOG_ROOT}/trace/finding-materialize-${TASK_ID}.json
+python3 ${WORK_ROOT}/tools/scripts/handoff_merge.py \
+  --check-file ${STATE_ROOT}/handoffs/investigators/${TASK_ID}/${TASK_ID}.json \
+  --artifact-type finding --session-id ${SESSION_ID} \
+  --code-root ${REVIEW_CODE_ROOT} --design-root ${REVIEW_DESIGN_ROOT} \
+  --report ${LOG_ROOT}/trace/finding-check-${TASK_ID}.json
+python3 ${WORK_ROOT}/tools/scripts/handoff_merge.py \
+  --input-dir ${STATE_ROOT}/handoffs/investigators/${TASK_ID} \
+  --output ${STATE_ROOT}/investigation_findings.jsonl \
+  --artifact-type finding --session-id ${SESSION_ID} \
+  --code-root ${CODE_ROOT} --design-root ${DESIGN_ROOT} \
+  --report ${LOG_ROOT}/trace/finding-merge-${TASK_ID}.json
+python3 ${WORK_ROOT}/tools/scripts/goal_runner.py task-lifecycle-check \
+  --code-root ${CODE_ROOT} --design-root ${DESIGN_ROOT} \
+  --result-root ${RESULT_ROOT} --log-root ${LOG_ROOT} --state-root ${STATE_ROOT}
 ```
 
-完整finding通过 `handoff_merge.py --check-file --artifact-type finding` 后，仅merge该candidate目录；注意semantic input不能留在merge目录，可放candidate子目录外或merge前移至trace目录。Merge会更新task lifecycle。
+该candidate目录只能包含一个canonical `${TASK_ID}.json`；semantic、report、trace始终在目录外。上述四个命令全部返回0后记录：
 
-必要且有design-derived oracle时可做一个隔离单点probe；不做全量测试。无论是否probe，每个finding都启动fresh evidence critic，遵循 `${WORK_ROOT}/skills/evidence-critic.md`，check并merge critic。不要使用多个critic投票。
+```bash
+INVESTIGATION_ENDED_AT=$(date -u "+%Y-%m-%dT%H:%M:%SZ")
+python3 ${WORK_ROOT}/tools/scripts/session_event.py \
+  --state-root ${STATE_ROOT} --actor code-investigator --role code-investigator \
+  --phase investigation --status complete \
+  --event code-investigator.checkpoint --task-id ${TASK_ID} --scope-id ${TASK_ID} \
+  --scope "completed investigation for current task ${TASK_ID}" \
+  --input-artifact ${STATE_ROOT}/handoff-templates/investigators/${TASK_ID}.json \
+  --artifact ${STATE_ROOT}/semantic/investigators/${TASK_ID}.json \
+  --artifact ${STATE_ROOT}/handoffs/investigators/${TASK_ID}/${TASK_ID}.json \
+  --started-at ${INVESTIGATION_STARTED_AT} --ended-at ${INVESTIGATION_ENDED_AT} \
+  --provider-attempt ${INVESTIGATION_PROVIDER_ATTEMPT} \
+  --provider-session-id ${INVESTIGATION_PROVIDER_SESSION_ID} \
+  --output-count 1 --repair-count ${INVESTIGATION_REPAIR_COUNT} \
+  --outcome finding_merged --stop-reason task_lifecycle_passed
+```
+
+Active optional probe在本次比赛运行链路中暂停：`dynamic_probe_selection.disposition`不得为`selected`，`${STATE_ROOT}/dynamic_probes.jsonl`保持空。不得用probe、测试或其他fallback替代静态证据闭环。
+
+随后为该finding启动一个fresh evidence critic，启动前保存 `CRITIC_STARTED_AT` 和真实 `CRITIC_PROVIDER_SESSION_ID`。该角色遵循 `${WORK_ROOT}/skills/evidence-critic.md`，只写自己的raw semantic handoff，不运行helper。Orchestrator从canonical finding读取ID，然后执行check与typed merge：
+
+```bash
+FINDING_ID=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["finding_id"])' \
+  ${STATE_ROOT}/handoffs/investigators/${TASK_ID}/${TASK_ID}.json)
+python3 ${WORK_ROOT}/tools/scripts/handoff_merge.py \
+  --check-file ${STATE_ROOT}/handoffs/critics/${FINDING_ID}/${FINDING_ID}.json \
+  --artifact-type critic --session-id ${SESSION_ID} \
+  --report ${LOG_ROOT}/trace/critic-check-${FINDING_ID}.json
+python3 ${WORK_ROOT}/tools/scripts/handoff_merge.py \
+  --input-dir ${STATE_ROOT}/handoffs/critics/${FINDING_ID} \
+  --output ${STATE_ROOT}/critic_reviews.jsonl \
+  --artifact-type critic --session-id ${SESSION_ID} \
+  --report ${LOG_ROOT}/trace/critic-merge-${FINDING_ID}.json
+```
+
+Merge返回0后记录；candidate checkpoint的task/scope ID按final gate契约都等于finding ID：
+
+```bash
+CRITIC_ENDED_AT=$(date -u "+%Y-%m-%dT%H:%M:%SZ")
+python3 ${WORK_ROOT}/tools/scripts/session_event.py \
+  --state-root ${STATE_ROOT} --actor evidence-critic --role evidence-critic \
+  --phase critic_review --status complete \
+  --event evidence-critic.checkpoint \
+  --task-id ${FINDING_ID} --scope-id ${FINDING_ID} \
+  --scope "challenged current finding ${FINDING_ID}" \
+  --input-artifact ${STATE_ROOT}/handoffs/investigators/${TASK_ID}/${TASK_ID}.json \
+  --artifact ${STATE_ROOT}/handoffs/critics/${FINDING_ID}/${FINDING_ID}.json \
+  --started-at ${CRITIC_STARTED_AT} --ended-at ${CRITIC_ENDED_AT} \
+  --provider-attempt ${CRITIC_PROVIDER_ATTEMPT} \
+  --provider-session-id ${CRITIC_PROVIDER_SESSION_ID} \
+  --output-count 1 --repair-count ${CRITIC_REPAIR_COUNT} \
+  --outcome critic_merged --stop-reason critic_merge_passed
+```
+
+每个finding恰好一个current fresh critic，不使用多个critic投票。当前candidate的investigator → critic闭环后才调度后续相关动作。
 
 ## 8. Coverage、Final Judge 与输出
 
@@ -232,7 +408,7 @@ python3 ${WORK_ROOT}/tools/scripts/goal_runner.py coverage-check \
 
 若materializer报告尚有unfinished task，返回对应candidate，不得伪造deferred。
 
-启动fresh Final Judge，遵循 `${WORK_ROOT}/skills/final-judge.md`，为每个finding生成一个current verdict并运行：
+启动fresh Final Judge前保存 `FINAL_JUDGE_STARTED_AT` 和真实 `FINAL_JUDGE_PROVIDER_SESSION_ID`。Final Judge遵循 `${WORK_ROOT}/skills/final-judge.md`，作为明确的单写者例外，直接为每个finding写一个current verdict到 `${STATE_ROOT}/agent_review_verdicts.jsonl`，但不得调用helper。返回后由orchestrator运行：
 
 ```bash
 python3 ${WORK_ROOT}/tools/scripts/goal_runner.py review \
@@ -240,13 +416,36 @@ python3 ${WORK_ROOT}/tools/scripts/goal_runner.py review \
   --result-root ${RESULT_ROOT} --log-root ${LOG_ROOT} --state-root ${STATE_ROOT}
 ```
 
-写 `final_judgement/final-judge` checkpoint后执行：
+`review`返回0后写精确的 `final_judgement/final-judge` checkpoint：
+
+```bash
+FINAL_VERDICT_COUNT=$(python3 -c 'import json,sys; print(sum(1 for line in open(sys.argv[1], encoding="utf-8") if line.strip() and isinstance(json.loads(line), dict)))' \
+  ${STATE_ROOT}/agent_review_verdicts.jsonl)
+FINAL_JUDGE_ENDED_AT=$(date -u "+%Y-%m-%dT%H:%M:%SZ")
+python3 ${WORK_ROOT}/tools/scripts/session_event.py \
+  --state-root ${STATE_ROOT} --actor final-judge --role final-judge \
+  --phase final_judgement --status complete \
+  --event final-judge.checkpoint --scope-id FINAL-JUDGEMENT \
+  --scope "mapped every current finding to one current verdict" \
+  --input-artifact ${LOG_ROOT}/trace/coverage_validation.json \
+  --input-artifact ${STATE_ROOT}/critic_reviews.jsonl \
+  --artifact ${STATE_ROOT}/agent_review_verdicts.jsonl \
+  --started-at ${FINAL_JUDGE_STARTED_AT} --ended-at ${FINAL_JUDGE_ENDED_AT} \
+  --provider-attempt ${FINAL_JUDGE_PROVIDER_ATTEMPT} \
+  --provider-session-id ${FINAL_JUDGE_PROVIDER_SESSION_ID} \
+  --output-count ${FINAL_VERDICT_COUNT} --repair-count ${FINAL_JUDGE_REPAIR_COUNT} \
+  --outcome verdicts_validated --stop-reason review_gate_passed
+```
+
+然后执行：
 
 ```bash
 python3 ${WORK_ROOT}/tools/scripts/goal_runner.py finalize \
   --code-root ${CODE_ROOT} --design-root ${DESIGN_ROOT} \
   --result-root ${RESULT_ROOT} --log-root ${LOG_ROOT} --state-root ${STATE_ROOT}
 ```
+
+`finalize`内部先由report writer生成provisional结果，再立即运行final gate，因为final gate需要校验这些文件。只有该命令退出码为0且 `${LOG_ROOT}/trace/final_gate.json` 中 `passed=true` 时，`${RESULT_ROOT}` 文件才是有效最终结果；若gate失败，现有result只是不可提交的provisional文件，按trace修最早真实artifact后重跑受影响步骤，不能把文件存在当成成功。
 
 必须最终生成：
 

@@ -580,6 +580,131 @@ def test_existing_local_source_plan_mode_remains_available(tmp_path):
     )
 
 
+def test_source_plan_successfully_replaces_bundle_without_removed_source(tmp_path):
+    source_root = tmp_path / "source"
+    output_root = tmp_path / "bundle"
+    source_root.mkdir()
+    (source_root / "catalog.md").write_text(
+        "Use alpha.md as the design.\nUse beta.md as the design.\n",
+        encoding="utf-8",
+    )
+    (source_root / "alpha.md").write_text("Alpha contract.\n", encoding="utf-8")
+    (source_root / "beta.md").write_text("Beta contract.\n", encoding="utf-8")
+    plan_path = tmp_path / "plan.json"
+    manifest_path = tmp_path / "manifest.json"
+    args = argparse.Namespace(
+        source_root=str(source_root), output_root=str(output_root), plan=str(plan_path),
+        manifest=str(manifest_path), approval_log=None, allow_network=False,
+        max_bytes=1024 * 1024, timeout_seconds=1,
+    )
+    alpha = {
+        "source_id": "alpha", "kind": "local", "location": "alpha.md",
+        "output_path": "sources/alpha.md",
+        "catalog_evidence": {
+            "path": "catalog.md", "line_start": 1, "line_end": 1,
+            "quote": "Use alpha.md as the design.",
+        },
+    }
+    beta = {
+        "source_id": "beta", "kind": "local", "location": "beta.md",
+        "output_path": "sources/beta.md",
+        "catalog_evidence": {
+            "path": "catalog.md", "line_start": 2, "line_end": 2,
+            "quote": "Use beta.md as the design.",
+        },
+    }
+    ac.save_json(plan_path, {
+        "catalog_path": "catalog.md", "sources": [alpha, beta],
+    })
+    assert materializer.materialize(args) == 0
+    assert (output_root / "sources" / "alpha.md").is_file()
+    assert (output_root / "sources" / "beta.md").is_file()
+
+    ac.save_json(plan_path, {
+        "catalog_path": "catalog.md", "sources": [beta],
+    })
+    assert materializer.materialize(args) == 0
+
+    manifest = ac.load_json(manifest_path)
+    assert manifest["passed"] is True
+    assert [item["source_id"] for item in manifest["sources"]] == ["catalog", "beta"]
+    assert not (output_root / "sources" / "alpha.md").exists()
+    assert (output_root / "sources" / "beta.md").read_text(encoding="utf-8") == (
+        "Beta contract.\n"
+    )
+
+
+def test_failed_source_plan_retry_keeps_previous_complete_bundle(tmp_path):
+    source_root = tmp_path / "source"
+    output_root = tmp_path / "bundle"
+    source_root.mkdir()
+    (source_root / "catalog.md").write_text(
+        "Use alpha.md as design.\nUse beta.md as design.\n"
+        "Use missing.md as design.\n",
+        encoding="utf-8",
+    )
+    (source_root / "alpha.md").write_text("Alpha contract.\n", encoding="utf-8")
+    (source_root / "beta.md").write_text("Beta contract.\n", encoding="utf-8")
+    plan_path = tmp_path / "plan.json"
+    manifest_path = tmp_path / "manifest.json"
+    args = argparse.Namespace(
+        source_root=str(source_root), output_root=str(output_root), plan=str(plan_path),
+        manifest=str(manifest_path), approval_log=None, allow_network=False,
+        max_bytes=1024 * 1024, timeout_seconds=1,
+    )
+    ac.save_json(plan_path, {
+        "catalog_path": "catalog.md",
+        "sources": [{
+            "source_id": "alpha", "kind": "local", "location": "alpha.md",
+            "output_path": "sources/alpha.md",
+            "catalog_evidence": {
+                "path": "catalog.md", "line_start": 1, "line_end": 1,
+                "quote": "Use alpha.md as design.",
+            },
+        }],
+    })
+    assert materializer.materialize(args) == 0
+    before = {
+        path.relative_to(output_root).as_posix(): path.read_bytes()
+        for path in output_root.rglob("*") if path.is_file()
+    }
+
+    ac.save_json(plan_path, {
+        "catalog_path": "catalog.md",
+        "sources": [
+            {
+                "source_id": "beta", "kind": "local", "location": "beta.md",
+                "output_path": "sources/beta.md",
+                "catalog_evidence": {
+                    "path": "catalog.md", "line_start": 2, "line_end": 2,
+                    "quote": "Use beta.md as design.",
+                },
+            },
+            {
+                "source_id": "missing", "kind": "local", "location": "missing.md",
+                "output_path": "sources/missing.md",
+                "catalog_evidence": {
+                    "path": "catalog.md", "line_start": 3, "line_end": 3,
+                    "quote": "Use missing.md as design.",
+                },
+            },
+        ],
+    })
+    assert materializer.materialize(args) == 1
+
+    after = {
+        path.relative_to(output_root).as_posix(): path.read_bytes()
+        for path in output_root.rglob("*") if path.is_file()
+    }
+    manifest = ac.load_json(manifest_path)
+    assert manifest["passed"] is False
+    assert any("local source is missing" in error for error in manifest["errors"])
+    assert after == before
+    assert (output_root / "sources" / "alpha.md").is_file()
+    assert not (output_root / "sources" / "beta.md").exists()
+    assert not list(tmp_path.glob(f".{output_root.name}.staging-*"))
+
+
 def test_source_plan_mode_reports_invalid_json_without_traceback(tmp_path):
     source_root = tmp_path / "source"
     output_root = tmp_path / "bundle"
@@ -809,6 +934,12 @@ def test_auto_inventory_mechanically_indexes_complete_manifest(tmp_path):
     manifest = {
         "session_id": session_id,
         "design": {
+            "source_manifest": {
+                "sources": [{
+                    "source_id": "catalog",
+                    "bundle_path": "catalog/benchmark.md",
+                }],
+            },
             "documents": [
                 {
                     "path": "catalog/benchmark.md",
@@ -844,17 +975,21 @@ def test_auto_inventory_mechanically_indexes_complete_manifest(tmp_path):
     assert [
         (section["line_start"], section["line_end"])
         for section in spec_group["sections"]
-    ] == [(1, 800), (801, 1600), (1601, 1605)]
+    ] == [
+        (1, 300), (301, 600), (601, 800),
+        (801, 1100), (1101, 1400), (1401, 1600),
+        (1601, 1605),
+    ]
     assert [
         section["behavior_families"] for section in spec_group["sections"]
     ] == [
-        ["Overview", "sources/contract.txt"],
-        ["Middle", "sources/contract.txt"],
+        *[["Overview", "sources/contract.txt"] for _ in range(3)],
+        *[["Middle", "sources/contract.txt"] for _ in range(3)],
         ["Tail", "sources/contract.txt"],
     ]
     assert all("quote" not in section for section in spec_group["sections"])
     assert all(
-        section["line_end"] - section["line_start"] + 1 <= 800
+        section["line_end"] - section["line_start"] + 1 <= 300
         for section in spec_group["sections"]
     )
     issues = validator.Issues()
@@ -867,6 +1002,12 @@ def test_auto_inventory_mechanically_indexes_complete_manifest(tmp_path):
     assert trace["passed"] is True
     assert trace["artifact_kind"] == "auto-inventory"
     assert trace["semantic_analysis_performed"] is False
+
+    # A user-supplied design directory may legitimately be named "catalog".
+    # Only explicit source-manifest provenance may downgrade it to informational.
+    del manifest["design"]["source_manifest"]
+    without_provenance = materializer.materialize_auto_inventory(manifest, design)
+    assert without_provenance["document_groups"][0]["scope_relation"] == "in_scope"
 
 
 def test_auto_inventory_rejects_manifest_source_hash_drift(tmp_path):

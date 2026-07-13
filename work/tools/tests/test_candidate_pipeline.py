@@ -56,16 +56,14 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, str]:
     })
     ac.save_json(state / "risk_sweep_plan.json", {
         "session_id": session_id,
-        "slices": [{"sweep_id": "SCOUT-CONTRACT"}],
+        "slices": [{
+            "sweep_id": "SCOUT-CONTRACT", "direction": "design_to_code",
+            "document_keys": ["contract"],
+            "section_ids": ["SECTION-CONTRACT"], "anchor_paths": [],
+        }],
     })
     plan_sha = ac.sha256_file(state / "risk_sweep_plan.json")
-    _write_jsonl(state / "scout_receipts.jsonl", [{
-        "session_id": session_id, "sweep_id": "SCOUT-CONTRACT",
-        "risk_sweep_plan_sha256": plan_sha, "status": "complete",
-        "candidate_count": 1,
-        "candidate_ids": ["OBS-NEGATIVE"],
-    }])
-    _write_jsonl(state / "risk_observations.jsonl", [{
+    observation = {
         "observation_id": "OBS-NEGATIVE", "session_id": session_id,
         "sweep_id": "SCOUT-CONTRACT", "direction": "design_to_code",
         "mismatch_signal": "direct_conflict",
@@ -89,6 +87,32 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, str]:
         "architecture_boundaries": ["BOUNDARY-API"],
         "implementation_planes": ["PLANE-SERVICE"],
         "parallel_path_ids": [],
+    }
+    _write_jsonl(state / "risk_observations.jsonl", [observation])
+    handoff = (
+        state / "handoffs" / "risks" / "SCOUT-CONTRACT" / "SCOUT-CONTRACT.json"
+    )
+    handoff.parent.mkdir(parents=True)
+    handoff.write_text(json.dumps([observation]) + "\n", encoding="utf-8")
+    coverage = state / "scout-coverage" / "SCOUT-CONTRACT.json"
+    coverage.parent.mkdir(parents=True)
+    ac.save_json(coverage, {
+        "sweep_id": "SCOUT-CONTRACT",
+        "reviewed_section_ids": ["SECTION-CONTRACT"],
+        "reviewed_anchor_paths": [],
+    })
+    _write_jsonl(state / "scout_receipts.jsonl", [{
+        "session_id": session_id, "sweep_id": "SCOUT-CONTRACT",
+        "risk_sweep_plan_sha256": plan_sha, "status": "complete",
+        "candidate_count": 1,
+        "candidate_ids": ["OBS-NEGATIVE"],
+        "direction": "design_to_code",
+        "handoff_sha256": ac.sha256_file(handoff),
+        "coverage_report_sha256": ac.sha256_file(coverage),
+        "assigned_section_ids": ["SECTION-CONTRACT"],
+        "reviewed_section_ids": ["SECTION-CONTRACT"],
+        "assigned_anchor_paths": [],
+        "reviewed_anchor_paths": [],
     }])
     ac.save_json(state / "candidate_selection.json", {
         "candidate_ids": ["OBS-NEGATIVE"],
@@ -162,3 +186,86 @@ def test_selection_rejects_compliance_observation(tmp_path: Path) -> None:
         assert "lacks a candidate mismatch_signal" in str(exc)
     else:
         raise AssertionError("compliance observation unexpectedly entered frontier")
+
+
+def test_selection_rejects_informational_candidate_source(tmp_path: Path) -> None:
+    state, design, _session = _fixture(tmp_path)
+    inventory = ac.load_json(state / "design_inventory.json")
+    inventory["document_groups"][0]["scope_relation"] = "informational"
+    ac.save_json(state / "design_inventory.json", inventory)
+
+    try:
+        cp.select(state, design, state / "candidate_selection.json")
+    except ValueError as exc:
+        assert "source group must be required/in_scope" in str(exc)
+    else:
+        raise AssertionError("informational catalog source entered candidate frontier")
+
+
+def test_selection_rejects_non_atomic_source_range_over_80_lines(
+    tmp_path: Path,
+) -> None:
+    state, design, _session = _fixture(tmp_path)
+    observations, errors = ac.load_jsonl(state / "risk_observations.jsonl")
+    assert errors == []
+    observations[0]["design_requirement"]["source_ref"]["line_end"] = 82
+    _write_jsonl(state / "risk_observations.jsonl", observations)
+
+    try:
+        cp.select(state, design, state / "candidate_selection.json")
+    except ValueError as exc:
+        assert "source_ref exceeds 80 lines" in str(exc)
+    else:
+        raise AssertionError("over-broad design citation entered candidate frontier")
+
+
+def test_nonempty_observations_require_nonempty_selection(tmp_path: Path) -> None:
+    state, design, _session = _fixture(tmp_path)
+    ac.save_json(state / "candidate_selection.json", {"candidate_ids": []})
+
+    try:
+        cp.select(state, design, state / "candidate_selection.json")
+    except ValueError as exc:
+        assert "non-empty observations require" in str(exc)
+    else:
+        raise AssertionError("non-empty observations were silently dropped")
+
+
+def test_code_origin_candidate_is_not_rejected_by_architecture_test_metadata(
+    tmp_path: Path,
+) -> None:
+    state, design, _session = _fixture(tmp_path)
+    ac.save_json(state / "architecture_map.json", {
+        "test_surfaces": [{"path": "service.py"}],
+    })
+    plan = ac.load_json(state / "risk_sweep_plan.json")
+    plan["slices"][0].update({
+        "direction": "code_to_design", "document_keys": [],
+        "section_ids": [], "anchor_paths": ["service.py"],
+    })
+    ac.save_json(state / "risk_sweep_plan.json", plan)
+    plan_sha = ac.sha256_file(state / "risk_sweep_plan.json")
+    receipts, errors = ac.load_jsonl(state / "scout_receipts.jsonl")
+    assert errors == []
+    receipts[0].update({
+        "direction": "code_to_design",
+        "risk_sweep_plan_sha256": plan_sha,
+        "assigned_section_ids": [], "reviewed_section_ids": [],
+        "assigned_anchor_paths": ["service.py"],
+        "reviewed_anchor_paths": ["service.py"],
+    })
+    coverage = state / "scout-coverage" / "SCOUT-CONTRACT.json"
+    ac.save_json(coverage, {
+        "sweep_id": "SCOUT-CONTRACT",
+        "reviewed_section_ids": [],
+        "reviewed_anchor_paths": ["service.py"],
+    })
+    receipts[0]["coverage_report_sha256"] = ac.sha256_file(coverage)
+    _write_jsonl(state / "scout_receipts.jsonl", receipts)
+    observations, errors = ac.load_jsonl(state / "risk_observations.jsonl")
+    assert errors == []
+    observations[0]["direction"] = "code_to_design"
+    _write_jsonl(state / "risk_observations.jsonl", observations)
+
+    selected = cp.select(state, design, state / "candidate_selection.json")
+    assert selected["candidate_ids"] == ["OBS-NEGATIVE"]

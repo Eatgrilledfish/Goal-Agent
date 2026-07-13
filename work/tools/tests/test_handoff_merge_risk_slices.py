@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -211,17 +214,13 @@ def test_risk_scope_fields_must_be_arrays(field: str) -> None:
     assert any(f"{field} must be an array" in error for error in errors)
 
 
-def test_risk_scope_arrays_must_have_at_least_one_combined_entry() -> None:
+def test_code_to_design_risk_may_omit_architecture_navigation_ids() -> None:
     item = _risk(
         "RISK-1", "session", "SWEEP-CONTROL",
         boundary_ids=[], plane_ids=[], path_ids=[],
     )
     errors = hm.validate_artifact(item, "risk", "risk (RISK-1)")
-    assert any("code_to_design candidate must identify at least one" in error for error in errors)
-
-    item["parallel_path_ids"] = ["PATH-ALTERNATE"]
-    errors = hm.validate_artifact(item, "risk", "risk (RISK-1)")
-    assert not any("code_to_design candidate must identify at least one" in error for error in errors)
+    assert not any("architecture" in error for error in errors)
 
 
 def test_risk_check_accepts_multi_observation_slice_and_checks_each_context(
@@ -313,8 +312,9 @@ def test_risk_merge_requires_and_records_both_planned_sweeps(
     assert result["validated_sweep_ids"] == sorted(SWEEP_IDS)
     assert result["completed_sweep_ids"] == sorted(SWEEP_IDS)
     assert result["missing_sweep_ids"] == []
-    assert result["closed"] is True
-    assert result["global_coverage_validated"] is True
+    assert result["observation_sweeps_complete"] is True
+    assert result["closed"] is False
+    assert result["global_coverage_validated"] is False
     merged, errors = ac.load_jsonl(output)
     assert errors == []
     assert {item["observation_id"] for item in merged} == {
@@ -341,7 +341,8 @@ def test_risk_merge_accepts_one_true_coupled_sweep(
     assert result["submitted_sweep_ids"] == ["SWEEP-CONTROL"]
     assert result["completed_sweep_ids"] == ["SWEEP-CONTROL"]
     assert result["missing_sweep_ids"] == []
-    assert result["closed"] is True
+    assert result["observation_sweeps_complete"] is True
+    assert result["closed"] is False
     merged, errors = ac.load_jsonl(output)
     assert errors == []
     assert [item["observation_id"] for item in merged] == ["RISK-ONLY"]
@@ -369,24 +370,22 @@ def test_risk_merge_accepts_all_planned_focused_sweeps(
     assert result["submitted_sweep_ids"] == sweep_ids
     assert result["completed_sweep_ids"] == sweep_ids
     assert result["missing_sweep_ids"] == []
-    assert result["closed"] is True
+    assert result["observation_sweeps_complete"] is True
+    assert result["closed"] is False
     merged, errors = ac.load_jsonl(output)
     assert errors == []
     assert len(merged) == 4
 
 
-def test_risk_merge_incrementally_completes_and_replaces_only_submitted_sweep(
+def test_risk_merge_incrementally_publishes_without_global_receipt_closure(
     risk_state: dict[str, object], monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
     handoffs = Path(risk_state["handoffs"])
-    coverage_calls: list[set[str]] = []
 
-    def validate_global_coverage(risks: dict[str, dict], root: Path) -> tuple[list[str], dict]:
-        assert root == risk_state["state"]
-        coverage_calls.append({str(item["sweep_id"]) for item in risks.values()})
-        return [], {}
+    def unexpected_global_coverage(*_args, **_kwargs):
+        pytest.fail("single-sweep merge must not run global receipt closure")
 
-    monkeypatch.setattr(rpv, "validate_risk_coverage", validate_global_coverage)
+    monkeypatch.setattr(rpv, "validate_risk_coverage", unexpected_global_coverage)
 
     ac.save_json(handoffs / "SWEEP-CONTROL.json", [
         _risk("RISK-C-OLD", str(risk_state["session_id"]), "SWEEP-CONTROL"),
@@ -401,7 +400,6 @@ def test_risk_merge_incrementally_completes_and_replaces_only_submitted_sweep(
     assert first["missing_sweep_ids"] == ["SWEEP-PARALLEL"]
     assert first["closed"] is False
     assert first["global_coverage_validated"] is False
-    assert coverage_calls == []
 
     (handoffs / "SWEEP-CONTROL.json").unlink()
     ac.save_json(handoffs / "SWEEP-PARALLEL.json", [
@@ -415,9 +413,9 @@ def test_risk_merge_incrementally_completes_and_replaces_only_submitted_sweep(
     assert second["submitted_sweep_ids"] == ["SWEEP-PARALLEL"]
     assert second["completed_sweep_ids"] == sorted(SWEEP_IDS)
     assert second["missing_sweep_ids"] == []
-    assert second["closed"] is True
-    assert second["global_coverage_validated"] is True
-    assert coverage_calls == [SWEEP_IDS]
+    assert second["observation_sweeps_complete"] is True
+    assert second["closed"] is False
+    assert second["global_coverage_validated"] is False
 
     (handoffs / "SWEEP-PARALLEL.json").unlink()
     ac.save_json(handoffs / "SWEEP-CONTROL.json", [
@@ -431,13 +429,65 @@ def test_risk_merge_incrementally_completes_and_replaces_only_submitted_sweep(
     assert third["submitted_sweep_ids"] == ["SWEEP-CONTROL"]
     assert third["completed_sweep_ids"] == sorted(SWEEP_IDS)
     assert third["missing_sweep_ids"] == []
-    assert third["closed"] is True
+    assert third["closed"] is False
     merged, errors = ac.load_jsonl(output)
     assert errors == []
     assert {item["observation_id"] for item in merged} == {
         "RISK-C-NEW", "RISK-P",
     }
-    assert coverage_calls == [SWEEP_IDS, SWEEP_IDS]
+
+
+def test_concurrent_risk_merges_preserve_both_sweeps(
+    risk_state: dict[str, object], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = Path(risk_state["state"])
+    handoffs = Path(risk_state["handoffs"])
+    control = handoffs / "SCOUT-CONTROL"
+    parallel = handoffs / "SCOUT-PARALLEL"
+    control.mkdir()
+    parallel.mkdir()
+    ac.save_json(control / "SWEEP-CONTROL.json", [
+        _risk("RISK-C", str(risk_state["session_id"]), "SWEEP-CONTROL"),
+    ])
+    ac.save_json(parallel / "SWEEP-PARALLEL.json", [
+        _risk("RISK-P", str(risk_state["session_id"]), "SWEEP-PARALLEL"),
+    ])
+    output = state / "risk_observations.jsonl"
+    ac.atomic_write_jsonl(output, [])
+    original_load_jsonl = ac.load_jsonl
+    delay_guard = threading.Lock()
+    delay_first = {"value": True}
+
+    def delayed_first_load(path: Path):
+        values = original_load_jsonl(path)
+        delay = False
+        if path.resolve() == output.resolve():
+            with delay_guard:
+                if delay_first["value"]:
+                    delay_first["value"] = False
+                    delay = True
+        if delay:
+            time.sleep(0.2)
+        return values
+
+    monkeypatch.setattr(ac, "load_jsonl", delayed_first_load)
+    start = threading.Barrier(2)
+
+    def publish(input_dir: Path) -> dict:
+        start.wait()
+        return hm.merge(
+            input_dir, output, "observation_id",
+            artifact_type="risk", session_id=str(risk_state["session_id"]),
+            context_root=state,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(publish, (control, parallel)))
+
+    merged, errors = original_load_jsonl(output)
+    assert errors == []
+    assert {item["observation_id"] for item in merged} == {"RISK-C", "RISK-P"}
+    assert any(result["observation_sweeps_complete"] is True for result in results)
 
 
 def test_candidate_owned_risk_directory_ignores_invalid_peer_directory(

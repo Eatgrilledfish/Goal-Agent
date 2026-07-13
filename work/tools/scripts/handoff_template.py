@@ -208,13 +208,18 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Create a generic finding handoff scaffold.")
     parser.add_argument("--tasks", required=True)
     parser.add_argument("--claims", required=True)
-    parser.add_argument("--task-id", required=True)
-    parser.add_argument("--output", required=True)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--task-id")
+    mode.add_argument(
+        "--frontier", action="store_true",
+        help="Generate templates for up to two eligible tasks in the earliest open round.",
+    )
+    parser.add_argument("--output")
+    parser.add_argument("--output-dir")
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args(argv)
     tasks_path = Path(args.tasks).resolve()
     claims_path = Path(args.claims).resolve()
-    output = Path(args.output).resolve()
     state_root = tasks_path.parent
     template_root = (state_root / "handoff-templates" / "investigators").resolve()
     if tasks_path != (state_root / "investigation_tasks.jsonl").resolve():
@@ -229,27 +234,108 @@ def main(argv: list[str] | None = None) -> int:
             "error": "--claims must be the canonical state design_claims.jsonl",
         }))
         return 2
-    if output.parent != template_root:
-        print(json.dumps({
-            "passed": False,
-            "error": f"output must be directly under {template_root}",
-        }))
-        return 2
-    if output.name != f"{args.task_id}.json":
-        print(json.dumps({
-            "passed": False,
-            "error": f"output filename must be {args.task_id}.json",
-        }))
-        return 2
-    if output.exists() and not args.force:
-        print(json.dumps({"passed": False, "error": "output already exists"}))
-        return 2
+    if args.frontier:
+        if args.output or not args.output_dir:
+            print(json.dumps({
+                "passed": False,
+                "error": "--frontier requires --output-dir and does not accept --output",
+            }))
+            return 2
+        output_dir = Path(args.output_dir).resolve()
+        if output_dir != template_root:
+            print(json.dumps({
+                "passed": False,
+                "error": f"output-dir must be the canonical template root: {template_root}",
+            }))
+            return 2
+    else:
+        if not args.output or args.output_dir:
+            print(json.dumps({
+                "passed": False,
+                "error": "--task-id requires --output and does not accept --output-dir",
+            }))
+            return 2
+        output = Path(args.output).resolve()
+        if output.parent != template_root:
+            print(json.dumps({
+                "passed": False,
+                "error": f"output must be directly under {template_root}",
+            }))
+            return 2
+        if output.name != f"{args.task_id}.json":
+            print(json.dumps({
+                "passed": False,
+                "error": f"output filename must be {args.task_id}.json",
+            }))
+            return 2
+        if output.exists() and not args.force:
+            print(json.dumps({"passed": False, "error": "output already exists"}))
+            return 2
     try:
         tasks = _index_jsonl(tasks_path, "task_id")
         rounds = _ordered_rounds(state_root / "investigation_rounds.jsonl")
+        claims = _index_jsonl(claims_path, "claim_id")
     except (OSError, ValueError) as exc:
         print(json.dumps({"passed": False, "error": str(exc)}))
         return 1
+
+    if args.frontier:
+        round_id, eligible_task_ids = _eligible_pending_frontier(tasks, rounds)
+        prepared: list[tuple[str, Path, dict[str, Any]]] = []
+        validation_errors: dict[str, list[str]] = {}
+        try:
+            for task_id in eligible_task_ids:
+                _traces, task_errors = _current_task_validation(state_root, task_id)
+                if task_errors:
+                    validation_errors[task_id] = task_errors
+                    continue
+                task = tasks[task_id]
+                claim = claims.get(str(task.get("claim_id") or ""))
+                if claim is None:
+                    validation_errors[task_id] = [
+                        f"task references unknown claim_id: {task.get('claim_id')}"
+                    ]
+                    continue
+                output = template_root / f"{task_id}.json"
+                if output.exists() and not args.force:
+                    validation_errors[task_id] = [f"template already exists: {output}"]
+                    continue
+                prepared.append((task_id, output, finding_template(task, claim)))
+        except (OSError, ValueError) as exc:
+            print(json.dumps({"passed": False, "error": str(exc)}))
+            return 1
+        if validation_errors:
+            print(json.dumps({
+                "passed": False,
+                "mode": "frontier",
+                "round_id": round_id,
+                "task_ids": eligible_task_ids,
+                "error": (
+                    "current task plan and lifecycle validation is required "
+                    "before frontier template creation"
+                ),
+                "validation_errors": validation_errors,
+            }))
+            return 3
+        outputs: list[dict[str, str]] = []
+        for task_id, output, template in prepared:
+            ac.save_json(output, template)
+            outputs.append({
+                "task_id": task_id,
+                "finding_id": str(template["finding_id"]),
+                "output": str(output),
+            })
+        print(json.dumps({
+            "passed": True,
+            "mode": "frontier",
+            "round_id": round_id,
+            "task_ids": eligible_task_ids,
+            "count": len(outputs),
+            "outputs": outputs,
+        }))
+        return 0
+
+    assert args.task_id is not None
     _, validation_errors = _current_task_validation(state_root, args.task_id)
     if validation_errors:
         print(json.dumps({
@@ -259,7 +345,6 @@ def main(argv: list[str] | None = None) -> int:
         }))
         return 3
     try:
-        claims = _index_jsonl(claims_path, "claim_id")
         task = tasks.get(args.task_id)
         if not task:
             raise ValueError(f"unknown task_id: {args.task_id}")
