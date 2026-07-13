@@ -177,7 +177,7 @@ def _validate(plan: dict, architecture: dict) -> tuple[list[str], dict]:
     )
 
 
-def test_accepts_balanced_multi_document_design_slice() -> None:
+def test_rejects_multi_document_design_slice() -> None:
     architecture = _architecture()
     inventory = _inventory()
     inventory["document_groups"].append({
@@ -210,7 +210,7 @@ def test_accepts_balanced_multi_document_design_slice() -> None:
         inventory_digest=INVENTORY_DIGEST,
     )
 
-    assert errors == []
+    assert any("at most 1 documents" in error for error in errors)
     assert index["covered_document_keys"] == {"design", "second-design"}
 
 
@@ -233,14 +233,13 @@ def test_accepts_one_large_document_split_across_bounded_design_slices() -> None
     }
     plan = _valid_plan(architecture)
     plan["slices"][0]["document_keys"] = ["large-design"]
-    plan["slices"][0]["section_ids"] = [
-        section["section_id"] for section in large_sections[:4]
-    ]
-    plan["slices"].insert(1, {
-        **plan["slices"][0],
-        "sweep_id": "DESIGN-SCOUT-TAIL",
-        "section_ids": [large_sections[4]["section_id"]],
-    })
+    plan["slices"][0]["section_ids"] = [large_sections[0]["section_id"]]
+    for index, section in enumerate(large_sections[1:], start=1):
+        plan["slices"].insert(index, {
+            **plan["slices"][0],
+            "sweep_id": f"DESIGN-SCOUT-{index}",
+            "section_ids": [section["section_id"]],
+        })
 
     errors, index = validator.validate_plan(
         plan,

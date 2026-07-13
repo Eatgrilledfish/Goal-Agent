@@ -135,9 +135,9 @@ def test_builder_covers_every_design_group_and_uses_non_overlapping_code_anchors
     large_slices = [
         item for item in design_slices if "doc-large" in item["document_keys"]
     ]
-    assert len(large_slices) == 1
+    assert len(large_slices) == 3
     assert {
-        section_id for section_id in large_slices[0]["section_ids"]
+        section_id for item in large_slices for section_id in item["section_ids"]
         if section_id.startswith("SECTION-LARGE-")
     } == {f"SECTION-LARGE-{index:02d}" for index in range(11)}
     assert {
@@ -294,7 +294,9 @@ def test_builder_splits_large_design_documents_without_duplicate_sections(
         for section_id in item["section_ids"]
     )
 
-    assert len([item for item in design_slices if "large" in item["document_keys"]]) == 3
+    assert len([item for item in design_slices if "large" in item["document_keys"]]) == len(
+        large_sections
+    )
     assert set(occurrences) == set(section_spans)
     assert set(occurrences.values()) == {1}
     assert all(

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Build a complete bidirectional semantic-scout plan without model routing.
 
-Design sections are assigned in balanced, bounded slices.  A scout may own a
-small number of documents, but every document-local range remains contiguous
+Design sections are assigned in balanced, bounded slices.  A scout owns one
+document-local range, and every such range remains contiguous
 and every required section has exactly one owner.
 Code scopes are partitioned by real file count, so a large imported tree never
 masquerades as one reviewable anchor.  The helper does not rank requirements
@@ -21,8 +21,8 @@ import agent_common as ac
 import risk_sweep_plan_validator as validator
 
 
-MAX_DESIGN_SLICE_LINES = 3500
-MAX_DOCUMENTS_PER_DESIGN_SCOUT = 2
+MAX_DESIGN_SLICE_LINES = 1200
+MAX_DOCUMENTS_PER_DESIGN_SCOUT = 1
 MAX_CODE_SLICE_FILES = 1200
 
 
@@ -281,7 +281,7 @@ def build(state_root: Path) -> dict[str, Any]:
             "anchor_paths": [],
             "review_lenses": lenses,
             "scope_rationale": (
-                "Own balanced bounded section ranges from at most two design documents "
+                "Own one bounded contiguous design-document range "
                 "and search the complete code repository for reachable behavior."
             ),
         })

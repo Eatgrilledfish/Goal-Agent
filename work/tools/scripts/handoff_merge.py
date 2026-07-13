@@ -697,7 +697,11 @@ def validate_artifact(item: dict[str, Any], artifact_type: str, label: str) -> l
             errors.append(f"{label}: design_requirement must be an object")
         else:
             errors.extend(_require(
-                requirement, DESIGN_REQUIREMENT_FIELDS,
+                requirement,
+                tuple(
+                    field for field in DESIGN_REQUIREMENT_FIELDS
+                    if field not in {"exceptions", "ambiguities"}
+                ),
                 f"{label}: design_requirement",
             ))
             source_ref = requirement.get("source_ref")

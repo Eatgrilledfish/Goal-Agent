@@ -59,6 +59,10 @@ def receipt_state(
             },
         }, []),
     )
+    monkeypatch.setattr(
+        scout_receipt, "validate_coverage_contract",
+        lambda state_root, sweep, candidates, coverage: None,
+    )
     return state, handoffs
 
 

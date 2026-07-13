@@ -50,14 +50,9 @@ ARTIFACT_NAMES = {
 }
 
 PORTFOLIO_LENSES = [
-    "collection completeness and hidden fixed bounds",
-    "timing, delay, retry, and unsolicited behavior",
-    "optional, recommended, and conditional behavior",
-    "declared capability versus registration, build, and total absence",
-    "chains, nested records, and repeated element traversal",
-    "routing or ownership changes across subsystem boundaries",
-    "parallel implementations, imported code, and fast/slow path parity",
-    "error handling, state transitions, invariants, and configuration-dependent behavior",
+    "contract_mechanics",
+    "temporal_conditional",
+    "routing_capability",
 ]
 
 EXPLORATION_MODES = [
@@ -414,8 +409,8 @@ def loop_contract(
                 "owner": "risk-explorer",
                 "output": [artifacts["risk_sweep_plan"], artifacts["risk_observations"]],
                 "done_when": (
-                    "Requirement-centric design-to-code scouts own every in-scope document group and search the whole repository; "
-                    "non-overlapping code-to-design scouts own the mapped code anchors. Every scout records completion even when it emits zero candidates, and only suspected mismatches enter the candidate ledger."
+                    "Every bounded design slice is first converted by a fresh design-only model into a source-bound atomic obligation queue, then a fresh design-to-code scout compares every queued obligation against the whole repository; "
+                    "non-overlapping code-to-design scouts own the mapped code anchors. Every scout records per-obligation or per-anchor completion even when it emits zero candidates, and only suspected mismatches enter the candidate ledger."
                 ),
             },
             {
@@ -532,10 +527,9 @@ def loop_contract(
         "handoff_integrity": {
             "max_concurrent_subagent_tasks": 2,
             "risk_discovery_batch": (
-                "After risk-plan-check, keep at most two tasks active. Start one design-inventory task and one risk sweep; "
-                "as either completes, fill the free slot with the next disjoint risk slice or bounded design-resolution task. "
-                "Every sweep owns a disjoint primary anchor scope, receives assigned design sections plus the complete lens portfolio, and writes one isolated handoff with at most eight design-linked observations; architecture IDs may repeat only when they have local paths in each scope. Observations are trace candidates, "
-                "not an exact restatement of every assigned ID or lens."
+                "After risk-plan-check, keep at most two semantic tasks active and only parallelize disjoint design sections or code anchors. "
+                "For each design slice, a fresh extractor reads only the assigned source and emits atomic obligations; a second fresh scout consumes every materialized obligation in order and searches the whole repository. "
+                "For each code slice, a fresh scout consumes every assigned primary anchor in order and retrieves applicable design. Each task writes isolated semantic output with at most twelve suspected mismatches; deterministic helpers bind source, scope, session, and digests."
             ),
             "parallel_write_rule": "Each risk/investigator/probe/critic task writes one isolated JSON file under state/handoffs; never append to a shared JSONL from parallel tasks.",
             "merge_helper": str(Path(paths["state_root"]).parents[1] / "work" / "tools" / "scripts" / "handoff_merge.py"),
@@ -668,9 +662,8 @@ def loop_contract(
                 "task/finding or records the concrete unmapped boundary as a coverage gap; a gap does not invalidate an already confirmed candidate."
             ),
             "risk_backtracking_rule": (
-                "Fresh design-guided trace explorers read their assigned inventory sections and inspect every assigned boundary and plane, emitting only concrete code/design alignment questions. "
-                "Every observation names the design sections whose behavior it traces and explains the semantic alignment. "
-                "A code-to-design task references a validated observation sharing a boundary and plane; irrelevant or compliant observations do not require tasks."
+                "Fresh design-only extractors turn every assigned source range into atomic implementable obligations without seeing code. Fresh explorers then compare every obligation, or every assigned code anchor, and record candidate/no-mismatch coverage in exact queue order. "
+                "A candidate must preserve the source-bound requirement and concrete code lead; irrelevant or compliant comparisons do not enter the candidate ledger."
             ),
             "anti_shortcut": "Prior maturity, upstream origin, popularity, and a few compliant samples are not evidence that the supplied implementation is fully consistent.",
             "dynamic_probe": {

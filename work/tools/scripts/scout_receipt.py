@@ -12,6 +12,76 @@ import agent_common as ac
 import risk_sweep_plan_validator as rpv
 
 
+def validate_coverage_contract(
+    state_root: Path, sweep: dict[str, Any], candidates: list[dict[str, Any]],
+    coverage: dict[str, Any],
+) -> None:
+    """Revalidate the compact semantic work queue before recording completion."""
+    candidate_ids = {
+        str(item.get("observation_id") or "") for item in candidates
+        if isinstance(item, dict) and item.get("observation_id")
+    }
+    direction = sweep.get("direction")
+    if direction == "design_to_code":
+        sweep_id = str(sweep.get("sweep_id") or "")
+        queue_path = state_root / "design-obligations" / f"{sweep_id}.json"
+        if not queue_path.is_file() or queue_path.is_symlink():
+            raise ValueError("design scout completion requires a current obligation queue")
+        if coverage.get("obligation_queue_sha256") != ac.sha256_file(queue_path):
+            raise ValueError("coverage obligation queue digest is stale")
+        queue = ac.load_json(queue_path)
+        obligations = queue.get("obligations")
+        if not isinstance(obligations, list):
+            raise ValueError("design obligation queue is invalid")
+        expected = [item.get("obligation_id") for item in obligations]
+        checks = coverage.get("obligation_checks")
+        if not isinstance(checks, list) or [
+            item.get("obligation_id") if isinstance(item, dict) else None
+            for item in checks
+        ] != expected:
+            raise ValueError("obligation_checks must exactly follow the design queue")
+        bound = [
+            candidate_id for item in checks if isinstance(item, dict)
+            for candidate_id in item.get("candidate_ids", [])
+        ]
+        if len(bound) != len(set(bound)) or set(bound) != candidate_ids:
+            raise ValueError("obligation_checks must bind every candidate exactly once")
+        origin = {
+            str(item.get("observation_id")): item.get("origin_obligation_id")
+            for item in candidates
+        }
+        if any(
+            origin.get(candidate_id) != item.get("obligation_id")
+            for item in checks if isinstance(item, dict)
+            for candidate_id in item.get("candidate_ids", [])
+        ):
+            raise ValueError("obligation_checks bind a candidate to the wrong obligation")
+    elif direction == "code_to_design":
+        expected = list(sweep.get("anchor_paths", []))
+        checks = coverage.get("anchor_checks")
+        if not isinstance(checks, list) or [
+            item.get("anchor_path") if isinstance(item, dict) else None
+            for item in checks
+        ] != expected:
+            raise ValueError("anchor_checks must exactly follow assigned code anchors")
+        bound = [
+            candidate_id for item in checks if isinstance(item, dict)
+            for candidate_id in item.get("candidate_ids", [])
+        ]
+        if len(bound) != len(set(bound)) or set(bound) != candidate_ids:
+            raise ValueError("anchor_checks must bind every candidate exactly once")
+        origin = {
+            str(item.get("observation_id")): item.get("origin_anchor_path")
+            for item in candidates
+        }
+        if any(
+            origin.get(candidate_id) != item.get("anchor_path")
+            for item in checks if isinstance(item, dict)
+            for candidate_id in item.get("candidate_ids", [])
+        ):
+            raise ValueError("anchor_checks bind a candidate to the wrong anchor")
+
+
 def _read_values(path: Path) -> list[dict[str, Any]]:
     if not path.is_file() or path.is_symlink():
         raise ValueError(f"scout handoff must be a regular file: {path}")
@@ -77,6 +147,7 @@ def record(
         raise ValueError("design_to_code scout cannot own code anchor paths")
     if direction == "code_to_design" and assigned_section_ids:
         raise ValueError("code_to_design scout cannot own design sections")
+    validate_coverage_contract(state_root, sweep, values, coverage)
     state = ac.load_json(state_root / "agent_loop_state.json")
     plan_path = state_root / "risk_sweep_plan.json"
     receipt = {

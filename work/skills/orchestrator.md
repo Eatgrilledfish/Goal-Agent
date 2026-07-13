@@ -16,7 +16,7 @@
 
 从 review code root 建立轻量 `architecture_map.json`，只记录真实入口、subsystem、owned/imported/adapter/fast/slow plane、边界、配置/能力/构建/测试 surface 和 parallel paths。它只用于补充 code-origin 导航，不能限制 design-origin 全仓搜索、产生设计义务或成为task合法条件。运行 `goal_runner.py architecture-check` 后不得再修改。
 
-Design inventory 与 scout plan均由 helper生成。Design plan根据当前输入规模生成足够多的slices，每个slice硬上限3500行且最多包含2个文档；每个document-local range连续，大文档可拆成多个连续chunks分给不同slice，同一slice不含同文档的两个不连续chunk，全部in-scope sections全局唯一owner。Code plan按architecture map中的实际scope递归拆成互斥anchors，每个slice最多覆盖1200个文件；不得用粗粒度根目录替代必要的递归分片。`test_surfaces`只作导航，不能删除plane、ownership或candidate：
+Design inventory 与 scout plan均由 helper生成。每个design slice只含1个文档中不超过1200行的连续sections，全部in-scope sections全局唯一owner。Code plan按architecture map递归拆成互斥anchors，每slice最多1200个文件。Architecture只导航，不能限制design-origin全仓搜索或产生义务：
 
 ```bash
 python3 ${WORK_ROOT}/tools/scripts/design_source_materializer.py \
@@ -35,9 +35,11 @@ python3 ${WORK_ROOT}/tools/scripts/goal_runner.py risk-plan-check \
 
 ## Scouts
 
-按 plan 以最多两个并发 fresh `risk-explorer` 运行。每个design scout完整读取自己不超过3500行、最多2个文档的document-local连续chunks；每个code scout完整检查自身互斥anchors覆盖的不超过1200个文件，遵循 `work/skills/risk-explorer.md`。Catalog、architecture和测试缺失不能产生runtime mismatch候选。Scout每slice最多输出12条原子线索；原子设计义务加真实代码lead或结构化absence lead及最低限度反证即可形成`uncertain`候选。不要让scout在raw阶段穷尽入口、替代和补偿闭环，完整证明留给investigator/critic。Scout只写handoff与coverage report；check/merge/receipt/checkpoint均由你执行。
+按 plan最多运行两个语义Task。Design slice先启动fresh `obligation-extractor`遵循`${WORK_ROOT}/skills/obligation-extractor.md`，只写`${STATE_ROOT}/semantic/obligations/${SWEEP_ID}.json`；每个assigned section必须产出义务或显式no-obligation原因。你调用`obligation_queue.py`生成source-bound队列。随后另一个fresh `risk-explorer`严格逐义务比较。Code slice直接启动fresh risk-explorer并逐anchor比较。角色只写semantic candidates/coverage；你调用`scout_materializer.py`注入session、digest、scope和design requirement，再check/merge/receipt。不得让模型复制机械envelope。
 
-非空 handoff：先 `handoff_merge.py --check-file`，再仅 merge该 scout目录。空 handoff不check、不merge。每个scout在merge目录外写coverage report，design scout逐值列出plan中的全部section IDs，code scout逐值列出全部anchor paths。非空handoff运行：
+准确的obligation和scout materializer命令逐值使用`INSTRUCTION.md`第5节。Catalog、architecture和测试缺失不能产生runtime mismatch候选。Raw scout只需真实代码lead或结构化absence lead与最低限度反证，完整证明留给investigator/critic。
+
+非空 handoff：先 `handoff_merge.py --check-file`，再仅 merge该 scout目录。空 handoff不check、不merge。每个scout在merge目录外写coverage report；design scout按queue顺序逐值列出全部obligation IDs，code scout按plan顺序逐值列出全部anchor paths。非空handoff运行：
 
 ```bash
 python3 ${WORK_ROOT}/tools/scripts/scout_receipt.py \

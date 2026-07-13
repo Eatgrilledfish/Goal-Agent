@@ -443,7 +443,7 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
         task_lenses = (
             lenses[index - 1::count]
             if count >= 3 else lenses[(index - 1) * 2:index * 2]
-        )
+        ) or [lenses[(index - 1) % len(lenses)]]
         candidate = {
             "observation_id": f"RISK-API-{index:03d}",
             "session_id": workspace["session_id"],
@@ -612,7 +612,7 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
         task_lenses = (
             lenses[index - 1::count]
             if count >= 3 else lenses[(index - 1) * 2:index * 2]
-        )
+        ) or [lenses[(index - 1) % len(lenses)]]
         task_mode = (
             "design-to-code obligation tracing"
             if candidate["direction"] == "design_to_code"
@@ -2324,7 +2324,7 @@ def test_instruction_allows_valid_candidate_to_merge_without_waiting_for_its_pee
 def test_instruction_requires_risk_plan_gate_before_parallel_risk_tasks():
     instruction = (ROOT / "INSTRUCTION.md").read_text(encoding="utf-8")
     gate_position = instruction.index("goal_runner.py risk-plan-check")
-    launch_position = instruction.index("按 plan最多并发两个 fresh `risk-explorer`")
+    launch_position = instruction.index("按 plan最多并发两个语义Task")
     assert gate_position < launch_position
     assert "primary code anchors" in instruction[:launch_position]
     assert "不同 design section ownership" in instruction[:launch_position]
@@ -2350,8 +2350,8 @@ def test_discovery_policy_uses_design_guided_trace_candidates_without_quotas():
     assert "所有current receipts完成前禁止 candidate selection" in orchestrator
     assert "design_section_ids" in risk
     assert "最多 12 个疑似差异 ID" in orchestrator
-    assert "不要为了完成 slice 填充候选" in risk
-    assert "一个 scout 可以合法返回 `[]`" in risk
+    assert "不要为了完成slice填充候选" in risk
+    assert "整个slice也可为零" in risk
     assert "supplied design" in instruction
     assert "evidence" in skill.lower()
 

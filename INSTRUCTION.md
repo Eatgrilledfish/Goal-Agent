@@ -150,19 +150,40 @@ python3 ${WORK_ROOT}/tools/scripts/session_event.py \
   --outcome architecture_map_validated --stop-reason bootstrap_gates_passed
 ```
 
-Inventory和scout plan不由模型手写。Inventory按真实文档标题边界生成连续section；Plan根据当前输入规模生成足够多的design slices，每个slice硬上限3500行且最多包含2个文档。每个document-local range必须连续；大文档可拆成多个连续chunk分给不同slice，同一slice不能包含同一文档的两个不连续chunk，全部in-scope sections在全局只有一个owner。Code plan依据architecture map中的实际scope递归拆分为互斥的primary anchors，每个code slice覆盖的文件不超过1200个；不得用粗粒度根目录替代必要的递归分片。`test_surfaces`只作导航提示，不能删除implementation plane、代码ownership或candidate。不得把超过上述边界的文档或代码范围塞给同一个scout。
+Inventory和scout plan不由模型手写。Inventory按真实文档标题边界生成连续section；每个design slice只拥有1个文档中不超过1200行的连续范围，大文档可拆分，全部in-scope sections全局唯一owner。Code plan依据architecture map递归拆成互斥primary anchors，每slice不超过1200个文件。Architecture只导航，不能限制design-origin全仓搜索或产生设计义务。
 
 ## 5. 双向 Semantic Scouts
 
-按 plan最多并发两个 fresh `risk-explorer`，完整遵循 `${WORK_ROOT}/skills/risk-explorer.md`。Orchestrator在每个Task启动前保存 `${SCOUT_STARTED_AT}` 和返回的 `${SCOUT_PROVIDER_SESSION_ID}`；scout只写自己的 `<SWEEP_ID>.json` 和coverage report，下面所有helper命令都由orchestrator执行：
+按 plan最多并发两个语义Task。Design-to-code先用fresh `obligation-extractor`只读设计并生成原子义务semantic文件，再由helper绑定源码、ID、session和digest；随后另一个fresh `risk-explorer`逐义务比较代码。Code-to-design直接使用fresh `risk-explorer`。任何角色都不写机械envelope或运行helper。
 
-- design-to-code scout拥有总计不超过3500行、来自最多2个文档的document-local chunks；每个chunk内的`section_ids`连续，同一slice不含同一文档的两个不连续chunk，所有section在全局只有一个owner。Scout逐段提炼可观察要求，并可搜索整个代码仓；
+- design-to-code extractor拥有1个文档中不超过1200行的连续sections，保留mandatory、recommended、declared capability和明确optional义务；不读代码。每个assigned section必须至少产出一个义务，或在`no_obligation_sections`中给出非空原因，不能静默跳过。Scout严格按materialized义务队列逐条搜索完整代码仓；
 - code-to-design scout独占递归划分后的primary code anchors，该slice覆盖不超过1200个文件，并可从完整design inventory动态检索规范；
 - 只输出 direct conflict、结构化能力缺失、cross-plane mismatch或有证据的uncertain；
 - catalog、architecture map、测试缺失和普通代码质量不能成为设计义务；catalog只证明正文来源，测试代码只作静态反证线索；
-- raw scout每个slice最多输出12条线索。每条只需绑定原子设计义务，以及真实代码lead或指向入口、dispatch、registration、build/config邻近位置的结构化absence lead，并完成最低限度的candidate-specific反证，即可形成`uncertain`候选；raw阶段不要求闭合完整入口链、所有替代路径或补偿机制；
+- raw scout每个slice最多输出12条线索。Design候选只引用obligation ID，requirement/source由helper投影；code候选提供设计义务。真实代码lead或结构化absence lead和最低限度反证即可形成`uncertain`；
+- 当父能力已实现而明确MAY/optional分支没有机制时，输出标注为“非MUST违反”的optional design-gap候选；不能仅因MAY允许省略就记为`no_mismatch`；
 - 完整的可达入口、调用链、替代/补偿路径、能力缺失和误报排除证明由后续investigator完成，并由fresh critic独立挑战；
-- 合规实现不输出，零候选合法。
+- 合规实现不输出，零候选合法；但design义务或code anchor必须在semantic coverage中逐项记录candidate/no_mismatch、实际搜索和countercheck。
+
+Design-to-code先执行：
+
+```bash
+python3 ${WORK_ROOT}/tools/scripts/obligation_queue.py \
+  --state-root ${STATE_ROOT} --sweep-id ${SWEEP_ID} \
+  --input ${STATE_ROOT}/semantic/obligations/${SWEEP_ID}.json \
+  --output ${STATE_ROOT}/design-obligations/${SWEEP_ID}.json
+```
+
+Risk Explorer返回semantic candidates和semantic coverage后，由orchestrator执行：
+
+```bash
+python3 ${WORK_ROOT}/tools/scripts/scout_materializer.py \
+  --state-root ${STATE_ROOT} --sweep-id ${SWEEP_ID} \
+  --semantic-candidates ${STATE_ROOT}/semantic/scouts/${SWEEP_ID}.candidates.json \
+  --semantic-coverage ${STATE_ROOT}/semantic/scouts/${SWEEP_ID}.coverage.json \
+  --handoff ${STATE_ROOT}/handoffs/risks/${SWEEP_ID}/${SWEEP_ID}.json \
+  --coverage-output ${STATE_ROOT}/scout-coverage/${SWEEP_ID}.json
+```
 
 非空 `<SWEEP_ID>.json` 先check再merge：
 
@@ -178,17 +199,13 @@ python3 ${WORK_ROOT}/tools/scripts/handoff_merge.py \
   --report ${LOG_ROOT}/trace/risk-merge-${SWEEP_ID}.json
 ```
 
-每个scout还要在merge目录外写 `${STATE_ROOT}/scout-coverage/${SWEEP_ID}.json`。这不是候选或合规结论，只是逐值声明实际读完的分配范围：
+Canonical coverage由helper生成。Design包含按queue顺序的`obligation_checks`和queue digest；code包含按plan顺序的`anchor_checks`。两者同时投影实际reviewed scope。模型只写slice内唯一`candidate_key`以及各check的disposition、candidate keys、搜索摘要和countercheck；helper按sweep生成全局稳定`observation_id`并投影canonical candidate IDs。
 
 ```json
-{
-  "sweep_id":"当前SWEEP_ID",
-  "reviewed_section_ids":["design-to-code逐值复制slice.section_ids"],
-  "reviewed_anchor_paths":["code-to-design逐值复制slice.anchor_paths"]
-}
+{"sweep_id":"helper注入","reviewed_section_ids":[],"reviewed_anchor_paths":[],"obligation_checks或anchor_checks":[]}
 ```
 
-Helper会把该slice全部assigned section IDs或anchor paths与coverage report逐值核对；未精确覆盖分配范围不能complete。非空handoff在check和merge成功后执行：
+Helper会核对全部assigned scope、每个义务/anchor以及所有candidate恰好绑定一次；未精确闭合不能complete。非空handoff在check和merge成功后执行：
 
 ```bash
 python3 ${WORK_ROOT}/tools/scripts/scout_receipt.py \
