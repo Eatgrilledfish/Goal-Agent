@@ -7,6 +7,7 @@
 - Orchestrator：发现输入、建轻量 architecture map、调度与调用确定性 helper；不代替专业角色写语义结论。
 - Obligation Extractor：只读一个有界设计切片，把可实现的规范拆成source-bound原子义务，不读取代码或判断差异。
 - Semantic Scout：逐条消费原子义务队列，或从互斥代码 anchors 反向检索设计，只输出有差异信号的原子候选。
+- Negative-Coverage Reviewer：每个最多4项的blind batch使用独立fresh session复核；不读取原disposition或scout reasoning，逐项先搜索再窄窗口取证，并结构化记录执行入口、推进、guard/bound、终止、剩余工作和补偿反查；只接受设计原文明示的适用域例外，证据充分后立即结束当前item，质疑项重新进入候选链路。
 - Spec Critic：只读设计，验证候选中的规范引用、强度、原子性和适用性。
 - Code Investigator：沿候选锚点证明实际行为和反证，输出 contradiction/satisfied/uncertain。
 - Evidence Critic：fresh session 独立挑战每个 finding。
@@ -18,7 +19,7 @@
 
 1. 输入语义来自当前 design/code。禁止读取公开答案、旧 result 或以 issue 数量决定候选。
 2. Design-to-code scout 搜索整个代码仓，不能被预先 architecture map 裁剪。Design plan由当前输入规模推导，每个slice硬上限1200行且只包含1个文档的连续range；大文档可拆成多个连续chunks，全部in-scope sections全局唯一owner。Code plan按architecture map中的实际scope递归拆成互斥primary anchors，每个code slice最多覆盖1200个文件；不得用粗粒度根目录替代必要的递归分片。
-3. Design slice先由fresh extractor完整生成原子义务队列，再由另一个fresh scout逐义务对照代码。Scout只输出疑似不一致，零候选合法；receipt必须精确绑定queue中的每个obligation或plan中的每个anchor，所有current plan receipts完成前不能全局选择候选。
+3. Design slice先由fresh extractor完整生成原子义务队列，再由另一个fresh scout逐义务对照代码。之后helper把所有未产出候选的比较单元切成每批最多4项的source-only blind batches；每批由不同fresh reviewer独立复核，不看到原disposition、candidate或scout reasoning，并逐项先搜索再读取窄源码窗口，形成candidate所需证据和一次定向替代/补偿反查充分后立即结束当前item。质疑或证据不足必须以candidate进入普通调查链路，不能因Scout已达到12条初始上限而丢弃；全局selector随后仍最多选择12项深入调查。Receipt必须证明scout与所有review sessions互异、各review sessions彼此互异且review完整，所有current plan receipts完成前不能全局选择候选。
 4. Catalog只定位/追溯正文，architecture只导航代码，二者都不能产生设计义务。测试缺失不是运行实现缺失；测试代码只作静态反证线索，本次链路不执行dynamic probe。
 5. 模型只写语义字段，不复制session、sweep、digest、direction或architecture IDs。Helper从current plan与source-bound obligation queue注入机械envelope，并把requirement、source range、code anchors、direction 与 mismatch signal逐值投影到claim和task；orchestrator不得重写。
 6. 搜索无命中、构建失败或环境失败不单独证明能力缺失。Raw scout可凭原子设计义务、真实代码lead或结构化absence lead和最低限度反证输出`uncertain`候选，每slice最多12条；不在raw阶段强制闭合完整入口、替代或补偿路径。能力缺失的入口、构建、注册、配置、邻近能力、依赖和误报闭环由investigator证明，并由critic独立挑战。
@@ -72,11 +73,11 @@ finish_scouts
 → run_final
 ```
 
-确定性 helper 只校验/物化 provenance、source authority、scope ownership和状态，不做 semantic ranking 或 verdict。全链路使用同一组`contract_mechanics`、`temporal_conditional`、`routing_capability` review vocabulary，不再维护另一套行为×lens矩阵。模型只在以下位置做判断：原子义务提取、逐义务/anchor差异候选、最多 12 个 candidate ID 排序、spec review、代码调查、反证和最终状态映射。
+确定性 helper 只校验/物化 provenance、source authority、scope ownership、fresh-session差异和状态，不做 semantic ranking 或 verdict。全链路使用同一组`contract_mechanics`、`temporal_conditional`、`routing_capability` review vocabulary，不再维护另一套行为×lens矩阵。模型只在以下位置做判断：原子义务提取、逐义务/anchor差异候选、negative coverage独立反证、最多 12 个 candidate ID 排序、spec review、代码调查、反证和最终状态映射。
 
 ## Candidate 与调查
 
-Design slice先严格遵循`work/skills/obligation-extractor.md`生成义务，再由`work/skills/risk-explorer.md`逐义务比较；code slice由同一scout逐anchor反查。候选全部完成后，orchestrator只写：
+Design slice先严格遵循`work/skills/obligation-extractor.md`生成义务，再由`work/skills/risk-explorer.md`逐义务比较；code slice由同一scout逐anchor反查。每个slice在materialize前必须由多个按需fresh `negative-coverage-reviewer.md`逐blind batch完成独立复核与helper reconciliation。候选全部完成后，orchestrator只写：
 
 ```json
 {"candidate_ids":["按证据强度排序的 observation_id，最多12个"]}

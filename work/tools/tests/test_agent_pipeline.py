@@ -544,6 +544,10 @@ def populate_handoffs(workspace: dict[str, Path | str], count: int = 4, bad_quot
             "risk_sweep_plan_sha256": risk_plan_digest,
             "handoff_sha256": ac.sha256_file(handoff), "status": "complete",
             "coverage_report_sha256": ac.sha256_file(coverage_report),
+            "negative_review_packet_sha256": "b" * 64,
+            "negative_review_sha256": "c" * 64,
+            "scout_provider_session_id": f"provider-scout-{sweep_id}",
+            "reviewer_provider_session_ids": [f"provider-review-{sweep_id}"],
             "candidate_count": len(candidates),
             "candidate_ids": [item["observation_id"] for item in candidates],
             "assigned_section_ids": list(sweep["section_ids"]),
@@ -1255,7 +1259,7 @@ def test_prepare_is_semantic_neutral_and_writes_agent_contract(workspace):
     assert "paths" not in design_manifest
     assert "code_root" not in json.dumps(design_manifest)
     assert contract["execution_model"] == "opencode-owned-model-driven-loop"
-    assert contract["contract_version"] == 20
+    assert contract["contract_version"] == 21
     assert contract["handoff_integrity"]["max_concurrent_subagent_tasks"] == 2
     assert contract["tool_protocol"]["agent_event_contract"]["required_fields"] == [
         "event", "role", "phase", "scope_id", "scope",

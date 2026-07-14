@@ -863,11 +863,6 @@ def validate_sweep_coverage(
     sweep = index.get("slices", {}).get(sweep_id)
     if not isinstance(sweep, dict):
         return [f"risk sweep {sweep_id}: unknown sweep_id"]
-    if len(items) > MAX_OBSERVATIONS_PER_SWEEP:
-        errors.append(
-            f"risk sweep {sweep_id}: may emit at most "
-            f"{MAX_OBSERVATIONS_PER_SWEEP} high-information observations"
-        )
     foreign = sorted({
         str(item.get("sweep_id") or "") for item in items
         if item.get("sweep_id") != sweep_id
@@ -933,6 +928,26 @@ def _completed_scout_receipts(
             or any(character not in "0123456789abcdef" for character in coverage_digest)
         ):
             errors.append(f"{label}: coverage_report_sha256 must be a SHA-256 digest")
+            continue
+        review_packet_digest = receipt.get("negative_review_packet_sha256")
+        review_digest = receipt.get("negative_review_sha256")
+        if any(
+            not isinstance(value, str) or len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+            for value in (review_packet_digest, review_digest)
+        ):
+            errors.append(f"{label}: negative review digests must be SHA-256 values")
+            continue
+        scout_provider = receipt.get("scout_provider_session_id")
+        reviewer_providers = receipt.get("reviewer_provider_session_ids")
+        if (
+            not isinstance(scout_provider, str) or not scout_provider
+            or not isinstance(reviewer_providers, list)
+            or any(not isinstance(value, str) or not value for value in reviewer_providers)
+            or len(reviewer_providers) != len(set(reviewer_providers))
+            or scout_provider in reviewer_providers
+        ):
+            errors.append(f"{label}: negative review requires distinct provider sessions")
             continue
         completed[sweep_id] = receipt
     return completed, errors

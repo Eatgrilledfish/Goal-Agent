@@ -13,7 +13,8 @@ prepare + 只读快照
 → fresh design-only obligation extractor
 → helper绑定source/section/hash，生成原子义务队列
 → fresh scout逐义务搜索全仓并直接对照
-→ helper物化canonical candidate与逐义务coverage
+→ source-only blind negative review（每批最多4项、独立fresh session）
+→ helper合并质疑项并物化canonical candidate与逐义务coverage
 → candidate selection（最多12）
 → spec critic → investigator → evidence critic
 → coverage → final judge → provisional report → final gate
@@ -34,6 +35,8 @@ Code-to-design仍作为补充入口：互斥code anchors逐项反查完整design
 9. 模型只写slice内`candidate_key`；helper按`sweep + key`生成全局稳定`observation_id`，避免并发scout都写`CANDIDATE-1`造成候选冲突。
 10. Canonical coverage逐义务或逐anchor绑定所有候选一次且仅一次；receipt重验queue/plan digest、顺序、ownership和handoff hash。
 11. 修复正式risk validator把合法空`exceptions/ambiguities`数组误判为缺失的问题；新增materialized candidate直接通过正式risk schema的集成测试。
+12. 新增blind negative coverage review：scout准备关闭的每个义务/anchor进入不含原disposition、candidate或scout reasoning的source-only packet，并切成每批最多4项；每批使用不同fresh provider session，逐项先搜索再读取窄源码窗口。每个verdict前必须结构化记录入口、推进/转换、guard/bound、终止/出口、剩余适用工作和一次替代/补偿反查；直接证据和反查充分后立即结束当前item。质疑项机械升级为candidate，只有独立upheld才保留`no_mismatch`。Helper只校验current digest、逐项覆盖、证据字段存在、candidate绑定和session隔离，不使用领域语义规则。
+13. Scout的每slice 12条上限不再错误压制blind challenges：初始Scout仍受限，Reviewer推翻项全部保留到canonical ledger，再由全局selector最多选择12项进入调查。
 
 ## 确定性验证
 
@@ -48,7 +51,7 @@ git diff --check
 当前结果：
 
 ```text
-463 passed in 133.39s
+471 passed in 115.36s
 py_compile: passed
 git diff --check: passed
 ```
@@ -65,6 +68,8 @@ git diff --check: passed
 - 1200行/1文档design plan、大文档拆分、section唯一ownership；
 - materialized candidate可通过正式risk handoff schema；
 - 既有controller、并发发布、claim、investigation、critic、report和final gate回归保持通过。
+- blind review packet不泄露原disposition或scout reasoning，review顺序完整且scout与所有batch sessions彼此不同；challenged项进入canonical candidate，upheld项才可关闭。
+- `negative_review.py batch/assemble`按正式命令行无`--state-root`运行成功，避免函数级测试通过但orchestrator入口失败。
 
 ## 本地分层模型诊断
 
@@ -78,8 +83,12 @@ git diff --check: passed
 4. raw recall：对全部canonical candidates做本地结果对照；
 5. pipeline survival：检查候选是否在selection、claim、investigation和final gate中保留。
 
-两阶段pair回归已完成：每case先由独立design-only session生成完整原子义务队列，再由另一个fresh session逐义务比较并写精确coverage。六个case全部完成，2并发总耗时约22分41秒，19个raw candidates在本地结果对照中召回5/6，达到允许完整OpenCode验证的开发门槛。该回归同时暴露出一个仍需修复的通用缺陷：scout给出的`no_mismatch`尚无fresh独立语义复核，单次模型判断可能把已找到的反向代码事实错误归为一致。
+三阶段pair回归曾达到5/6，暴露出旧review packet携带Scout肯定性notes造成上下文锚定：Reviewer虽使用新session且读到限制代码，仍重复了Scout的错误结论。source-only blind batches随后重新抽取16个义务；Scout仍漏掉此前唯一漏项，blind reviewer则独立将其升级为candidate，证明去除Scout结论能恢复该漏项。该次最多4项的历史回归耗时1348.5秒，但单batch仍使用约6.7万至10.2万token并整读大型源码。
+
+中间版本曾把batch固定收敛为最多2项、逐项search-first和不超过240行的源码窗口，并增加通用证据边界：实现动机、常见实践或推测意图不能替设计补写例外。相同source-only双项packet的fresh回归中，第一版虽把总token降至26,097，却因模型自行补写设计例外而仍漏报；加入证据边界后，新的独立provider session正确将该项判为`challenged`。该实验说明固定2项既非必要也非充分，却把reviewer调用数近乎翻倍，因此恢复每批最多4项。
+
+恢复4项后的回归进一步暴露出自然语言要求可能被模型跳过：一次有界读取运行虽然读到相关控制流，却没有在verdict中核算循环终止条件而漏报。当前因此保留source-only、窄窗口、设计证据边界和fresh session，并要求每项结构化填写六个`execution_accounting`字段；helper只校验字段非空，不以字段内容作领域判断。最终同一4项packet的fresh回归中，此前漏项被正确判为`challenged`，本地ignored oracle确认命中；另有一个独立guard-path候选。总token为57,302，12次源码读取全部带offset和不超过240行的limit，没有整文件读取。与双项成功回归的54,416 token相比只增加约5%，但reviewer调用数减半。正式prompt没有得到旧结论、公开答案或项目专用判断规则。
 
 ## 尚未宣称的结果
 
-局部模型gate通过不等于完整流水线已经生成最终报告。本轮尚未启动完整OpenCode run，因此不宣称最终issues数量或误报率已经达标；完整链路仍须按后台日志方式运行，并以最终`/result/issues.json`、`issues.jsonl`、`00-summary.md`、单issue报告和final gate为准。
+单个fresh-review漏项回归通过不等于完整六对局部gate已经通过，也不等于完整流水线已经生成最终报告。本轮尚未重新运行六对局部gate或完整OpenCode run，因此不宣称最终issues数量或误报率已经达标；下一步应先运行完整便宜局部盲测，达到门槛后才进入完整链路，并以最终`/result/issues.json`、`issues.jsonl`、`00-summary.md`、单issue报告和final gate为准。

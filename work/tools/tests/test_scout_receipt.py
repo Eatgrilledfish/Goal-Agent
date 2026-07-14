@@ -90,7 +90,14 @@ def _coverage(path: Path, sweep_id: str) -> Path:
             "reviewed_anchor_paths": ["src"],
         },
     }
-    ac.save_json(path, {"sweep_id": sweep_id, **values[sweep_id]})
+    ac.save_json(path, {
+        "sweep_id": sweep_id, **values[sweep_id],
+        "negative_review": {
+            "packet_sha256": "b" * 64, "review_sha256": "c" * 64,
+            "scout_provider_session_id": f"provider-scout-{sweep_id}",
+            "reviewer_provider_session_ids": [f"provider-review-{sweep_id}"],
+        },
+    })
     return path
 
 

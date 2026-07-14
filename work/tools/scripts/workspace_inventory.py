@@ -371,7 +371,7 @@ def loop_contract(
     state_root = Path(paths["state_root"])
     artifacts = {name: str(state_root / filename) for name, filename in ARTIFACT_NAMES.items()}
     return {
-        "contract_version": 20,
+        "contract_version": 21,
         "execution_model": "opencode-owned-model-driven-loop",
         "session": {
             "session_id": session_id,
@@ -410,7 +410,7 @@ def loop_contract(
                 "output": [artifacts["risk_sweep_plan"], artifacts["risk_observations"]],
                 "done_when": (
                     "Every bounded design slice is first converted by a fresh design-only model into a source-bound atomic obligation queue, then a fresh design-to-code scout compares every queued obligation against the whole repository; "
-                    "non-overlapping code-to-design scouts own the mapped code anchors. Every scout records per-obligation or per-anchor completion even when it emits zero candidates, and only suspected mismatches enter the candidate ledger."
+                    "non-overlapping code-to-design scouts own the mapped code anchors. Source-only negative comparisons are split into blind batches of at most four items; each batch uses a distinct fresh provider session without seeing scout disposition or reasoning, reads source through search-first bounded windows, records structured entry/progress/guard/termination/remaining-work/compensation accounting, accepts only design-supported exceptions, stops each item once direct evidence and one targeted compensation check are sufficient, and sends disagreements back to the candidate ledger. Every final negative has an upheld blind review and current artifact digests."
                 ),
             },
             {
@@ -485,6 +485,11 @@ def loop_contract(
                 "from": "orchestrator", "to": "risk-explorer",
                 "inputs": [artifacts["architecture_map"], artifacts["risk_sweep_plan"]],
                 "read_roots": [paths["review_code_root"]],
+            },
+            {
+                "from": "orchestrator", "to": "negative-coverage-reviewer",
+                "inputs": [artifacts["design_inventory"], artifacts["risk_sweep_plan"]],
+                "read_roots": [paths["review_code_root"], paths["review_design_root"]],
             },
             {
                 "from": "deterministic-helper", "to": "spec-critic",

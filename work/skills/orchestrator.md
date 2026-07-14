@@ -35,9 +35,9 @@ python3 ${WORK_ROOT}/tools/scripts/goal_runner.py risk-plan-check \
 
 ## Scouts
 
-按 plan最多运行两个语义Task。Design slice先启动fresh `obligation-extractor`遵循`${WORK_ROOT}/skills/obligation-extractor.md`，只写`${STATE_ROOT}/semantic/obligations/${SWEEP_ID}.json`；每个assigned section必须产出义务或显式no-obligation原因。你调用`obligation_queue.py`生成source-bound队列。随后另一个fresh `risk-explorer`严格逐义务比较。Code slice直接启动fresh risk-explorer并逐anchor比较。角色只写semantic candidates/coverage；你调用`scout_materializer.py`注入session、digest、scope和design requirement，再check/merge/receipt。不得让模型复制机械envelope。
+按 plan最多运行两个语义Task。Design slice先启动fresh `obligation-extractor`遵循`${WORK_ROOT}/skills/obligation-extractor.md`，只写`${STATE_ROOT}/semantic/obligations/${SWEEP_ID}.json`；每个assigned section必须产出义务或显式no-obligation原因。你调用`obligation_queue.py`生成source-bound队列。随后另一个fresh `risk-explorer`严格逐义务比较。Code slice直接启动fresh risk-explorer并逐anchor比较。Scout返回后先由`negative_review.py prepare`生成不含原disposition、candidate绑定或scout notes的blind packet；再按packet batches逐个调用`batch`，每批最多4项并各自启动不同fresh `negative-coverage-reviewer`。Reviewer必须逐项先搜索、后窄窗口读取，禁止整读大型源码文件或预加载下一项，并在verdict前结构化列出入口、推进、guard/bound、终止、剩余工作和补偿反查；也不得用实现理由或常见实践替设计文档补写例外，直接反例和一次定向替代/补偿反查充分后立即结束当前item。全部raw reviews由`assemble`绑定真实provider sessions，随后调用reconcile合并质疑候选，最后才运行`scout_materializer.py`。Scout与所有review batch sessions以及各batch sessions彼此不同；角色都只写semantic文件，不得运行helper或复制机械envelope。
 
-准确的obligation和scout materializer命令逐值使用`INSTRUCTION.md`第5节。Catalog、architecture和测试缺失不能产生runtime mismatch候选。Raw scout只需真实代码lead或结构化absence lead与最低限度反证，完整证明留给investigator/critic。
+准确的obligation、blind batch review和scout materializer命令逐值使用`INSTRUCTION.md`第5节。Catalog、architecture和测试缺失不能产生runtime mismatch候选。Raw scout只需真实代码lead或结构化absence lead与最低限度反证，完整证明留给investigator/critic。Negative reviewer看不到scout reasoning，不应用固定语义规则；它独立尝试推翻每个待关闭单元，`upheld/challenged`均为模型结论，helper只校验batch边界、freshness、完整覆盖和分歧升级。
 
 非空 handoff：先 `handoff_merge.py --check-file`，再仅 merge该 scout目录。空 handoff不check、不merge。每个scout在merge目录外写coverage report；design scout按queue顺序逐值列出全部obligation IDs，code scout按plan顺序逐值列出全部anchor paths。非空handoff运行：
 

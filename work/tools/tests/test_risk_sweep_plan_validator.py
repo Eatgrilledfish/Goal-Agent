@@ -394,6 +394,10 @@ def _write_receipts(
             "candidate_count": 0,
             "candidate_ids": [],
             "coverage_report_sha256": "a" * 64,
+            "negative_review_packet_sha256": "b" * 64,
+            "negative_review_sha256": "c" * 64,
+            "scout_provider_session_id": f"provider-scout-{sweep_id}",
+            "reviewer_provider_session_ids": [f"provider-review-{sweep_id}"],
             "assigned_section_ids": list(slices[sweep_id].get("section_ids", [])),
             "reviewed_section_ids": list(slices[sweep_id].get("section_ids", [])),
             "assigned_anchor_paths": list(slices[sweep_id].get("anchor_paths", [])),
@@ -1136,7 +1140,9 @@ def test_design_to_code_observation_may_cross_repository_code_scopes(
     assert errors == []
 
 
-def test_sweep_rejects_more_than_twelve_observations(tmp_path: Path) -> None:
+def test_canonical_sweep_accepts_blind_review_expansion_beyond_raw_limit(
+    tmp_path: Path,
+) -> None:
     state_root, _plan = _write_valid_state(tmp_path)
     items = []
     for index in range(13):
@@ -1154,4 +1160,4 @@ def test_sweep_rejects_more_than_twelve_observations(tmp_path: Path) -> None:
 
     errors = validator.validate_sweep_coverage(items, state_root, "SWEEP-A")
 
-    assert any("may emit at most 12" in error for error in errors)
+    assert errors == []

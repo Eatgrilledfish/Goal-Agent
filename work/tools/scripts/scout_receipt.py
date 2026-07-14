@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import agent_common as ac
+import negative_review as nr
 import risk_sweep_plan_validator as rpv
 
 
@@ -17,13 +18,14 @@ def validate_coverage_contract(
     coverage: dict[str, Any],
 ) -> None:
     """Revalidate the compact semantic work queue before recording completion."""
+    sweep_id = str(sweep.get("sweep_id") or "")
+    nr.validate_attestation(state_root, sweep_id, coverage)
     candidate_ids = {
         str(item.get("observation_id") or "") for item in candidates
         if isinstance(item, dict) and item.get("observation_id")
     }
     direction = sweep.get("direction")
     if direction == "design_to_code":
-        sweep_id = str(sweep.get("sweep_id") or "")
         queue_path = state_root / "design-obligations" / f"{sweep_id}.json"
         if not queue_path.is_file() or queue_path.is_symlink():
             raise ValueError("design scout completion requires a current obligation queue")
@@ -80,6 +82,24 @@ def validate_coverage_contract(
             for candidate_id in item.get("candidate_ids", [])
         ):
             raise ValueError("anchor_checks bind a candidate to the wrong anchor")
+    checks = coverage.get(
+        "obligation_checks" if direction == "design_to_code" else "anchor_checks",
+    )
+    if not isinstance(checks, list):
+        raise ValueError("canonical coverage checks are missing")
+    for number, item in enumerate(checks, start=1):
+        if not isinstance(item, dict):
+            raise ValueError(f"coverage check {number} must be an object")
+        disposition = item.get("disposition")
+        status = item.get("negative_review_status")
+        if status not in nr.REVIEW_STATUSES:
+            raise ValueError(f"coverage check {number} has no fresh review status")
+        if disposition == "no_mismatch" and status != "upheld":
+            raise ValueError(f"coverage check {number} closes without an upheld review")
+        if status == "upheld" and disposition != "no_mismatch":
+            raise ValueError(f"coverage check {number} has an invalid upheld review")
+        if status in {"challenged", "not_applicable"} and disposition != "candidate":
+            raise ValueError(f"coverage check {number} drops a candidate review outcome")
 
 
 def _read_values(path: Path) -> list[dict[str, Any]]:
@@ -148,6 +168,7 @@ def record(
     if direction == "code_to_design" and assigned_section_ids:
         raise ValueError("code_to_design scout cannot own design sections")
     validate_coverage_contract(state_root, sweep, values, coverage)
+    negative_review = coverage["negative_review"]
     state = ac.load_json(state_root / "agent_loop_state.json")
     plan_path = state_root / "risk_sweep_plan.json"
     receipt = {
@@ -157,6 +178,12 @@ def record(
         "risk_sweep_plan_sha256": ac.sha256_file(plan_path),
         "handoff_sha256": ac.sha256_file(handoff),
         "coverage_report_sha256": ac.sha256_file(coverage_report),
+        "negative_review_packet_sha256": negative_review["packet_sha256"],
+        "negative_review_sha256": negative_review["review_sha256"],
+        "scout_provider_session_id": negative_review["scout_provider_session_id"],
+        "reviewer_provider_session_ids": negative_review[
+            "reviewer_provider_session_ids"
+        ],
         "status": "complete",
         "candidate_count": len(values),
         "candidate_ids": [str(item.get("observation_id")) for item in values],
@@ -181,6 +208,10 @@ def record(
         "event": "semantic_scout_complete", "actor": "scout_receipt_helper",
         "phase": "semantic_scouting", "status": "complete",
         "sweep_id": sweep_id, "candidate_count": len(values),
+        "scout_provider_session_id": negative_review["scout_provider_session_id"],
+        "reviewer_provider_session_ids": negative_review[
+            "reviewer_provider_session_ids"
+        ],
         "receipt_sha256": ac.sha256_file(path),
     })
     return receipt

@@ -9,6 +9,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 import agent_common as ac
+import negative_review as nr
 import risk_sweep_plan_validator as rpv
 
 
@@ -44,10 +45,6 @@ def _raw_candidates(path: Path) -> list[dict[str, Any]]:
     value = ac.load_json(path)
     if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
         raise ValueError("raw scout candidates must be a JSON array of objects")
-    if len(value) > rpv.MAX_OBSERVATIONS_PER_SWEEP:
-        raise ValueError(
-            f"raw scout candidates may contain at most {rpv.MAX_OBSERVATIONS_PER_SWEEP} items"
-        )
     return value
 
 
@@ -129,6 +126,17 @@ def _checks(
             raise ValueError(f"{label} candidate disposition requires candidate_keys")
         if disposition == "no_mismatch" and keys:
             raise ValueError(f"{label} no_mismatch disposition cannot bind candidates")
+        review_status = _nonempty(
+            item.get("negative_review_status"), f"{label}.negative_review_status",
+        )
+        if review_status not in nr.REVIEW_STATUSES:
+            raise ValueError(f"{label}.negative_review_status is unsupported")
+        if disposition == "no_mismatch" and review_status != "upheld":
+            raise ValueError(f"{label} no_mismatch requires an upheld fresh review")
+        if review_status == "upheld" and disposition != "no_mismatch":
+            raise ValueError(f"{label} upheld fresh review cannot bind a candidate")
+        if review_status in {"not_applicable", "challenged"} and disposition != "candidate":
+            raise ValueError(f"{label} review status requires a candidate disposition")
         unknown = set(keys) - candidate_keys
         if unknown:
             raise ValueError(f"{label} references unknown candidates: {sorted(unknown)}")
@@ -147,6 +155,7 @@ def _checks(
                 item.get("code_search_summary"), f"{label}.code_search_summary",
             ),
             "countercheck": _nonempty(item.get("countercheck"), f"{label}.countercheck"),
+            "negative_review_status": review_status,
         })
     if seen != expected:
         raise ValueError(f"{key} must exactly follow the assigned review order")
@@ -170,6 +179,7 @@ def materialize(
     raw_coverage = ac.load_json(semantic_coverage)
     if not isinstance(raw_coverage, dict):
         raise ValueError("raw scout coverage must be an object")
+    nr.validate_attestation(state_root, sweep_id, raw_coverage)
     state = ac.load_json(state_root / "agent_loop_state.json")
     envelope = {
         "session_id": state.get("session_id"),
@@ -230,6 +240,7 @@ def materialize(
             "reviewed_anchor_paths": [],
             "obligation_queue_sha256": obligation_digest,
             "obligation_checks": checks,
+            "negative_review": dict(raw_coverage["negative_review"]),
         }
     else:
         anchors = list(sweep.get("anchor_paths", []))
@@ -280,6 +291,7 @@ def materialize(
             "reviewed_section_ids": [],
             "reviewed_anchor_paths": anchors,
             "anchor_checks": checks,
+            "negative_review": dict(raw_coverage["negative_review"]),
         }
     ids = [item["observation_id"] for item in candidates]
     if len(ids) != len(set(ids)):
